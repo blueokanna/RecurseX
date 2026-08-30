@@ -17,6 +17,7 @@ pub mod edns;
 pub mod engine;
 pub mod error;
 pub mod estimator;
+pub mod float;
 pub mod graph;
 pub mod message;
 pub mod name;
@@ -40,6 +41,8 @@ pub mod transports;
 pub mod config;
 #[cfg(feature = "dnssec")]
 pub mod dnssec;
+#[cfg(feature = "std")]
+pub mod entropy;
 #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
 pub mod forward;
 #[cfg(feature = "std")]

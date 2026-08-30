@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------
+  # Formatting — rustfmt must be clean.
+  # ------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ------------------------------------------------------------------
+  # Lint — clippy with warnings denied, on the MSRV toolchain.
+  # ------------------------------------------------------------------
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (all features, all targets)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (no_std core, lib only)
+        run: cargo clippy --no-default-features --lib -- -D warnings
+
+  # ------------------------------------------------------------------
+  # Build — every feature combination must compile.
+  # ------------------------------------------------------------------
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (default features)
+        run: cargo build
+      - name: Build (no_std core)
+        run: cargo build --no-default-features
+      - name: Build (all features)
+        run: cargo build --all-features
+      - name: Check examples compile
+        run: cargo build --examples --all-features
+
+  # ------------------------------------------------------------------
+  # Test — full suite on the MSRV and on stable.
+  # ------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.78.0", stable]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (all features)
+        run: cargo test --all-features
+      - name: Test (default features)
+        run: cargo test
+      - name: Test (no_std core is at least buildable)
+        run: cargo build --no-default-features

@@ -148,7 +148,8 @@ impl PathModel {
         self.successes += 1;
         self.last_seen = now;
         // EWMA of RTT (α = 0.2).
-        self.rtt_var_ms = self.rtt_var_ms * 0.8 + (rtt_ms - self.rtt_ewma_ms).abs() * 0.2;
+        self.rtt_var_ms =
+            self.rtt_var_ms * 0.8 + crate::float::fabs(rtt_ms - self.rtt_ewma_ms) * 0.2;
         self.rtt_ewma_ms = self.rtt_ewma_ms * 0.8 + rtt_ms * 0.2;
         // Decay loss slowly on success.
         self.loss_rate *= 0.95;

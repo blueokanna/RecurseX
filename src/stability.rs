@@ -84,7 +84,8 @@ impl StabilityModel {
             self.ttl_ewma = t;
             self.ttl_volatility = 0.0;
         } else {
-            self.ttl_volatility = self.ttl_volatility * 0.8 + (t - self.ttl_ewma).abs() * 0.2;
+            self.ttl_volatility =
+                self.ttl_volatility * 0.8 + crate::float::fabs(t - self.ttl_ewma) * 0.2;
             self.ttl_ewma = self.ttl_ewma * 0.8 + t * 0.2;
         }
         self.last_refresh = now;

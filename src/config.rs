@@ -41,98 +41,71 @@ impl Default for ListenConfig {
     }
 }
 
-/// Cache tuning (JSON).
-#[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
+/// Cache tuning (JSON). All fields are optional; absent values fall back to
+/// [`CacheConfig::default`], so a minimal document does not accidentally
+/// disable the cache or zero a capacity.
+#[derive(Debug, Clone, PartialEq, Default, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct CacheJson {
     #[njson(default)]
-    pub hot_capacity: usize,
+    pub hot_capacity: Option<usize>,
     #[njson(default)]
-    pub warm_capacity: usize,
+    pub warm_capacity: Option<usize>,
     #[njson(default)]
-    pub cold_capacity: usize,
+    pub cold_capacity: Option<usize>,
     #[njson(default)]
-    pub stale_window_secs: u32,
+    pub stale_window_secs: Option<u32>,
     #[njson(default)]
-    pub negative_ttl_cap: u32,
+    pub negative_ttl_cap: Option<u32>,
     #[njson(default)]
-    pub max_ttl_cap: u32,
+    pub max_ttl_cap: Option<u32>,
     #[njson(default)]
-    pub prefetch_threshold_ttl: u32,
+    pub prefetch_threshold_ttl: Option<u32>,
     #[njson(default)]
-    pub prefetch_probability: f64,
-}
-
-impl Default for CacheJson {
-    fn default() -> Self {
-        let c = CacheConfig::default();
-        Self {
-            hot_capacity: c.hot_capacity,
-            warm_capacity: c.warm_capacity,
-            cold_capacity: c.cold_capacity,
-            stale_window_secs: c.stale_window_secs,
-            negative_ttl_cap: c.negative_ttl_cap,
-            max_ttl_cap: c.max_ttl_cap,
-            prefetch_threshold_ttl: c.prefetch_threshold_ttl,
-            prefetch_probability: c.prefetch_probability,
-        }
-    }
+    pub prefetch_probability: Option<f64>,
 }
 
 impl CacheJson {
     pub fn into_cache(&self) -> CacheConfig {
         let d = CacheConfig::default();
         CacheConfig {
-            hot_capacity: self.hot_capacity,
-            warm_capacity: self.warm_capacity,
-            cold_capacity: self.cold_capacity,
-            stale_window_secs: self.stale_window_secs,
-            negative_ttl_cap: self.negative_ttl_cap,
-            max_ttl_cap: self.max_ttl_cap,
-            prefetch_threshold_ttl: self.prefetch_threshold_ttl,
-            prefetch_probability: self.prefetch_probability,
+            hot_capacity: self.hot_capacity.unwrap_or(d.hot_capacity),
+            warm_capacity: self.warm_capacity.unwrap_or(d.warm_capacity),
+            cold_capacity: self.cold_capacity.unwrap_or(d.cold_capacity),
+            stale_window_secs: self.stale_window_secs.unwrap_or(d.stale_window_secs),
+            negative_ttl_cap: self.negative_ttl_cap.unwrap_or(d.negative_ttl_cap),
+            max_ttl_cap: self.max_ttl_cap.unwrap_or(d.max_ttl_cap),
+            prefetch_threshold_ttl: self
+                .prefetch_threshold_ttl
+                .unwrap_or(d.prefetch_threshold_ttl),
+            prefetch_probability: self.prefetch_probability.unwrap_or(d.prefetch_probability),
             ..d
         }
     }
 }
 
-/// Engine tuning (JSON).
-#[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
+/// Engine tuning (JSON). All fields are optional; absent values fall back
+/// to [`EngineConfig::default`].
+#[derive(Debug, Clone, PartialEq, Default, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct EngineJson {
     #[njson(default)]
     pub root_servers: Vec<String>,
     #[njson(default)]
-    pub timeout_ms: u64,
+    pub timeout_ms: Option<u64>,
     #[njson(default)]
-    pub qname_minimization: bool,
+    pub qname_minimization: Option<bool>,
     #[njson(default)]
-    pub use_0x20: bool,
+    pub use_0x20: Option<bool>,
     #[njson(default)]
-    pub max_cname_depth: usize,
+    pub max_cname_depth: Option<usize>,
     #[njson(default)]
-    pub dnssec: bool,
+    pub dnssec: Option<bool>,
     #[njson(default)]
-    pub tcp_fallback: bool,
+    pub tcp_fallback: Option<bool>,
     /// Forwarding upstreams (optional): `{"proto":"dot","ip":"1.1.1.1","port":853,"host":"cloudflare-dns.com"}`.
     #[njson(default)]
     pub forwarders: Vec<ForwarderJson>,
-}
-
-impl Default for EngineJson {
-    fn default() -> Self {
-        let e = EngineConfig::default();
-        Self {
-            root_servers: Vec::new(),
-            timeout_ms: e.timeout_ms,
-            qname_minimization: e.qname_minimization,
-            use_0x20: e.use_0x20,
-            max_cname_depth: e.max_cname_depth,
-            dnssec: e.dnssec,
-            tcp_fallback: e.tcp_fallback,
-            forwarders: Vec::new(),
-        }
-    }
 }
 
 /// A forwarding upstream.
@@ -254,13 +227,15 @@ pub struct Config {
     pub engine: EngineJson,
     #[njson(default)]
     pub policy: PolicyJson,
-    /// Client rate limit: queries per second per client.
+    /// Client rate limit: queries per second per client (absent = default).
     #[njson(default)]
-    pub client_qps: f64,
+    pub client_qps: Option<f64>,
+    /// Client rate limit burst (absent = default).
     #[njson(default)]
-    pub client_burst: f64,
+    pub client_burst: Option<f64>,
+    /// Maintenance loop interval in ms (absent = default).
     #[njson(default)]
-    pub maintenance_interval_ms: u64,
+    pub maintenance_interval_ms: Option<u64>,
     /// L3 persistent cache (persist feature): `{"path":"cache.rxc","saveIntervalMs":60000}`.
     #[cfg(feature = "persist")]
     #[njson(default)]
@@ -269,15 +244,14 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let r = ResolverConfig::default();
         Self {
             listen: vec![ListenConfig::default()],
             cache: CacheJson::default(),
             engine: EngineJson::default(),
             policy: PolicyJson::default(),
-            client_qps: r.rate_limit.client_refill_per_sec,
-            client_burst: r.rate_limit.client_capacity,
-            maintenance_interval_ms: r.maintenance_interval_ms,
+            client_qps: None,
+            client_burst: None,
+            maintenance_interval_ms: None,
             #[cfg(feature = "persist")]
             persist: None,
         }
@@ -309,28 +283,37 @@ impl Config {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
+        // Absent JSON fields (None) fall back to the resolver defaults, so
+        // a minimal document keeps sane timeouts/minimization/0x20 etc.
         let mut ec = EngineConfig {
             root_servers,
-            timeout_ms: engine.timeout_ms,
-            qname_minimization: engine.qname_minimization,
-            use_0x20: engine.use_0x20,
-            max_cname_depth: engine.max_cname_depth,
-            dnssec: engine.dnssec,
-            tcp_fallback: engine.tcp_fallback,
+            timeout_ms: engine.timeout_ms.unwrap_or(d.engine.timeout_ms),
+            qname_minimization: engine
+                .qname_minimization
+                .unwrap_or(d.engine.qname_minimization),
+            use_0x20: engine.use_0x20.unwrap_or(d.engine.use_0x20),
+            max_cname_depth: engine.max_cname_depth.unwrap_or(d.engine.max_cname_depth),
+            tcp_fallback: engine.tcp_fallback.unwrap_or(d.engine.tcp_fallback),
             ..d.engine
         };
-        ec.dnssec = engine.dnssec && cfg!(feature = "dnssec");
+        ec.dnssec = engine.dnssec.unwrap_or(d.engine.dnssec) && cfg!(feature = "dnssec");
+        let client_burst = self.client_burst.unwrap_or(d.rate_limit.client_capacity);
+        let client_qps = self
+            .client_qps
+            .unwrap_or(d.rate_limit.client_refill_per_sec);
         Ok(ResolverConfig {
             cache: self.cache.into_cache(),
             planner: PlannerConfig::default(),
             policy: self.policy.into_policy(),
             engine: ec,
             rate_limit: RateLimitConfig {
-                client_capacity: self.client_burst.max(1.0),
-                client_refill_per_sec: self.client_qps.max(0.0),
+                client_capacity: client_burst.max(1.0),
+                client_refill_per_sec: client_qps.max(0.0),
                 max_client_buckets: d.rate_limit.max_client_buckets,
             },
-            maintenance_interval_ms: self.maintenance_interval_ms,
+            maintenance_interval_ms: self
+                .maintenance_interval_ms
+                .unwrap_or(d.maintenance_interval_ms),
             #[cfg(feature = "persist")]
             persist: self.persist.as_ref().and_then(PersistJson::into_persist),
             ..d
@@ -388,6 +371,50 @@ mod tests {
         assert_eq!(c.listen[0].addr, "127.0.0.1:5353");
         let rc = c.into_resolver_config().unwrap();
         assert!(rc.engine.timeout_ms > 0);
+    }
+
+    /// A minimal document must fall back to the resolver defaults for every
+    /// absent tuning field — a regression guard for the Option-based JSON
+    /// mapping (absent must never zero the timeout, disable 0x20/QNAME
+    /// minimization, or zero the cache capacities).
+    #[test]
+    fn minimal_document_keeps_resolver_defaults() {
+        let d = ResolverConfig::default();
+        let rc = Config::from_json_str(r#"{"listen":[]}"#)
+            .unwrap()
+            .into_resolver_config()
+            .unwrap();
+        assert_eq!(rc.engine.timeout_ms, d.engine.timeout_ms);
+        assert_eq!(rc.engine.qname_minimization, d.engine.qname_minimization);
+        assert_eq!(rc.engine.use_0x20, d.engine.use_0x20);
+        assert_eq!(rc.engine.tcp_fallback, d.engine.tcp_fallback);
+        assert_eq!(rc.cache.hot_capacity, d.cache.hot_capacity);
+        assert_eq!(rc.cache.warm_capacity, d.cache.warm_capacity);
+        assert_eq!(
+            rc.rate_limit.client_refill_per_sec,
+            d.rate_limit.client_refill_per_sec
+        );
+        assert_eq!(rc.maintenance_interval_ms, d.maintenance_interval_ms);
+        assert!(rc.cache.hot_capacity > 0 && rc.engine.timeout_ms > 0);
+    }
+
+    /// Explicit values override the defaults.
+    #[test]
+    fn explicit_values_override_defaults() {
+        let rc = Config::from_json_str(
+            r#"{
+                "engine": { "timeoutMs": 700, "qnameMinimization": false, "use0x20": false },
+                "clientQps": 5.0, "clientBurst": 10.0
+            }"#,
+        )
+        .unwrap()
+        .into_resolver_config()
+        .unwrap();
+        assert_eq!(rc.engine.timeout_ms, 700);
+        assert!(!rc.engine.qname_minimization);
+        assert!(!rc.engine.use_0x20);
+        assert_eq!(rc.rate_limit.client_refill_per_sec, 5.0);
+        assert_eq!(rc.rate_limit.client_capacity, 10.0);
     }
 
     #[test]

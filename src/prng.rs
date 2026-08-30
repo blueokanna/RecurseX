@@ -32,18 +32,18 @@ impl SplitMix64 {
         Self { state: seed }
     }
 
-    /// Seed from the current time and a per-process jitter value.
+    /// Seed from OS entropy (`crate::entropy`), so the query-ID / 0x20
+    /// generator starts unpredictable on every run. Falls back to
+    /// time + `RandomState` process entropy if no OS source is reachable.
     #[cfg(feature = "std")]
     pub fn seeded() -> Self {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        // Fold the stack address of a local in as process entropy. This is
-        // weak on purpose: 0x20/cookies are not the only anti-spoofing
-        // mechanism and this generator is never used for keys.
-        let jitter = (&t as *const _ as usize) as u64;
-        Self::new(t ^ jitter.rotate_left(17) ^ 0x9e3779b97f4a7c15)
+        Self::new(crate::entropy::seed_u64())
+    }
+
+    /// Replace the internal state (used to reseed a long-lived generator so
+    /// an observer who recovered the stream cannot predict far ahead).
+    pub fn reseed(&mut self, seed: u64) {
+        self.state = seed;
     }
 
     /// The next 64-bit value.

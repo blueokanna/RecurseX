@@ -238,7 +238,7 @@ mod tests {
         );
         let mut r = Message::new(7);
         r.flags.qr = true;
-        r.questions = q.questions.clone();
+        r.questions.clone_from(&q.questions);
         assert!(response_matches_query(&q, &r));
         r.id = 8;
         assert!(!response_matches_query(&q, &r));

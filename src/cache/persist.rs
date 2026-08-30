@@ -242,7 +242,7 @@ pub fn encode(cache: &SemanticCache, now_unix: i64) -> Result<Vec<u8>> {
 pub fn save_to(cache: &SemanticCache, path: &Path, now_unix: i64) -> Result<()> {
     let bytes = encode(cache, now_unix)?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)
+    std::fs::write(&tmp, bytes)
         .map_err(|e| Error::io(format!("cache persist write {}: {e}", tmp.display())))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| Error::io(format!("cache persist rename {}: {e}", path.display())))?;

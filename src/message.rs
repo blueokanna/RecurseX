@@ -292,6 +292,42 @@ impl Message {
         Ok(out)
     }
 
+    /// The serialized wire length (with compression), or [`usize::MAX`]
+    /// when serialization fails. Used for UDP truncation decisions.
+    pub fn wire_len(&self) -> usize {
+        self.to_bytes().map(|b| b.len()).unwrap_or(usize::MAX)
+    }
+
+    /// Truncate this (response) message so its wire form fits in `limit`
+    /// bytes, per RFC 6891 §6.2.5 and RFC 1035 §4.2.1.
+    ///
+    /// Sets the TC bit and drops records — additional, then authority, then
+    /// answer — from the end until the message fits. The question and the
+    /// EDNS OPT record are preserved (the OPT record is small; the limit is
+    /// a floor of 512 so a minimal message always fits). Used by the UDP
+    /// server to avoid sending oversized, fragmenting datagrams.
+    pub fn truncate_for_udp(&mut self, limit: usize) {
+        let limit = limit.max(512);
+        if self.wire_len() <= limit {
+            return;
+        }
+        self.flags.tc = true;
+        while self.wire_len() > limit {
+            if !self.additionals.is_empty() {
+                self.additionals.pop();
+            } else if !self.authorities.is_empty() {
+                self.authorities.pop();
+            } else if !self.answers.is_empty() {
+                self.answers.pop();
+            } else {
+                // Nothing left to drop; the header+question+EDNS still
+                // overflows the (≥512) limit, which cannot happen for a
+                // bounded message — stop to avoid an infinite loop.
+                break;
+            }
+        }
+    }
+
     /// Build a response with the same ID and question, the given flags, and
     /// the standard SERVFAIL rcode.
     pub fn error_response(&self, rcode: Rcode) -> Message {
@@ -300,7 +336,7 @@ impl Message {
         m.flags.rd = self.flags.rd;
         m.flags.ra = true;
         m.flags.rcode = rcode;
-        m.questions = self.questions.clone();
+        m.questions.clone_from(&self.questions);
         // Preserve a minimal EDNS echo.
         if let Some(e) = &self.edns {
             m.edns = Some(Edns {
@@ -441,5 +477,52 @@ mod tests {
         assert_eq!(e.flags.rcode, Rcode::SERVFAIL);
         assert_eq!(e.questions, q.questions);
         assert_eq!(e.id, q.id);
+    }
+
+    #[test]
+    fn truncate_oversized_response_sets_tc_and_fits() {
+        // A response with many distinct records so it far exceeds 512 bytes.
+        let mut m = Message::new(7);
+        m.flags.qr = true;
+        m.questions.push(Question {
+            qname: Name::from_ascii("big.example.com").unwrap(),
+            qtype: RrType::TXT,
+            qclass: RrClass::IN,
+        });
+        for i in 0..40u8 {
+            let txt: Vec<u8> = (0..200).map(|_| i).collect();
+            m.answers.push(Record {
+                name: Name::from_ascii("big.example.com").unwrap(),
+                rr_type: RrType::TXT,
+                class: RrClass::IN,
+                ttl: 300,
+                rdata: RData::Txt(vec![txt]),
+            });
+        }
+        let full = m.wire_len();
+        assert!(full > 512);
+        assert!(!m.is_truncated());
+
+        m.truncate_for_udp(512);
+        assert!(m.is_truncated());
+        let bytes = m.to_bytes().unwrap();
+        assert!(bytes.len() <= 512, "truncated size {}", bytes.len());
+        // The question survives truncation.
+        assert_eq!(m.questions.len(), 1);
+
+        // A small response is left untouched.
+        let mut small = Message::new(8);
+        small.flags.qr = true;
+        small.answers.push(Record {
+            name: Name::from_ascii("a.example.com").unwrap(),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::A("192.0.2.1".parse().unwrap()),
+        });
+        let before = small.wire_len();
+        small.truncate_for_udp(512);
+        assert!(!small.is_truncated());
+        assert_eq!(small.wire_len(), before);
     }
 }

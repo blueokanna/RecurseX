@@ -104,6 +104,27 @@ second pass should come from cache. Verified against the live tree on a normal
 connection (example.com ~127 ms, google.com ~3.2 s first hit, ietf.org ~0.7 s,
 `nonexistent.invalid` → NXDOMAIN in ~23 ms).
 
+### Examples
+
+The `examples/` directory has several self-contained, runnable programs:
+
+| Example | What it shows |
+| ------- | ------------- |
+| `quick_check` | live end-to-end iterative resolution + cache hits |
+| `multi_type_resolve` | resolving A / AAAA / MX / TXT / NS / SOA for a name |
+| `server_demo` | a local UDP+TCP DNS server, JSON config, self-test |
+| `custom_config` | building a strict resolver entirely in code |
+| `forward_resolver` | forwarding through DoT / plain UDP (RFC 8484-style) |
+| `persist_cache` | L3 snapshot: warm cache survives a restart |
+
+```sh
+cargo run --example multi_type_resolve
+cargo run --example custom_config
+cargo run --example persist_cache
+cargo run --example forward_resolver
+cargo run --example server_demo   # blocks; query it with dig -p 5353
+```
+
 ### Client-facing server
 
 ```rust
@@ -207,25 +228,54 @@ enabled it also writes the cache snapshot on the configured interval.
 
 The algorithmic core (`--no-default-features`) is `no_std` + `alloc`.
 
+## MSRV and CI
+
+- **MSRV: Rust 1.78** (`rust-version = "1.78"`, pinned by `rust-toolchain.toml`).
+  The no_std core deliberately avoids libm-style float methods that only
+  landed in `core` after 1.78 (see `src/float.rs`).
+- **CI** (`.github/workflows/ci.yml`) runs on the MSRV toolchain and on
+  stable: `cargo fmt --check`, `cargo clippy -D warnings` (all features and
+  the no_std lib), `cargo build` for every feature combination, and
+  `cargo test --all-features`.
+
 ## Testing
 
 ```sh
-# full suite, all features
-cargo test --features std,dot,doh,doh3,doq,dnssec,persist --lib
+# full suite, all features (MSRV toolchain)
+cargo +1.78.0 test --all-features
 
-# no_std core build
-cargo build --no-default-features
+# no_std core build + lint
+cargo +1.78.0 build --no-default-features
+cargo +1.78.0 clippy --no-default-features --lib -- -D warnings
 
-# strict lint
-cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D warnings
+# strict lint (all features)
+cargo +1.78.0 clippy --all-targets --all-features -- -D warnings
 ```
 
-The suite is 124 tests: wire codec, cache/stability/admission, estimator,
+The suite is 128 tests: wire codec, cache/stability/admission, estimator,
 planner, graph, upstream model, policy, engine classification, resolver
 orchestration, server, config JSON round-trip, encrypted transports, DNSSEC
-(including an authentic openssl-generated 1024-bit RSA vector), and the
-persistent cache (round-trip, stale-parking, dead-entry drop, tamper
-rejection).
+(including an authentic openssl-generated 1024-bit RSA vector), the persistent
+cache (round-trip, stale-parking, dead-entry drop, tamper rejection), the
+self-contained float helpers, OS-entropy seeding, and UDP truncation.
+
+## Security hardening
+
+- **OS-entropy PRNG seeding**: query IDs and 0x20 QNAME case are drawn from a
+  SplitMix64 generator seeded from the OS CSPRNG (courierust's
+  `fill_random`; pure-std `RandomState` fallback), and the generator is
+  periodically reseeded so an observer who recovered part of the stream
+  cannot predict far ahead (`src/entropy.rs`).
+- **UDP truncation**: the server never sends a datagram larger than the
+  client's advertised EDNS payload size — it sets TC and drops records per
+  RFC 6891 §6.2.5, which also prevents reflection amplification
+  (`Message::truncate_for_udp`).
+- **Bounded wire parsing**: section-count limits, a 255-octet name cap, and
+  a 40-hop compression-pointer loop guard reject malformed packets before
+  any allocation of note.
+- **Per-client rate limiting** with a bounded bucket table, bailiwick
+  discipline on cache admission, and response matching on ID + question
+  echo.
 
 ## License
 

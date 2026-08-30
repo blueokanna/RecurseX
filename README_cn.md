@@ -87,6 +87,27 @@ cargo run --no-default-features --features std --example quick_check
 （example.com 约 127ms、google.com 首次约 3.2s、ietf.org 约 0.7s、`nonexistent.invalid`
 约 23ms 返回 NXDOMAIN）。
 
+### 示例程序
+
+`examples/` 目录下有几个自包含、可运行的示例：
+
+| 示例 | 演示内容 |
+| ---- | -------- |
+| `quick_check` | 在线端到端迭代解析 + 缓存命中 |
+| `multi_type_resolve` | 解析 A / AAAA / MX / TXT / NS / SOA |
+| `server_demo` | 本地 UDP+TCP DNS 服务器、JSON 配置、自测 |
+| `custom_config` | 纯代码构建一个严格配置的解析器 |
+| `forward_resolver` | 走 DoT / 普通 UDP 转发 |
+| `persist_cache` | L3 快照：热缓存重启不丢 |
+
+```sh
+cargo run --example multi_type_resolve
+cargo run --example custom_config
+cargo run --example persist_cache
+cargo run --example forward_resolver
+cargo run --example server_demo   # 阻塞运行；用 dig -p 5353 查询
+```
+
 ### 客户端服务器
 
 ```rust
@@ -175,22 +196,43 @@ let _thread = resolver.spawn_maintenance(); // sweep + 图剪枝 + 预测式预�
 
 算法核心（`--no-default-features`）是 `no_std` + `alloc`。
 
+## MSRV 与 CI
+
+- **MSRV：Rust 1.78**（`rust-version = "1.78"`，`rust-toolchain.toml` 已固定）。
+  no_std 核心刻意避开了 1.78 之后才进入 `core` 的 libm 风格浮点方法（见 `src/float.rs`）。
+- **CI**（`.github/workflows/ci.yml`）在 MSRV 工具链和 stable 上各跑一遍：
+  `cargo fmt --check`、`cargo clippy -D warnings`（全 feature + no_std lib）、
+  各 feature 组合的 `cargo build`、以及 `cargo test --all-features`。
+
 ## 测试
 
 ```sh
-# 全 feature 全量测试
-cargo test --features std,dot,doh,doh3,doq,dnssec,persist --lib
+# 全 feature 全量测试（MSRV 工具链）
+cargo +1.78.0 test --all-features
 
-# no_std 核心构建
-cargo build --no-default-features
+# no_std 核心构建与 lint
+cargo +1.78.0 build --no-default-features
+cargo +1.78.0 clippy --no-default-features --lib -- -D warnings
 
-# 严格 lint
-cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D warnings
+# 严格 lint（全 feature）
+cargo +1.78.0 clippy --all-targets --all-features -- -D warnings
 ```
 
-共 124 个测试：线格式编解码、缓存/稳定性/准入、估计器、规划器、图、上游模型、策略、引擎分类、
+共 128 个测试：线格式编解码、缓存/稳定性/准入、估计器、规划器、图、上游模型、策略、引擎分类、
 解析器编排、服务器、JSON 配置回环、加密传输、DNSSEC（含一个用 openssl 真实生成的 1024 位 RSA
-测试向量），以及持久化缓存（回环、stale 归位、死条目丢弃、篡改拒绝）。
+测试向量）、持久化缓存（回环、stale 归位、死条目丢弃、篡改拒绝）、自带的浮点辅助、OS 熵播种、
+UDP 截断。
+
+## 安全加固
+
+- **OS 熵播种**：查询 ID 与 0x20 QNAME 大小写来自 SplitMix64，种子取自 OS CSPRNG
+  （courierust 的 `fill_random`；纯 std 时回退 `RandomState`），并周期性重播种，
+  防止观察者从已泄露的流中预测后续输出（`src/entropy.rs`）。
+- **UDP 截断**：服务器绝不下发超过客户端广告的 EDNS 载荷大小的数据报——按
+  RFC 6891 §6.2.5 置 TC 并丢弃记录，同时堵住反射放大（`Message::truncate_for_udp`）。
+- **有界解析**：段计数上限、255 字节名字上限、40 跳压缩指针循环保护，
+  恶意报文在产生可观分配之前就被拒绝。
+- **按客户端限速**（桶表有界）、缓存准入的 bailiwick 纪律、ID + 问题回显的应答匹配。
 
 ## License
 

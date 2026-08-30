@@ -196,6 +196,11 @@ impl SharedState {
     }
 }
 
+/// Reseed the query-ID / 0x20 PRNG from OS entropy after this many draws,
+/// so an observer who recovered part of the SplitMix64 stream cannot
+/// predict far ahead (anti cache-poisoning hardening).
+const RNG_RESEED_EVERY: u64 = 4096;
+
 /// A slot a coalesced waiter blocks on.
 struct Slot {
     result: Mutex<Option<Result<Resolution>>>,
@@ -224,6 +229,8 @@ pub struct ResolverInner {
     pub forwarder_set: Mutex<crate::forward::ForwarderSet>,
     inflight: Mutex<BTreeMap<QueryKey, Arc<Slot>>>,
     rng: Mutex<SplitMix64>,
+    /// How many draws have been taken from `rng` (drives periodic reseed).
+    rng_draws: std::sync::atomic::AtomicU64,
 }
 
 impl Resolver {
@@ -274,8 +281,23 @@ impl Resolver {
                 forwarder_set: Mutex::new(forwarder_set),
                 inflight: Mutex::new(BTreeMap::new()),
                 rng: Mutex::new(rng),
+                rng_draws: std::sync::atomic::AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Run `f` with the shared PRNG locked, reseeding it from OS entropy
+    /// every [`RNG_RESEED_EVERY`] draws. The query-ID / 0x20 generator is a
+    /// seeded SplitMix64, which is unpredictable to an off-path attacker;
+    /// periodic reseeding additionally bounds what an *on-path* observer
+    /// (e.g. a server we query) can learn about the stream and predict.
+    fn with_rng<T>(&self, f: impl FnOnce(&mut SplitMix64) -> T) -> T {
+        let mut rng = self.inner.rng.lock().unwrap();
+        let draws = self.inner.rng_draws.fetch_add(1, Ordering::Relaxed);
+        if draws % RNG_RESEED_EVERY == 0 {
+            rng.reseed(crate::entropy::seed_u64());
+        }
+        f(&mut rng)
     }
 
     /// Replace the trust roots used for encrypted forwarders (DoT/DoH/DoH3).
@@ -466,7 +488,7 @@ impl Resolver {
             ad: res.validated,
             ..HeaderFlags::default()
         };
-        m.questions = query.questions.clone();
+        m.questions.clone_from(&query.questions);
         // Cap TTLs to the reported (remaining) TTL.
         for r in &res.answers {
             let mut rec = r.clone();
@@ -542,14 +564,14 @@ impl Resolver {
     /// Resolve through the configured forwarders (RD=1).
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     fn forward_resolve(&self, key: &QueryKey) -> Result<Resolution> {
-        let mut rng = self.inner.rng.lock().unwrap();
-        let query = crate::forward::build_forward_query(
-            key,
-            self.inner.config.engine.edns_udp_size,
-            self.inner.config.engine.dnssec,
-            &mut rng,
-        );
-        drop(rng);
+        let query = self.with_rng(|rng| {
+            crate::forward::build_forward_query(
+                key,
+                self.inner.config.engine.edns_udp_size,
+                self.inner.config.engine.dnssec,
+                rng,
+            )
+        });
         let bytes = query.to_bytes()?;
         let resp = self.inner.forwarder_set.lock().unwrap().exchange(
             &query,
@@ -1160,27 +1182,24 @@ impl Resolver {
                     .stats
                     .upstream_queries
                     .fetch_add(1, Ordering::Relaxed);
-                let id = {
-                    let mut rng = self.inner.rng.lock().unwrap();
-                    (rng.next_u32() & 0xffff) as u16
-                };
+                let id = self.with_rng(|rng| (rng.next_u32() & 0xffff) as u16);
                 let edns = EdnsSpec {
                     udp_size: self.inner.config.engine.edns_udp_size,
                     dnssec_ok: self.inner.config.engine.dnssec || key.want_dnssec,
                     ecs: ecs_option(key),
                     client_cookie: None,
                 };
-                let mut rng = self.inner.rng.lock().unwrap();
-                let q = engine::build_query(
-                    id,
-                    qname,
-                    qtype,
-                    false,
-                    Some(&edns),
-                    self.inner.config.engine.use_0x20,
-                    &mut rng,
-                );
-                drop(rng);
+                let q = self.with_rng(|rng| {
+                    engine::build_query(
+                        id,
+                        qname,
+                        qtype,
+                        false,
+                        Some(&edns),
+                        self.inner.config.engine.use_0x20,
+                        rng,
+                    )
+                });
 
                 let t0 = Instant::now();
                 let resp_bytes = match self.inner.transports.exchange(

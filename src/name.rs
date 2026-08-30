@@ -421,7 +421,7 @@ impl Name {
     pub fn randomized_case(&self, rng: &mut SplitMix64) -> Name {
         let bytes = &self.0;
         let mut out = Vec::with_capacity(bytes.len());
-        for &b in bytes {
+        for &b in bytes.iter() {
             if b.is_ascii_alphabetic() {
                 let upper = (rng.next_u64() & 1) == 0;
                 out.push(if upper { b.to_ascii_uppercase() } else { b });

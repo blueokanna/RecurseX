@@ -121,7 +121,15 @@ fn udp_loop(sock: Arc<UdpSocket>, resolver: Resolver) {
             .name("dns-udp".into())
             .spawn(move || {
                 let client_ip = Some(src.ip());
-                let response = answer(&resolver, &query_bytes, client_ip);
+                // UDP answers are truncated to the client's advertised EDNS
+                // payload size (RFC 6891 §6.2.5), so we never emit an
+                // oversized, fragmenting datagram or amplify past the
+                // client's buffer.
+                let udp_limit = Message::parse(&query_bytes)
+                    .ok()
+                    .and_then(|q| q.edns.map(|e| e.udp_payload_size as usize))
+                    .unwrap_or(512);
+                let response = answer(&resolver, &query_bytes, client_ip, Some(udp_limit));
                 let _ = responder.send_to(&response, src);
             });
     }
@@ -165,7 +173,8 @@ fn tcp_conn(mut stream: TcpStream, resolver: Resolver) -> std::io::Result<()> {
         }
         let mut query = vec![0u8; len];
         stream.read_exact(&mut query)?;
-        let response = answer(&resolver, &query, client_ip);
+        // TCP carries full responses; no truncation.
+        let response = answer(&resolver, &query, client_ip, None);
         let mut framed = Vec::with_capacity(response.len() + 2);
         framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
         framed.extend_from_slice(&response);
@@ -173,11 +182,20 @@ fn tcp_conn(mut stream: TcpStream, resolver: Resolver) -> std::io::Result<()> {
     }
 }
 
-/// Answer one query, returning the wire response.
-fn answer(resolver: &Resolver, query_bytes: &[u8], client_ip: Option<IpAddr>) -> Vec<u8> {
+/// Answer one query, returning the wire response. When `udp_limit` is set,
+/// the response is truncated to that many bytes with the TC bit (RFC 6891).
+fn answer(
+    resolver: &Resolver,
+    query_bytes: &[u8],
+    client_ip: Option<IpAddr>,
+    udp_limit: Option<usize>,
+) -> Vec<u8> {
     match Message::parse(query_bytes) {
         Ok(query) => {
-            let resp = resolver.handle_query(&query, client_ip);
+            let mut resp = resolver.handle_query(&query, client_ip);
+            if let Some(limit) = udp_limit {
+                resp.truncate_for_udp(limit);
+            }
             match resp.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(_) => query

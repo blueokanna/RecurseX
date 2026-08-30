@@ -53,9 +53,9 @@ dependencies = [
 
 [[package]]
 name = "rustbinary"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a4626197e4ea1997c2bcb74b6b54f2606db307d4a0edf1b01c484b4ce8b1ef"
+checksum = "229bae73c7a1daecd8f504d382ea8372683d1b2b30962048b051218ee96a6e7f"
 dependencies = [
  "nextjson",
  "rustbinary-derive",
@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "rustbinary-derive"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e66e0623319f3ec8a3f66bbe3eb29652d8970eeaa4c17b26a854b52087be2b4"
+checksum = "c8ff15f5a7a6c6048ff7b7984847585e7cc70f36d80ed431bfbda42417f961c9"
 dependencies = [
  "proc-macro2",
  "quote",

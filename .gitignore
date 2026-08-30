@@ -1,0 +1,12 @@
+# Build artifacts
+/target
+
+# Persistent cache snapshots (L3 tier) and temp writes
+*.rxc
+*.rxc.tmp
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -2,7 +2,7 @@
 name = "recurse-x"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.78"
 license = "Apache-2.0"
 authors = ["blueokanna", "HyphenTeam"]
 description = "A predictive adaptive recursive DNS resolver with a stability-aware multi-tier semantic cache, resolution graph, and adaptive upstream selection."
@@ -11,7 +11,7 @@ repository = "https://github.com/blueokanna/RecurseX"
 readme = "README.md"
 keywords = ["dns", "resolver", "recursive", "dnssec", "network"]
 categories = ["network-programming"]
-exclude = ["target", "**/*.log", "**/*.err"]
+exclude = ["target/", "**/*.log", "**/*.err"]
 
 [features]
 default = ["std", "dot", "doh", "doh3", "dnssec", "persist"]
@@ -24,10 +24,20 @@ doq = ["std", "dep:courierust"]
 persist = ["std", "dep:rustbinary"]
 
 [dependencies]
-nextjson = { version = "0.1", default-features = false, features = ["derive"] }
+nextjson = { version = "0.1.4", default-features = false, features = ["derive"] }
 tzcraft = { version = "0.1", default-features = false, features = ["alloc"] }
-rustbinary = { version = "0.1.7", features = ["derive", "fingerprint", "static-size", "reflection"], optional = true }
+rustbinary = { version = "0.1.8", default-features = false, features = [
+    "std",
+    "derive",
+    "fingerprint",
+    "static-size",
+    "reflection",
+], optional = true }
 courierust = { version = "1.0.3", optional = true }
+
+[[example]]
+name = "persist_cache"
+required-features = ["persist"]
 
 [dev-dependencies]
 
