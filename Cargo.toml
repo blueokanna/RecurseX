@@ -1,0 +1,45 @@
+[package]
+name = "recurse-x"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "Apache-2.0"
+authors = ["blueokanna", "HyphenTeam"]
+description = "A predictive adaptive recursive DNS resolver with a stability-aware multi-tier semantic cache, resolution graph, and adaptive upstream selection."
+homepage = "https://github.com/blueokanna/RecurseX"
+repository = "https://github.com/blueokanna/RecurseX"
+readme = "README.md"
+keywords = ["dns", "resolver", "recursive", "dnssec", "cache", "network"]
+categories = ["network-programming"]
+exclude = ["**/target", "**/*.log", "**/*.err"]
+
+[features]
+default = ["std", "dot", "doh", "doh3", "dnssec", "persist"]
+# std: networked resolver core (sockets, threads, engine, client-facing server).
+std = []
+# dnssec: DNSSEC data model, trust-chain validation, aggressive NSEC caching.
+dnssec = ["std", "dep:courierust"]
+# dot: DNS over TLS transport (upstream forwarder + client-facing acceptor).
+dot = ["std", "dep:courierust"]
+# doh: DNS over HTTPS transport via courierust's HTTP/1.1 + HTTP/2 client.
+doh = ["std", "dep:courierust"]
+# doh3: DNS over HTTP/3 (QUIC) — implies `doh`.
+doh3 = ["std", "doh"]
+# doq: RFC 9250 DNS over QUIC protocol layer (framing + session semantics).
+doq = ["std", "dep:courierust"]
+# persist: rustbinary-backed persistent cache tier (L3).
+persist = ["std", "dep:rustbinary"]
+
+[dependencies]
+nextjson = { version = "0.1", default-features = false, features = ["derive"] }
+tzcraft = { version = "0.1", default-features = false, features = ["alloc"] }
+# Pinned to 0.1.6: 0.1.7's `derive` feature re-exports `CompactBinary`,
+# which rustbinary-derive 0.1.4 does not provide (broken upstream combo).
+rustbinary = { version = "=0.1.6", features = ["derive", "fingerprint", "static-size", "reflection"], optional = true }
+courierust = { version = "1.0", optional = true }
+
+[dev-dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
