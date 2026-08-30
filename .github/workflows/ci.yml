@@ -64,24 +64,34 @@ jobs:
       - name: Check examples compile
         run: cargo build --examples --all-features
 
-  # ------------------------------------------------------------------
-  # Test — full suite on the MSRV and on stable.
-  # ------------------------------------------------------------------
-  test:
-    name: test (${{ matrix.rust }})
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ["1.78.0", stable]
+  test-msrv:
+    name: test (1.78 MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@${{ matrix.rust }}
+      - uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       - name: Test (all features)
         run: cargo test --all-features
       - name: Test (default features)
         run: cargo test
-      - name: Test (no_std core is at least buildable)
+      - name: no_std core builds
+        run: cargo build --no-default-features
+
+  test-stable:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins 1.78; remove it here so this job actually
+      # runs on the latest stable compiler.
+      - name: Ignore the MSRV toolchain file for this job
+        run: rm -f rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (all features)
+        run: cargo test --all-features
+      - name: Test (default features)
+        run: cargo test
+      - name: no_std core builds
         run: cargo build --no-default-features
