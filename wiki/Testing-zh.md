@@ -26,8 +26,9 @@ cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D 
 - **引擎与解析器** —— 应答分类（answer / NXDOMAIN / NODATA / referral / empty）、QNAME
   最小化步骤、负 TTL 规则、服务器绑 UDP 和 TCP 并应答。
 - **配置** —— JSON 回环、最小文档、转发器默认端口。
-- **加密传输** —— DoT/DoH/DoH3/DoQ 协议行为（帧与错误码的编译和单测；在线使用要网络，
-  DoQ 还要 provider）。
+- **加密传输** —— DoT/DoH/DoH3/DoQ 协议行为（帧、错误码、QUIC 包/加密/ACK 与 TLS
+  握手的单测；DoQ 的 QUIC-TLS 客户端还用本地 courierust HTTP/3 服务器做了含
+  Retry + 完整握手 + 1-RTT 的互操作验证）。
 - **DNSSEC** —— 一个 openssl 真实生成的 1024 位 RSA/SHA-256 向量能验过；改摘要或改签名都
   失败；DNSKEY 解析边界（零长度 → 4 字节指数）。
 - **持久化** —— 回环、stale 归位 cold、死条目丢弃、ECS 存活、篡改拒绝、原子写。

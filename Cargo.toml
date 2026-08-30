@@ -24,7 +24,7 @@ exclude = [
 ]
 
 [features]
-default = ["std", "dot", "doh", "doh3", "dnssec", "persist"]
+default = ["std", "dot", "doh", "doh3", "doq", "dnssec", "persist"]
 std = []
 dnssec = ["std", "dep:courierust"]
 dot = ["std", "dep:courierust"]

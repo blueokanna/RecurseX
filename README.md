@@ -202,11 +202,13 @@ enabled it also writes the cache snapshot on the configured interval.
 - **DNSSEC scope**: RRSIG validation implements RSA PKCS#1 v1.5 with SHA-256
   (from-scratch limb arithmetic, no external crypto dependency). ECDSA and
   SHA-1 signatures are not validated yet.
-- **DoQ transport**: RFC 9250 framing, session semantics and error codes are
-  implemented, but the QUIC connection itself comes through a
-  [`DoqProvider`](https://docs.rs/recurse-x/latest/recurse_x/transports/doq/trait.DoqProvider.html) trait — courierust's QUIC transport lives behind its HTTP/3
-  runtime and does not expose a raw connection, so the default provider
-  reports DoQ as unavailable rather than faking it. Wire a provider to use it.
+- **DoQ transport**: a from-scratch RFC 9000/9001/9002 QUIC v1 client plus
+  RFC 9250 framing, session semantics and error codes. The QUIC transport
+  and the QUIC-TLS 1.3 handshake are implemented directly on courierust's
+  public wire codecs (packet/frame codecs, X25519, HKDF, RSA-PSS/
+  PKCS#1/ECDSA/Ed25519 verification), so the default transport talks to real
+  RFC 9250 servers. A custom QUIC stack can still be substituted through the
+  [`DoqProvider`](https://docs.rs/recurse-x/latest/recurse_x/transports/doq/trait.DoqProvider.html) trait.
 - **Time**: `tzcraft` has no IANA timezone database, so the estimator's
   time-of-day profile is wall-clock UTC.
 - **No DNS-over-HTTPS server side**: the client-facing server accepts plain
@@ -222,7 +224,7 @@ enabled it also writes the cache snapshot on the configured interval.
 | `dot`     | yes     | DoT upstream transport (courierust TLS)         |
 | `doh`     | yes     | DoH upstream transport (courierust HTTP client) |
 | `doh3`    | yes     | DoH3 upstream (implies `doh`)                   |
-| `doq`     | no      | DoQ (RFC 9250) protocol layer                   |
+| `doq`     | yes    | DoQ (RFC 9250) upstream transport, from-scratch QUIC client |
 | `dnssec`  | yes     | DNSSEC validation                               |
 | `persist` | yes     | rustbinary-backed L3 persistent cache           |
 

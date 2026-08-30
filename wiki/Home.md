@@ -34,5 +34,6 @@ files.
 2. **Nothing unbounded.** Every model in this crate has a hard cap. A hostile
    query stream can make the resolver busy, but it cannot make it grow
    without bound.
-3. **No faked transports.** If a protocol layer is not fully usable (see the
-   DoQ provider), the crate says so instead of pretending.
+3. **No faked transports.** Every transport ships a real, usable
+   implementation. If a layer were only a stub, the crate would say so
+   instead of pretending.

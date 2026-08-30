@@ -31,9 +31,10 @@ cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D 
   NODATA / referral / empty), QNAME minimization steps, negative TTL rules,
   server binds UDP and TCP and answers.
 - **Config** — JSON round-trip, minimal document, forwarder default ports.
-- **Encrypted transports** — DoT/DoH/DoH3/DoQ protocol behavior (compiled
-  and unit-tested for framing/codes; live use needs network + a provider for
-  DoQ).
+- **Encrypted transports** — DoT/DoH/DoH3/DoQ protocol behavior (framing,
+  error codes, QUIC packet/crypto/ACK and TLS handshake unit tests; the DoQ
+  QUIC-TLS client is also verified against a local courierust HTTP/3 server
+  with Retry + full handshake + 1-RTT).
 - **DNSSEC** — an authentic openssl-generated 1024-bit RSA/SHA-256 vector
   verifies; tampering with the digest or the signature fails; DNSKEY parsing
   edge cases (zero-length → 4-byte exponent).

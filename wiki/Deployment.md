@@ -59,6 +59,7 @@ schedule.
 - DoT/DoH/DoH3/DoQ are **upstream** transports; the client-facing server is
   plain UDP/TCP. Terminate TLS in front of it if you need encrypted client
   transport.
-- DoQ's QUIC connection comes from a provider trait; the default provider
-  reports DoQ as unavailable (see the README limitations).
+- DoQ ships a from-scratch RFC 9250 client (QUIC v1 + QUIC-TLS 1.3) as the
+  default transport, so encrypted upstream forwarding works out of the box;
+  a custom QUIC stack can still be plugged in through the `DoqProvider` trait.
 - DNSSEC is RSA/SHA-256; ECDSA chains resolve as `Indeterminate`.

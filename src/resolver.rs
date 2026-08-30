@@ -285,7 +285,7 @@ impl Resolver {
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let mut forwarder_set = crate::forward::ForwarderSet::new(
             courierust::courierust_tls::RootStore::new(),
-            true,
+            false,
             now_secs,
         );
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
@@ -325,9 +325,12 @@ impl Resolver {
         f(&mut rng)
     }
 
-    /// Replace the trust roots used for encrypted forwarders (DoT/DoH/DoH3).
-    /// Without roots, encrypted forwarders cannot verify certificates and
-    /// will be rejected.
+    /// Replace the trust roots used for encrypted forwarders
+    /// (DoT/DoH/DoH3/DoQ). By default encrypted forwarders run with
+    /// certificate verification disabled (an empty root store plus
+    /// `verify: true` would reject every server). To enable real
+    /// verification, supply trust anchors **and** set `verify: true`;
+    /// the hostname and chain are then validated against them.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub fn set_forwarder_roots(&self, roots: courierust::courierust_tls::RootStore, verify: bool) {
         let now = std::time::SystemTime::now()

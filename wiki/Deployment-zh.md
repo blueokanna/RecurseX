@@ -43,5 +43,6 @@
 
 - DoT/DoH/DoH3/DoQ 是**上游**传输；面向客户端的服务器是普通 UDP/TCP。要加密客户端传输，
   请在前面挂 TLS 终结。
-- DoQ 的 QUIC 连接来自 provider trait；默认 provider 如实报告 DoQ 不可用（见 README 局限）。
+- DoQ 自带从零实现的 RFC 9250 客户端（QUIC v1 + QUIC-TLS 1.3）作为默认传输，
+  开箱即可加密上游转发；仍可通过 `DoqProvider` trait 插入自定义 QUIC 栈。
 - DNSSEC 是 RSA/SHA-256；ECDSA 链解析为 `Indeterminate`。

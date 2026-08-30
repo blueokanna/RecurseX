@@ -175,9 +175,11 @@ let _thread = resolver.spawn_maintenance(); // sweep + 图剪枝 + 预测式预�
 
 - **DNSSEC 范围**：RRSIG 校验实现了 RSA PKCS#1 v1.5 + SHA-256（从零手写的 limb 大数运算，
   不依赖外部密码库）。ECDSA 与 SHA-1 签名尚未支持。
-- **DoQ 传输**：RFC 9250 的帧、会话语义和错误码都实现了，但 QUIC 连接本身走一个
-  [`DoqProvider`](https://docs.rs/recurse-x/latest/recurse_x/transports/doq/trait.DoqProvider.html) trait——courierust 的 QUIC 传输藏在它的 HTTP/3 运行时后面，没有暴露裸连接，
-  所以默认 provider 会如实报告 DoQ 不可用，而不是假装能用。接上 provider 即可用。
+- **DoQ 传输**：从零实现的 RFC 9000/9001/9002 QUIC v1 客户端 + RFC 9250 帧、
+  会话语义与错误码。QUIC 传输与 QUIC-TLS 1.3 握手直接构建在 courierust 公开的
+  线格式编解码（包/帧编解码、X25519、HKDF、RSA-PSS/PKCS#1/ECDSA/Ed25519 验签）之上，
+  默认传输即可直连真实 RFC 9250 服务器。高级嵌入仍可通过
+  [`DoqProvider`](https://docs.rs/recurse-x/latest/recurse_x/transports/doq/trait.DoqProvider.html) trait 替换自定义 QUIC 栈。
 - **时间**：`tzcraft` 没有 IANA 时区库，所以估计器的时段画像用的是墙钟 UTC。
 - **没有 DoH 服务端**：面向客户端的服务器只收普通 UDP/TCP。DoT/DoH/DoH3/DoQ 是上游传输。
 - **首次 `cargo build` 需要网络**（要从 crates.io 拉 courierust 等依赖）。
@@ -190,7 +192,7 @@ let _thread = resolver.spawn_maintenance(); // sweep + 图剪枝 + 预测式预�
 | `dot`     | 开   | DoT 上游传输（courierust TLS）              |
 | `doh`     | 开   | DoH 上游传输（courierust HTTP 客户端）      |
 | `doh3`    | 开   | DoH3 上游（隐含 `doh`）                     |
-| `doq`     | 关   | DoQ（RFC 9250）协议层                       |
+| `doq`     | 开   | DoQ（RFC 9250）上游传输，从零实现的 QUIC 客户端 |
 | `dnssec`  | 开   | DNSSEC 校验                                 |
 | `persist` | 开   | rustbinary 支撑的 L3 持久化缓存             |
 

@@ -53,6 +53,8 @@ pub struct ForwarderSet {
     doh: Mutex<BTreeMap<Endpoint, crate::transports::doh::DohTransport>>,
     #[cfg(feature = "doh3")]
     doh3: Mutex<BTreeMap<Endpoint, crate::transports::doh3::Doh3Transport>>,
+    #[cfg(feature = "doq")]
+    doq: Mutex<BTreeMap<Endpoint, crate::transports::doq::DoqTransport>>,
     plain: Transports,
     roots: courierust::courierust_tls::RootStore,
     verify: bool,
@@ -70,6 +72,8 @@ impl ForwarderSet {
             doh: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "doh3")]
             doh3: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "doq")]
+            doq: Mutex::new(BTreeMap::new()),
             plain: Transports::new(),
             roots,
             verify,
@@ -171,7 +175,16 @@ impl ForwarderSet {
             }
             #[cfg(feature = "doq")]
             Proto::DoQ => {
-                let t = crate::transports::doq::DoqTransport::default();
+                let mut cache = self.doq.lock().unwrap();
+                let t = cache.entry(f.endpoint).or_insert_with(|| {
+                    let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
+                    crate::transports::doq::DoqTransport::for_host(
+                        host,
+                        self.roots.clone(),
+                        self.verify,
+                        self.now,
+                    )
+                });
                 t.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(not(feature = "dot"))]
