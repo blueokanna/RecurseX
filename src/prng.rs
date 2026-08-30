@@ -66,8 +66,6 @@ impl SplitMix64 {
     #[inline]
     pub fn below(&mut self, n: u64) -> u64 {
         debug_assert!(n > 0);
-        // Largest multiple of `n` that fits in u64; values below it are
-        // uniform mod n. Rejection sampling removes the modulo bias.
         let limit = (u64::MAX / n) * n;
         loop {
             let v = self.next_u64();
