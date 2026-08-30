@@ -17,8 +17,11 @@ use crate::time::Ts;
 /// A resource-record set: all records of one type at one owner name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RrSet {
+    /// The owner name.
     pub name: Name,
+    /// The record type.
     pub rr_type: RrType,
+    /// The record class.
     pub class: RrClass,
     /// The data records (excludes RRSIG).
     pub records: Vec<Record>,

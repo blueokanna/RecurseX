@@ -252,7 +252,7 @@ cargo +1.78.0 clippy --no-default-features --lib -- -D warnings
 cargo +1.78.0 clippy --all-targets --all-features -- -D warnings
 ```
 
-The suite is 128 tests: wire codec, cache/stability/admission, estimator,
+The suite is 130 tests: wire codec, cache/stability/admission, estimator,
 planner, graph, upstream model, policy, engine classification, resolver
 orchestration, server, config JSON round-trip, encrypted transports, DNSSEC
 (including an authentic openssl-generated 1024-bit RSA vector), the persistent

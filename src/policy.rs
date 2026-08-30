@@ -140,7 +140,9 @@ impl RateLimiter {
 /// `*.example.com`), or exactly the name when `exact` is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockRule {
+    /// The blocked suffix (all names at or below it when `exact` is false).
     pub suffix: Name,
+    /// If true, only `suffix` itself is blocked (not its subtree).
     pub exact: bool,
 }
 

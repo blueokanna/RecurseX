@@ -18,95 +18,173 @@ use crate::qtype::{DnssecAlgorithm, DsDigestType, RrClass, RrType};
 /// The payload of a resource record.
 #[derive(Clone, PartialEq, Eq)]
 pub enum RData {
+    /// IPv4 host address (RFC 1035).
     A(Ipv4Addr),
+    /// IPv6 host address (RFC 3596).
     Aaaa(Ipv6Addr),
+    /// Canonical name (RFC 1035).
     Cname(Name),
+    /// DNAME redirection (RFC 6672).
     Dname(Name),
+    /// Authoritative nameserver (RFC 1035).
     Ns(Name),
+    /// Domain-name pointer (RFC 1035).
     Ptr(Name),
+    /// Mail exchange (RFC 1035).
     Mx {
+        /// Preference (lower is preferred).
         preference: u16,
+        /// The mail exchanger host.
         exchange: Name,
     },
+    /// Start of authority (RFC 1035).
     Soa {
+        /// Primary master name server.
         mname: Name,
+        /// Responsible person mailbox.
         rname: Name,
+        /// Zone serial number.
         serial: u32,
+        /// Refresh interval in seconds.
         refresh: u32,
+        /// Retry interval in seconds.
         retry: u32,
+        /// Expire interval in seconds.
         expire: u32,
+        /// Minimum (negative) TTL in seconds.
         minimum: u32,
     },
+    /// Text strings (RFC 1035), each a separate string.
     Txt(Vec<Vec<u8>>),
+    /// Service locator (RFC 2782).
     Srv {
+        /// Priority (lower is preferred).
         priority: u16,
+        /// Weight for selection among equal priorities.
         weight: u16,
+        /// The service port.
         port: u16,
+        /// The service target.
         target: Name,
     },
+    /// Naming authority pointer (RFC 3403).
     Naptr {
+        /// Order (lower is preferred).
         order: u16,
+        /// Preference within an order.
         preference: u16,
+        /// Flags (e.g. `"S"`, `"A"`, `"U"`).
         flags: Vec<u8>,
+        /// Service parameters.
         services: Vec<u8>,
+        /// Regular expression.
         regexp: Vec<u8>,
+        /// Replacement name.
         replacement: Name,
     },
+    /// Delegation signer (RFC 4034).
     Ds {
+        /// The key tag of the referenced DNSKEY.
         key_tag: u16,
+        /// The DNSKEY algorithm.
         algorithm: DnssecAlgorithm,
+        /// The digest type.
         digest_type: DsDigestType,
+        /// The digest bytes.
         digest: Vec<u8>,
     },
+    /// DNSSEC public key (RFC 4034).
     Dnskey {
+        /// Key flags (zone key, SEP, ...).
         flags: u16,
+        /// Protocol (must be 3).
         protocol: u8,
+        /// The key algorithm.
         algorithm: DnssecAlgorithm,
+        /// The public key material.
         public_key: Vec<u8>,
     },
+    /// DNSSEC signature (RFC 4034).
     Rrsig {
+        /// The RR type covered by this signature.
         type_covered: RrType,
+        /// The signing algorithm.
         algorithm: DnssecAlgorithm,
+        /// Number of labels in the original owner name.
         labels: u8,
+        /// The original TTL of the covered set.
         original_ttl: u32,
+        /// Signature expiration (serial date arithmetic, RFC 4034 §3.2).
         expiration: u32,
+        /// Signature inception (serial date arithmetic).
         inception: u32,
+        /// Key tag of the signing key.
         key_tag: u16,
+        /// The signer's name.
         signer: Name,
+        /// The signature bytes.
         signature: Vec<u8>,
     },
+    /// Next secure record (RFC 4034).
     Nsec {
+        /// The next owner name in canonical order.
         next: Name,
+        /// The types present at this name.
         types: Vec<RrType>,
     },
+    /// Hashed next secure record (RFC 5155).
     Nsec3 {
+        /// The hash algorithm (1 = SHA-1).
         hash_alg: u8,
+        /// Flags (opt-out).
         flags: u8,
+        /// Number of hash iterations.
         iterations: u16,
+        /// The salt bytes (empty for no salt).
         salt: Vec<u8>,
+        /// The hashed next owner name.
         next_hashed: Vec<u8>,
+        /// The types present at this name.
         types: Vec<RrType>,
     },
+    /// NSEC3 parameters (RFC 5155).
     Nsec3Param {
+        /// The hash algorithm (1 = SHA-1).
         hash_alg: u8,
+        /// Flags.
         flags: u8,
+        /// Number of hash iterations.
         iterations: u16,
+        /// The salt bytes (empty for no salt).
         salt: Vec<u8>,
     },
+    /// Certification authority authorization (RFC 8659).
     Caa {
+        /// Critical flag.
         flags: u8,
+        /// Property tag (e.g. `"issue"`).
         tag: Vec<u8>,
+        /// Property value.
         value: Vec<u8>,
     },
+    /// TLSA certificate association (RFC 6698).
     Tlsa {
+        /// Certificate usage.
         usage: u8,
+        /// Selector.
         selector: u8,
+        /// Matching type.
         matching_type: u8,
+        /// The certificate association data.
         data: Vec<u8>,
     },
+    /// Service binding and parameters (RFC 9460).
     Svcb {
+        /// Priority (0 = alias mode).
         priority: u16,
+        /// The target name.
         target: Name,
+        /// The SvcParam key/value pairs.
         params: Vec<(u16, Vec<u8>)>,
     },
     /// Any other type: the raw RDATA bytes.

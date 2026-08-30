@@ -8,24 +8,41 @@ use core::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::{Error, Result};
 
-/// EDNS option codes.
+/// EDNS option codes (RFC 6891 §6.1.2 and successors).
 pub mod opt {
+    /// LLQ (RFC 2136, experimental).
     pub const LLQ: u16 = 1;
+    /// Update Lease (RFC 2136, experimental).
     pub const UL: u16 = 2;
+    /// Name Server Identifier (RFC 5001).
     pub const NSID: u16 = 3;
+    /// DNSSEC Algorithm Understood (RFC 6975).
     pub const DAU: u16 = 5;
+    /// DS Hash Understood (RFC 6975).
     pub const DHU: u16 = 6;
+    /// NSEC3 Hash Understood (RFC 6975).
     pub const N3U: u16 = 7;
+    /// Client Subnet (RFC 7871).
     pub const ECS: u16 = 8;
+    /// Expire (RFC 7314).
     pub const EXPIRE: u16 = 9;
+    /// DNS Cookie (RFC 7873).
     pub const COOKIE: u16 = 10;
+    /// TCP Keepalive (RFC 7828).
     pub const KEEPALIVE: u16 = 11;
+    /// Padding (RFC 7830).
     pub const PADDING: u16 = 12;
+    /// CHAIN (RFC 7901).
     pub const CHAIN: u16 = 13;
+    /// Key Tag (RFC 8145).
     pub const KEY_TAG: u16 = 14;
+    /// Extended DNS Errors (RFC 8914).
     pub const EDE: u16 = 15;
+    /// Client Tag (RFC 8914).
     pub const CLIENT_TAG: u16 = 16;
+    /// Server Tag (RFC 8914).
     pub const SERVER_TAG: u16 = 17;
+    /// Zone Version (RFC 9108).
     pub const ZONEVERSION: u16 = 18;
 }
 
@@ -36,7 +53,12 @@ pub enum EdnsOption {
     Ecs(Ecs),
     /// DNS Cookie (RFC 7873): the 8-byte client cookie and, optionally,
     /// the server cookie.
-    Cookie { client: [u8; 8], server: Vec<u8> },
+    Cookie {
+        /// The 8-byte client cookie.
+        client: [u8; 8],
+        /// The server cookie, if the server returned one.
+        server: Vec<u8>,
+    },
     /// TCP Keepalive (RFC 7828). `None` requests the server's idle timeout.
     TcpKeepalive(Option<u16>),
     /// Padding (RFC 7830) — the length in octets the sender asks to pad to.
@@ -46,9 +68,19 @@ pub enum EdnsOption {
     /// NSID (RFC 5001).
     Nsid(Vec<u8>),
     /// Extended DNS Errors (RFC 8914).
-    Ede { info_code: u16, extra: Vec<u8> },
+    Ede {
+        /// The EDE info-code (RFC 8914 §6).
+        info_code: u16,
+        /// Extra text carried with the error.
+        extra: Vec<u8>,
+    },
     /// Any other option, kept raw.
-    Unknown { code: u16, data: Vec<u8> },
+    Unknown {
+        /// The option code on the wire.
+        code: u16,
+        /// The raw option data.
+        data: Vec<u8>,
+    },
 }
 
 impl EdnsOption {

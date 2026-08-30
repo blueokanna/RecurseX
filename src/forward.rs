@@ -20,6 +20,7 @@ use crate::upstream::{Endpoint, Proto};
 /// A forwarding upstream.
 #[derive(Clone, Debug)]
 pub struct Forwarder {
+    /// The upstream endpoint.
     pub endpoint: Endpoint,
     /// TLS server name for DoT / DoH / DoH3 / DoQ (SNI + verification).
     pub host: Option<String>,

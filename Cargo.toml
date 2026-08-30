@@ -11,7 +11,17 @@ repository = "https://github.com/blueokanna/RecurseX"
 readme = "README.md"
 keywords = ["dns", "resolver", "recursive", "dnssec", "network"]
 categories = ["network-programming"]
-exclude = ["target/", "**/*.log", "**/*.err"]
+exclude = [
+    "target/",
+    "**/*.log",
+    "**/*.err",
+    ".github/",
+    ".gitignore",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "wiki/",
+    ".vscode/",
+]
 
 [features]
 default = ["std", "dot", "doh", "doh3", "dnssec", "persist"]

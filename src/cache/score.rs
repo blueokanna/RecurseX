@@ -20,12 +20,16 @@
 use crate::stability::StabilityModel;
 use crate::time::Ts;
 
-/// Reference values used to normalize the raw signals.
-pub const POPULARITY_REF: f64 = 1.0; // estimator output is already 0..1
-pub const LOCALITY_WINDOW_SECS: f64 = 300.0; // 5 minutes of recency
-pub const TTL_REF_SECS: f64 = 3600.0; // an hour of TTL is "full value"
-pub const COST_REF_MS: f64 = 500.0; // 500 ms of resolution cost is "full"
-pub const MEM_REF_BYTES: f64 = 4096.0; // 4 KiB of entry is "full cost"
+/// Reference value for the popularity signal (estimator output is already 0..1).
+pub const POPULARITY_REF: f64 = 1.0;
+/// Reference recency window in seconds (5 minutes counts as "fully local").
+pub const LOCALITY_WINDOW_SECS: f64 = 300.0;
+/// Reference TTL in seconds (an hour of TTL is "full value").
+pub const TTL_REF_SECS: f64 = 3600.0;
+/// Reference resolution cost in milliseconds (500 ms is "full cost").
+pub const COST_REF_MS: f64 = 500.0;
+/// Reference entry size in bytes (4 KiB is "full cost").
+pub const MEM_REF_BYTES: f64 = 4096.0;
 
 /// The linear weights of the admission score.
 #[derive(Clone, Copy, Debug, PartialEq)]

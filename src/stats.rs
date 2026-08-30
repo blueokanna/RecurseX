@@ -5,41 +5,70 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Live counters.
 #[derive(Debug, Default)]
 pub struct Stats {
+    /// Queries received.
     pub queries: AtomicU64,
+    /// Cache hits.
     pub cache_hits: AtomicU64,
+    /// Cache misses.
     pub cache_misses: AtomicU64,
+    /// Stale answers served (RFC 8767).
     pub served_stale: AtomicU64,
+    /// Background prefetches performed.
     pub prefetches: AtomicU64,
+    /// Queries sent upstream.
     pub upstream_queries: AtomicU64,
+    /// Upstream timeouts.
     pub upstream_timeouts: AtomicU64,
+    /// SERVFAIL responses.
     pub servfails: AtomicU64,
+    /// NXDOMAIN responses.
     pub nxdomain: AtomicU64,
+    /// NODATA (empty NOERROR) responses.
     pub nodata: AtomicU64,
+    /// Queries rate-limited.
     pub rate_limited: AtomicU64,
+    /// Queries blocked by policy.
     pub policy_blocked: AtomicU64,
+    /// Queries served by coalescing.
     pub coalesced: AtomicU64,
+    /// Internal errors.
     pub errors: AtomicU64,
     /// Sum of resolve times in microseconds (for the average).
     pub resolve_time_us_sum: AtomicU64,
+    /// Number of resolves sampled for the average.
     pub resolve_count: AtomicU64,
 }
 
 /// A point-in-time snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StatsSnapshot {
+    /// Queries received.
     pub queries: u64,
+    /// Cache hits.
     pub cache_hits: u64,
+    /// Cache misses.
     pub cache_misses: u64,
+    /// Stale answers served (RFC 8767).
     pub served_stale: u64,
+    /// Background prefetches performed.
     pub prefetches: u64,
+    /// Queries sent upstream.
     pub upstream_queries: u64,
+    /// Upstream timeouts.
     pub upstream_timeouts: u64,
+    /// SERVFAIL responses.
     pub servfails: u64,
+    /// NXDOMAIN responses.
     pub nxdomain: u64,
+    /// NODATA (empty NOERROR) responses.
     pub nodata: u64,
+    /// Queries rate-limited.
     pub rate_limited: u64,
+    /// Queries blocked by policy.
     pub policy_blocked: u64,
+    /// Queries served by coalescing.
     pub coalesced: u64,
+    /// Internal errors.
     pub errors: u64,
     /// Average resolve time in microseconds (0 when no samples).
     pub avg_resolve_us: u64,

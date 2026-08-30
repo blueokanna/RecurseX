@@ -34,8 +34,11 @@ use crate::time::Ts;
 /// the cache key (RFC 7871 §7.2: ECS and non-ECS answers must not mix).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct EcsKey {
+    /// The address family (1 = IPv4, 2 = IPv6, RFC 7871).
     pub family: u16,
+    /// The source prefix length in bits.
     pub prefix: u8,
+    /// The address bytes, truncated to the prefix length.
     pub addr: Vec<u8>,
 }
 
@@ -57,8 +60,11 @@ impl EcsKey {
 /// The key of a cached entry.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct CacheKey {
+    /// The owner name.
     pub name: Name,
+    /// The record type.
     pub rr_type: RrType,
+    /// The record class.
     pub class: RrClass,
     /// The ECS partition (None = non-ECS data).
     pub ecs: Option<EcsKey>,
@@ -94,8 +100,11 @@ impl CacheKey {
 /// Which tier an entry lives in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
+    /// Small, high-score tier served on the hot path.
     Hot,
+    /// The main working set.
     Warm,
+    /// Aged or expired-but-within-stale-window entries (serve-stale).
     Cold,
 }
 
@@ -106,8 +115,11 @@ pub enum EntryKind {
     Positive(RrSet),
     /// A NODATA (NOERROR, empty) or other negative answer for the key.
     Negative {
+        /// The negative response code (NXDOMAIN, NOERROR/NODATA, ...).
         rcode: Rcode,
+        /// The SOA from the authority section, if present (RFC 2308).
         soa: Option<Record>,
+        /// The effective negative TTL in seconds.
         ttl_secs: u32,
     },
 }
@@ -115,7 +127,9 @@ pub enum EntryKind {
 /// A cache entry.
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
+    /// The key this entry is stored under.
     pub key: CacheKey,
+    /// What the entry holds (positive RRset or negative answer).
     pub kind: EntryKind,
     /// When the entry was inserted (or last refreshed).
     pub inserted: Ts,
@@ -201,10 +215,15 @@ impl CacheEntry {
 /// A per-name NXDOMAIN negative entry (applies to any type below the name).
 #[derive(Clone, Debug)]
 pub struct NegativeEntry {
+    /// Absolute expiry timestamp.
     pub expires: Ts,
+    /// The negative response code (always NXDOMAIN here).
     pub rcode: Rcode,
+    /// The SOA record, if present.
     pub soa: Option<Record>,
+    /// When the entry was inserted.
     pub inserted: Ts,
+    /// Number of times served.
     pub served: u64,
 }
 
@@ -218,18 +237,28 @@ pub enum LookupOutcome {
     Stale(CacheEntry),
     /// The exact type is not cached, but a fresh CNAME for the name is.
     Cname {
+        /// The CNAME target.
         target: Name,
+        /// TTL of the CNAME record in seconds.
         ttl_secs: u32,
+        /// Absolute expiry timestamp.
         expires: Ts,
+        /// Whether the CNAME was DNSSEC-validated.
         validated: bool,
     },
     /// A live NXDOMAIN for the name.
-    NxDomain { expires: Ts, soa: Option<Record> },
+    NxDomain {
+        /// Absolute expiry timestamp.
+        expires: Ts,
+        /// The SOA record, if present.
+        soa: Option<Record>,
+    },
     /// Nothing usable.
     Miss,
 }
 
 impl LookupOutcome {
+    /// Whether the lookup produced a usable result (anything but `Miss`).
     pub fn is_hit(&self) -> bool {
         !matches!(self, LookupOutcome::Miss)
     }
@@ -291,14 +320,23 @@ impl Default for CacheConfig {
 /// Runtime cache counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
+    /// Entries in the hot tier.
     pub hot_len: usize,
+    /// Entries in the warm tier.
     pub warm_len: usize,
+    /// Entries in the cold tier.
     pub cold_len: usize,
+    /// Entries in the NXDOMAIN store.
     pub nx_len: usize,
+    /// Cache hits.
     pub hits: u64,
+    /// Cache misses.
     pub misses: u64,
+    /// Stale entries served (RFC 8767).
     pub stale_served: u64,
+    /// Entries admitted.
     pub inserts: u64,
+    /// Entries evicted.
     pub evictions: u64,
 }
 

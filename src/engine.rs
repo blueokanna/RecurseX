@@ -158,15 +158,31 @@ pub enum ResponseKind {
         rrsigs: Vec<Record>,
     },
     /// A CNAME for the query name.
-    Cname { record: Record, rrsigs: Vec<Record> },
+    Cname {
+        /// The CNAME record.
+        record: Record,
+        /// RRSIGs carried alongside.
+        rrsigs: Vec<Record>,
+    },
     /// A DNAME that applies to the query name.
-    Dname { record: Record },
+    Dname {
+        /// The DNAME record.
+        record: Record,
+    },
     /// A negative answer (NXDOMAIN or NODATA) with an optional SOA.
-    Negative { rcode: Rcode, soa: Option<Record> },
+    Negative {
+        /// The negative response code.
+        rcode: Rcode,
+        /// The SOA from the authority section, if present.
+        soa: Option<Record>,
+    },
     /// A referral to a child zone.
     Referral {
+        /// The zone being referred to.
         zone: Name,
+        /// The NS records of the child zone.
         ns: Vec<Record>,
+        /// Glue address records, if any.
         glue: Vec<Record>,
     },
     /// Nothing usable.

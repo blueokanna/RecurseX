@@ -18,14 +18,23 @@ pub const MAX_QUESTIONS: usize = 16;
 /// The 16-bit flags word of a DNS header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderFlags {
+    /// Query/response flag (0 = query, 1 = response).
     pub qr: bool,
+    /// The opcode.
     pub opcode: Opcode,
+    /// Authoritative answer flag.
     pub aa: bool,
+    /// Truncation flag.
     pub tc: bool,
+    /// Recursion desired flag.
     pub rd: bool,
+    /// Recursion available flag.
     pub ra: bool,
+    /// Authentic data flag (DNSSEC).
     pub ad: bool,
+    /// Checking disabled flag (DNSSEC).
     pub cd: bool,
+    /// The response code.
     pub rcode: Rcode,
 }
 
@@ -46,6 +55,7 @@ impl Default for HeaderFlags {
 }
 
 impl HeaderFlags {
+    /// Encode the flags into the 16-bit wire word.
     pub fn to_u16(self) -> u16 {
         let mut v = 0u16;
         if self.qr {
@@ -74,6 +84,7 @@ impl HeaderFlags {
         v
     }
 
+    /// Decode the flags from the 16-bit wire word.
     pub fn from_u16(v: u16) -> Self {
         Self {
             qr: v & 0x8000 != 0,
@@ -92,18 +103,26 @@ impl HeaderFlags {
 /// A question section entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
+    /// The query name.
     pub qname: Name,
+    /// The query type.
     pub qtype: RrType,
+    /// The query class.
     pub qclass: RrClass,
 }
 
 /// A parsed or to-be-serialized DNS message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    /// The 16-bit message ID.
     pub id: u16,
+    /// The header flags.
     pub flags: HeaderFlags,
+    /// The question section.
     pub questions: Vec<Question>,
+    /// The answer section.
     pub answers: Vec<Record>,
+    /// The authority section.
     pub authorities: Vec<Record>,
     /// Non-OPT additional records.
     pub additionals: Vec<Record>,

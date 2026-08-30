@@ -26,14 +26,20 @@ pub trait DnsTransport: Send + Sync {
 /// The set of transports available to the engine.
 #[derive(Default)]
 pub struct Transports {
+    /// Plain UDP transport.
     pub udp: udp::UdpTransport,
+    /// Plain TCP transport.
     pub tcp: tcp::TcpTransport,
+    /// DNS-over-TLS transport (feature `dot`).
     #[cfg(feature = "dot")]
     pub dot: crate::transports::dot::DotTransport,
+    /// DNS-over-HTTPS transport (feature `doh`).
     #[cfg(feature = "doh")]
     pub doh: crate::transports::doh::DohTransport,
+    /// DNS-over-HTTP/3 transport (feature `doh3`).
     #[cfg(feature = "doh3")]
     pub doh3: crate::transports::doh3::Doh3Transport,
+    /// DNS-over-QUIC transport (feature `doq`).
     #[cfg(feature = "doq")]
     pub doq: crate::transports::doq::DoqTransport,
 }

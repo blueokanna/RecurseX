@@ -13,7 +13,7 @@ cargo build --no-default-features
 cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D warnings
 ```
 
-## 124 个测试覆盖了什么
+## 130 个测试覆盖了什么
 
 - **线格式编解码**（`message`、`rdata`、`name`、`qtype`、`edns`）—— 解析/序列化回环、
   名字压缩、截断、错误应答、NSEC 位图、EDNS 选项。

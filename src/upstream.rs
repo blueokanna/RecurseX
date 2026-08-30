@@ -24,11 +24,17 @@ use crate::time::Ts;
 /// The transport used to reach an upstream.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum Proto {
+    /// Plain DNS over UDP (RFC 1035).
     Udp,
+    /// Plain DNS over TCP (RFC 1035 / 7766).
     Tcp,
+    /// DNS over TLS, a.k.a. DoT (RFC 7858).
     Tls,
+    /// DNS over HTTPS (RFC 8484).
     DoH,
+    /// DNS over HTTP/3 (RFC 8484 over QUIC).
     DoH3,
+    /// DNS over QUIC (RFC 9250).
     DoQ,
 }
 
@@ -70,8 +76,11 @@ impl fmt::Display for Proto {
 /// A concrete upstream endpoint.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Endpoint {
+    /// The server address.
     pub ip: IpAddr,
+    /// The server port.
     pub port: u16,
+    /// The transport to use.
     pub proto: Proto,
 }
 
@@ -105,6 +114,7 @@ impl fmt::Display for Endpoint {
 /// The statistical path model for one upstream.
 #[derive(Clone, Debug)]
 pub struct PathModel {
+    /// The endpoint this model describes.
     pub endpoint: Endpoint,
     /// Successful exchanges.
     pub successes: u64,

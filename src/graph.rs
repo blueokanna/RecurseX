@@ -55,9 +55,13 @@ impl NodeId {
 /// The kind of a node (used by the planner).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeKind {
+    /// A domain name node.
     Domain,
+    /// A specific RRset node.
     Rrset,
+    /// A nameserver name node.
     Ns,
+    /// A concrete server address node.
     Server,
 }
 
@@ -77,6 +81,7 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    /// A stable string key for diagnostics.
     pub fn as_str(&self) -> &'static str {
         match self {
             EdgeKind::DependsOn => "depends_on",
@@ -91,7 +96,9 @@ impl EdgeKind {
 /// A node record.
 #[derive(Clone, Debug)]
 pub struct GraphNode {
+    /// The node identity.
     pub id: NodeId,
+    /// What kind of node this is.
     pub kind: NodeKind,
     /// How many resolutions touched this node.
     pub weight: u64,
@@ -104,11 +111,15 @@ pub struct GraphNode {
 /// An edge record.
 #[derive(Clone, Debug)]
 pub struct GraphEdge {
+    /// The source node.
     pub from: NodeId,
+    /// The destination node.
     pub to: NodeId,
+    /// The edge semantics.
     pub kind: EdgeKind,
     /// How many times the edge was observed.
     pub weight: u64,
+    /// Last time the edge was observed.
     pub last_seen: Ts,
 }
 

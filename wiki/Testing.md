@@ -13,7 +13,7 @@ cargo build --no-default-features
 cargo clippy --features std,dot,doh,doh3,doq,dnssec,persist --all-targets -- -D warnings
 ```
 
-## What the 124 tests cover
+## What the 130 tests cover
 
 - **Wire codec** (`message`, `rdata`, `name`, `qtype`, `edns`) — parse /
   serialize round-trips, name compression, truncation, error responses,

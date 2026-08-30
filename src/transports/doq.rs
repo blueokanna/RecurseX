@@ -20,12 +20,19 @@ use crate::upstream::{Endpoint, Proto};
 
 /// RFC 9250 §7: DOQ application error codes.
 pub mod error_code {
+    /// No error.
     pub const NO_ERROR: u64 = 0x0;
+    /// The server experienced an internal error.
     pub const INTERNAL_ERROR: u64 = 0x1;
+    /// The client or server detected a protocol violation.
     pub const PROTOCOL_ERROR: u64 = 0x2;
+    /// The request was cancelled (e.g. client timeout).
     pub const REQUEST_CANCELLED: u64 = 0x3;
+    /// The server is experiencing excessive load.
     pub const EXCESSIVE_LOAD: u64 = 0x4;
+    /// An unspecified error.
     pub const UNSPECIFIED_ERROR: u64 = 0x5;
+    /// Reserved error code.
     pub const ERROR_RESERVED: u64 = 0x6;
 
     /// A human-readable name for a DOQ error code.

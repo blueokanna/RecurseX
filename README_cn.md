@@ -218,7 +218,7 @@ cargo +1.78.0 clippy --no-default-features --lib -- -D warnings
 cargo +1.78.0 clippy --all-targets --all-features -- -D warnings
 ```
 
-共 128 个测试：线格式编解码、缓存/稳定性/准入、估计器、规划器、图、上游模型、策略、引擎分类、
+共 130 个测试：线格式编解码、缓存/稳定性/准入、估计器、规划器、图、上游模型、策略、引擎分类、
 解析器编排、服务器、JSON 配置回环、加密传输、DNSSEC（含一个用 openssl 真实生成的 1024 位 RSA
 测试向量）、持久化缓存（回环、stale 归位、死条目丢弃、篡改拒绝）、自带的浮点辅助、OS 熵播种、
 UDP 截断。

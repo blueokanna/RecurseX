@@ -19,8 +19,11 @@ use crate::time::Ts;
 /// The canonical, cacheable identity of a query.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct QueryKey {
+    /// The query name (canonical case).
     pub name: Name,
+    /// The query type.
     pub rr_type: RrType,
+    /// The query class.
     pub class: RrClass,
     /// The ECS network the client asked to be resolved from.
     pub ecs: Option<EcsKey>,

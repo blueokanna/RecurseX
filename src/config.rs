@@ -47,25 +47,34 @@ impl Default for ListenConfig {
 #[derive(Debug, Clone, PartialEq, Default, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct CacheJson {
+    /// Hot tier capacity (entries); absent = default.
     #[njson(default)]
     pub hot_capacity: Option<usize>,
+    /// Warm tier capacity (entries); absent = default.
     #[njson(default)]
     pub warm_capacity: Option<usize>,
+    /// Cold tier capacity (entries); absent = default.
     #[njson(default)]
     pub cold_capacity: Option<usize>,
+    /// Serve-stale window in seconds; absent = default.
     #[njson(default)]
     pub stale_window_secs: Option<u32>,
+    /// Cap on negative TTLs; absent = default.
     #[njson(default)]
     pub negative_ttl_cap: Option<u32>,
+    /// Absolute cap on positive TTLs; absent = default.
     #[njson(default)]
     pub max_ttl_cap: Option<u32>,
+    /// Prefetch refresh threshold (remaining TTL); absent = default.
     #[njson(default)]
     pub prefetch_threshold_ttl: Option<u32>,
+    /// Prefetch probability threshold; absent = default.
     #[njson(default)]
     pub prefetch_probability: Option<f64>,
 }
 
 impl CacheJson {
+    /// Build a [`CacheConfig`], applying defaults for absent fields.
     pub fn into_cache(&self) -> CacheConfig {
         let d = CacheConfig::default();
         CacheConfig {
@@ -89,18 +98,25 @@ impl CacheJson {
 #[derive(Debug, Clone, PartialEq, Default, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct EngineJson {
+    /// Root server addresses; empty = built-in default set.
     #[njson(default)]
     pub root_servers: Vec<String>,
+    /// Query timeout in ms; absent = default.
     #[njson(default)]
     pub timeout_ms: Option<u64>,
+    /// Enable QNAME minimization; absent = default.
     #[njson(default)]
     pub qname_minimization: Option<bool>,
+    /// Enable 0x20 anti-spoofing; absent = default.
     #[njson(default)]
     pub use_0x20: Option<bool>,
+    /// Maximum CNAME chain depth; absent = default.
     #[njson(default)]
     pub max_cname_depth: Option<usize>,
+    /// Enable DNSSEC validation; absent = default.
     #[njson(default)]
     pub dnssec: Option<bool>,
+    /// Fall back to TCP on truncation; absent = default.
     #[njson(default)]
     pub tcp_fallback: Option<bool>,
     /// Forwarding upstreams (optional): `{"proto":"dot","ip":"1.1.1.1","port":853,"host":"cloudflare-dns.com"}`.
@@ -112,9 +128,12 @@ pub struct EngineJson {
 #[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct ForwarderJson {
+    /// The upstream IP address.
     pub ip: String,
+    /// The upstream port (0 = protocol default).
     #[njson(default)]
     pub port: u16,
+    /// The transport: `udp` | `tcp` | `dot` | `doh` | `doh3` | `doq`.
     #[njson(default)]
     pub proto: String,
     /// TLS server name for DoT / DoH / DoH3 / DoQ.
@@ -157,11 +176,13 @@ impl ForwarderJson {
 #[derive(Debug, Clone, PartialEq, Default, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct PolicyJson {
+    /// Blocklist entries: `*.example.com` or exact names.
     #[njson(default)]
     pub block: Vec<String>,
 }
 
 impl PolicyJson {
+    /// Build a [`PolicyConfig`], applying defaults for absent fields.
     pub fn into_policy(&self) -> PolicyConfig {
         let d = PolicyConfig::default();
         PolicyConfig {
@@ -204,6 +225,7 @@ impl Default for PersistJson {
 
 #[cfg(feature = "persist")]
 impl PersistJson {
+    /// Build a [`PersistConfig`]; `None` when no path is configured.
     pub fn into_persist(&self) -> Option<crate::cache::persist::PersistConfig> {
         let path = self.path.as_ref()?;
         let mut c = crate::cache::persist::PersistConfig::new(
@@ -219,12 +241,16 @@ impl PersistJson {
 #[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase")]
 pub struct Config {
+    /// Listen addresses for the server mode.
     #[njson(default)]
     pub listen: Vec<ListenConfig>,
+    /// Cache tuning.
     #[njson(default)]
     pub cache: CacheJson,
+    /// Engine tuning.
     #[njson(default)]
     pub engine: EngineJson,
+    /// Policy (blocklist) tuning.
     #[njson(default)]
     pub policy: PolicyJson,
     /// Client rate limit: queries per second per client (absent = default).

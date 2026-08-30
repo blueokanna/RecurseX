@@ -5,8 +5,9 @@
 //!
 //! * [`SplitMix64`] — a deterministic 64-bit PRNG used for 0x20 QNAME
 //!   case randomization, EDNS query IDs, and cache-eviction sampling. It is
-//!   seeded from wall time plus process entropy; it is *not* a
-//!   cryptographically secure generator and must not be used for secrets.
+//!   seeded from OS entropy ([`crate::entropy`]) and periodically reseeded,
+//!   so the stream is not predictable from a recovered prefix; it is *not*
+//!   a cryptographically secure generator and must not be used for secrets.
 //! * [`fnv1a64`] — FNV-1a for cheap content fingerprints (cache-change
 //!   detection). Not cryptographic.
 //! * [`siphash24`] — a from-scratch SipHash-2-4 (the reference MAC used by

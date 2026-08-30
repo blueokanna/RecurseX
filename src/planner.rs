@@ -17,7 +17,10 @@ pub enum Plan {
     /// Answer from a stale entry (serve-stale). When
     /// `refresh_in_background` is set, a refresh is queued so the next
     /// query gets fresh data.
-    ServeStale { refresh_in_background: bool },
+    ServeStale {
+        /// Whether to queue a background refresh after serving stale.
+        refresh_in_background: bool,
+    },
     /// Do a full (or iterative) resolution now.
     Resolve,
 }

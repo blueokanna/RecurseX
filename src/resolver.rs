@@ -90,8 +90,11 @@ impl Default for EngineConfig {
 /// Client rate limiting.
 #[derive(Clone, Copy, Debug)]
 pub struct RateLimitConfig {
+    /// Token-bucket capacity per client (burst size).
     pub client_capacity: f64,
+    /// Token refill rate per second per client.
     pub client_refill_per_sec: f64,
+    /// Maximum number of tracked client buckets (bound memory).
     pub max_client_buckets: usize,
 }
 
@@ -108,10 +111,15 @@ impl Default for RateLimitConfig {
 /// Resolver configuration.
 #[derive(Clone, Debug)]
 pub struct ResolverConfig {
+    /// Cache tuning.
     pub cache: CacheConfig,
+    /// Planner tuning.
     pub planner: PlannerConfig,
+    /// Policy (blocklist) tuning.
     pub policy: PolicyConfig,
+    /// Engine tuning.
     pub engine: EngineConfig,
+    /// Client rate limiting.
     pub rate_limit: RateLimitConfig,
     /// Maximum distinct in-flight queries (coalescer bound).
     pub max_inflight: usize,
@@ -147,9 +155,13 @@ impl Default for ResolverConfig {
 /// The outcome of a resolution.
 #[derive(Clone, Debug)]
 pub struct Resolution {
+    /// The queried name.
     pub name: Name,
+    /// The queried type.
     pub rr_type: RrType,
+    /// The queried class.
     pub class: RrClass,
+    /// The response code.
     pub rcode: Rcode,
     /// The answer chain (CNAME/DNAME + final records), in order.
     pub answers: Vec<Record>,
@@ -171,11 +183,17 @@ pub struct Resolution {
 
 /// Shared resolver state (everything behind locks).
 pub struct SharedState {
+    /// The multi-tier semantic cache.
     pub cache: Mutex<SemanticCache>,
+    /// The query estimator (popularity / locality model).
     pub estimator: Mutex<QueryEstimator>,
+    /// The upstream selector (path statistics).
     pub selector: Mutex<UpstreamSelector>,
+    /// The resolution graph.
     pub graph: Mutex<ResolutionGraph>,
+    /// The query coalescer.
     pub coalescer: Mutex<Coalescer>,
+    /// The per-client rate limiter.
     pub client_limiter: Mutex<RateLimiter>,
 }
 
@@ -219,12 +237,19 @@ pub struct Resolver {
 
 /// All resolver state.
 pub struct ResolverInner {
+    /// The resolver configuration.
     pub config: ResolverConfig,
+    /// The shared (locked) state.
     pub shared: Arc<SharedState>,
+    /// The policy engine.
     pub policy: PolicyEngine,
+    /// The clock.
     pub clock: Arc<dyn Clock>,
+    /// The available transports.
     pub transports: Transports,
+    /// The statistics counters.
     pub stats: Stats,
+    /// The forwarding upstream set.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub forwarder_set: Mutex<crate::forward::ForwarderSet>,
     inflight: Mutex<BTreeMap<QueryKey, Arc<Slot>>>,
@@ -489,7 +514,6 @@ impl Resolver {
             ..HeaderFlags::default()
         };
         m.questions.clone_from(&query.questions);
-        // Cap TTLs to the reported (remaining) TTL.
         for r in &res.answers {
             let mut rec = r.clone();
             rec.ttl = res.ttl;
@@ -539,8 +563,6 @@ impl Resolver {
             .cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        // Forward-first when forwarders are configured; fall back to the
-        // iterative path if every forwarder fails.
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let mut res = self
             .forward_resolve(key)
@@ -752,12 +774,6 @@ impl Resolver {
         let mut depth = 0usize;
         let mut referrals = 0usize;
         let mut cached_rrsigs: Vec<Record> = Vec::new();
-        // The QNAME-minimized query currently in progress (a strict suffix
-        // of `current_name`). `None` means "recompute from the zone" —
-        // after a referral the minimal name is one label deeper than the
-        // new zone. A NODATA/empty answer to a minimized *prefix* is not
-        // terminal: it only proves the prefix itself is empty, so we
-        // deepen the query until the full qname is reached.
         let mut minimized: Option<Name> = None;
 
         loop {
@@ -799,9 +815,6 @@ impl Resolver {
                 }
             }
 
-            // QNAME minimization: query the minimal name one label deeper
-            // than the current zone, deepening one label at a time as
-            // empty answers are encountered.
             let query_name = match minimized.take() {
                 Some(q) => q,
                 None => {
@@ -816,7 +829,6 @@ impl Resolver {
             let (resp, endpoint, rtt_ms) =
                 self.query_servers(&servers, &query_name, current_type, &zone, key)?;
 
-            // Estimator + selector feedback.
             {
                 let mut est = self.inner.shared.estimator.lock().unwrap();
                 est.observe_upstream(&zone, rtt_ms as f64);
@@ -836,14 +848,11 @@ impl Resolver {
                     records,
                     rrsigs: sigs,
                 } => {
-                    // Bailiwick: only keep in-zone data.
                     let keep: Vec<Record> = records
                         .into_iter()
                         .filter(|r| engine::in_bailiwick(&r.name, &zone))
                         .collect();
                     if keep.is_empty() {
-                        // Server returned something out-of-bailiwick; treat
-                        // as an empty answer.
                         return Err(Error::transport("answer out of bailiwick"));
                     }
                     for r in &keep {
@@ -911,11 +920,6 @@ impl Resolver {
                     depth += 1;
                 }
                 ResponseKind::Negative { rcode: r, soa } => {
-                    // An NXDOMAIN for any prefix of the qname is final:
-                    // nothing below that name exists. A NODATA for a
-                    // minimized *prefix* is not — the qname may still
-                    // exist deeper, so deepen and retry. Only NODATA for
-                    // the full qname terminates the resolution.
                     if r.is_nxdomain() {
                         rcode = r;
                         if let Some(s) = &soa {
@@ -928,8 +932,6 @@ impl Resolver {
                         break;
                     }
                     let is_prefix = query_name != current_name;
-                    // Cache the (real) negative answer for the queried
-                    // name before deciding whether to continue.
                     let soa_ttl = soa.as_ref().map(negative_ttl).unwrap_or(0);
                     let inputs = self
                         .inner
@@ -944,7 +946,6 @@ impl Resolver {
                         cache.insert_negative(&ck, r, soa.clone(), soa_ttl, now, inputs);
                     }
                     if is_prefix {
-                        // NODATA for a prefix: the full qname may still
                         // exist; query one label deeper.
                         minimized = Some(deepen_minimized(&current_name, &query_name));
                         continue;
@@ -962,8 +963,6 @@ impl Resolver {
                     glue,
                 } => {
                     referrals += 1;
-                    // Bailiwick: the delegated zone must be strictly below
-                    // the current one.
                     if !new_zone.is_strict_subdomain_of(&zone) {
                         return Err(Error::transport(format!(
                             "referral to {} not below {}",
@@ -1027,13 +1026,8 @@ impl Resolver {
                         }
                     }
                     zone = new_zone;
-                    // The new zone fixes the minimization point; recompute
-                    // the minimal name on the next iteration.
                     minimized = None;
 
-                    // Build server endpoints from the referral's glue (the
-                    // addresses the parent gave us for the NS targets), then
-                    // fall back to resolving NS names independently.
                     let mut endpoints: Vec<Endpoint> = Vec::new();
                     for g in &glue {
                         let is_ns_glue = ns_names.contains(&g.name);
@@ -1063,8 +1057,6 @@ impl Resolver {
                     servers = endpoints;
                 }
                 ResponseKind::Empty => {
-                    // An empty answer to a minimized prefix is not a
-                    // verdict either — keep deepening toward the qname.
                     if query_name != current_name {
                         minimized = Some(deepen_minimized(&current_name, &query_name));
                         continue;
@@ -1446,11 +1438,8 @@ impl Resolver {
                 std::thread::sleep(std::time::Duration::from_millis(interval));
                 let r = &this;
                 let now = r.inner.clock.now();
-                // Sweep dead entries.
                 r.inner.shared.cache.lock().unwrap().sweep(now);
-                // Prune stale graph nodes.
                 r.inner.shared.graph.lock().unwrap().prune(now, 0);
-                // Predictive prefetch.
                 let candidates = {
                     let mut cache = r.inner.shared.cache.lock().unwrap();
                     let est = r.inner.shared.estimator.lock().unwrap();
