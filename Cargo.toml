@@ -34,7 +34,9 @@ doq = ["std", "dep:courierust"]
 persist = ["std", "dep:rustbinary"]
 
 [dependencies]
-nextjson = { version = "0.1.4", default-features = false, features = ["derive"] }
+nextjson = { version = "0.1.4", default-features = false, features = [
+    "derive",
+] }
 tzcraft = { version = "0.1", default-features = false, features = ["alloc"] }
 rustbinary = { version = "0.1.8", default-features = false, features = [
     "std",
