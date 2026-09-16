@@ -1447,7 +1447,7 @@ impl QuicConnection {
         // PTO fired: retransmit unacknowledged ack-eliciting data with
         // fresh packet numbers.
         self.pto_count += 1;
-        let retransmit: Vec<SentPacket> = self.sent.drain(..).collect();
+        let retransmit = core::mem::take(&mut self.sent);
         for p in retransmit {
             self.send_packet(p.space, p.frames, false)?;
         }

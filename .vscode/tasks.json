@@ -200,6 +200,16 @@
 				"cd /d d:\\RustProject\\RecurseX && powershell -NoProfile -ExecutionPolicy Bypass -File target\\ci-local.ps1 > %TEMP%\\rx_ci_run2.txt 2>&1 & echo ALLDONE >> %TEMP%\\rx_ci_run2.txt"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "rx-stable-check",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && powershell -NoProfile -ExecutionPolicy Bypass -File target\\stable-check.ps1 > %TEMP%\\rx_stable_run.txt 2>&1 & echo ALLDONE >> %TEMP%\\rx_stable_run.txt"
+			],
+			"isBackground": false
 		}
 	]
 }

@@ -83,7 +83,6 @@ required-features = ["std"]
 # Document the full surface: the transports and `persist` are part of the
 # public API, and a docs build that omits them would hide real items.
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.release]
 lto = "fat"

@@ -707,18 +707,18 @@ impl ClientHandshake {
                         saw_versions = true;
                     }
                 }
-                0x0033 => {
-                    // key_share: u16 group || u16 len || key.
+                0x0033
+                    // key_share: u16 group || u16 len || key. A guard keeps
+                    // a malformed extension from overwriting a good one.
                     if elen >= 4 + 32
                         && ev[0] == 0x00
                         && ev[1] == 0x1d
                         && ev[2] == 0x00
-                        && ev[3] == 0x20
-                    {
-                        let mut k = [0u8; 32];
-                        k.copy_from_slice(&ev[4..36]);
-                        server_key_share = Some(k);
-                    }
+                        && ev[3] == 0x20 =>
+                {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&ev[4..36]);
+                    server_key_share = Some(k);
                 }
                 _ => {}
             }

@@ -199,7 +199,8 @@ fn record_wire_without_ttl(r: &Record) -> Vec<u8> {
 /// Convenience constructors for tests.
 #[cfg(test)]
 impl RrSet {
-    pub fn a(name: &str, ip: &str, ttl: u32) -> RrSet {
+    /// One A record, for the tests that only care about the RRset shape.
+    pub(crate) fn a(name: &str, ip: &str, ttl: u32) -> RrSet {
         let mut s = RrSet::new(Name::from_ascii(name).unwrap(), RrType::A, RrClass::IN, ttl);
         s.add_record(Record {
             name: s.name.clone(),
