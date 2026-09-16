@@ -82,8 +82,6 @@ required-features = ["std"]
 [dev-dependencies]
 
 [package.metadata.docs.rs]
-# Document the full surface: the transports and `persist` are part of the
-# public API, and a docs build that omits them would hide real items.
 all-features = true
 
 [profile.release]
