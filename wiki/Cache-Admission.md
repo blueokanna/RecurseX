@@ -48,9 +48,20 @@ tiers have hard capacities.
 
 ## Eviction
 
-Eviction samples a bounded set of entries per tier (not a full scan) and
-drops the lowest-scored one — so the cache is honest about what it keeps:
-a cold, low-score entry is cheaper to evict than a hot, high-score one.
+Eviction is exact and cheap. Each tier keeps a secondary index keyed by
+`(quantized score, key)`, so "the lowest-scored entry" is found and removed in
+`O(log n)` — no scan of the tier, and no sampling either. The obvious
+implementation (walk the tier, take the minimum) is `O(n)` per insert once the
+cache is full, which makes filling a cache `O(n²)` and puts an attacker-chosen
+amount of work on the insert path.
+
+Evicting from hot or warm demotes the victim one tier instead of dropping it,
+so a valuable entry gets a second chance. That demotion is deliberately *not*
+recursive: a cascading demotion would make the cost of a single insert
+unbounded.
+
+An entry below `min_admit_score` is not cached at all, so what the cache keeps
+is what the score says is worth keeping.
 
 ## Serve-stale and prefetch
 

@@ -297,6 +297,23 @@ pub struct QuicConnection {
     closed: Option<Error>,
 }
 
+/// Connection identity and live state, at a level of detail that is useful
+/// in a log line: a full dump would be hundreds of packet numbers and keys.
+impl core::fmt::Debug for QuicConnection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "QuicConnection(remote={}, local_cid={}B, server_cid={}B, confirmed={}, srtt={:?}, closed={})",
+            self.remote,
+            self.local_cid.len(),
+            self.server_cid.len(),
+            self.handshake_confirmed,
+            self.srtt,
+            self.closed.is_some()
+        )
+    }
+}
+
 impl QuicConnection {
     /// Establish a QUIC connection to `endpoint`, performing the full
     /// TLS 1.3 handshake with ALPN `doq`. `host` is the certificate

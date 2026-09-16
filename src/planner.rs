@@ -48,6 +48,7 @@ impl Default for PlannerConfig {
 }
 
 /// The resolution planner.
+#[derive(Debug)]
 pub struct ResolutionPlanner {
     config: PlannerConfig,
 }

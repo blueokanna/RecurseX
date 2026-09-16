@@ -99,6 +99,7 @@ impl EdnsSpec {
 }
 
 /// A fully-built outgoing query.
+#[derive(Debug)]
 pub struct OutQuery {
     /// The wire bytes to send.
     pub bytes: Vec<u8>,

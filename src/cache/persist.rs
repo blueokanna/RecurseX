@@ -23,13 +23,14 @@
 //! * Persistence is best-effort: a failed save is logged away (returned as
 //!   an `Err`) and never poisons the live cache.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use std::path::Path;
 
 use nextjson::{NsonDeserialize, NsonSerialize};
 
-use crate::cache::{CacheEntry, CacheKey, EcsKey, EntryKind, NegativeEntry, SemanticCache, Tier};
+use crate::cache::{
+    CacheEntry, CacheKey, EcsKey, EntryKind, NegativeEntry, SemanticCache, Tier, TierMap,
+};
 use crate::error::{Error, Result};
 use crate::name::Name;
 use crate::qtype::{Rcode, RrClass, RrType};
@@ -52,7 +53,7 @@ pub struct PersistConfig {
     /// Where the cache frame lives.
     pub path: std::path::PathBuf,
     /// How often the maintenance loop writes a fresh snapshot (ms).
-    /// 0 disables periodic saves (only explicit [`save`] calls).
+    /// 0 disables periodic saves (only explicit [`save_to`] calls).
     pub save_interval_ms: u64,
     /// Maximum accepted frame size on load (bytes).
     pub frame_limit: u64,
@@ -161,18 +162,25 @@ impl Snapshot {
                 }
             }
         }
-        let negatives = cache
-            .nx
-            .iter()
-            .map(|(name, neg)| NegativeDto {
+        let mut negatives: Vec<NegativeDto> = Vec::with_capacity(cache.nx.len());
+        for (name, neg) in &cache.nx {
+            let soa = match neg.soa.as_ref() {
+                Some(r) => match record_wire(r) {
+                    Some(w) => Some(w),
+                    // Unencodable SOA: skip the entry, like the positive path.
+                    None => continue,
+                },
+                None => None,
+            };
+            negatives.push(NegativeDto {
                 name: name.to_wire_bytes(),
                 expires_unix: ts_to_unix(neg.expires),
                 rcode: neg.rcode.0,
-                soa: neg.soa.as_ref().map(record_wire),
+                soa,
                 inserted_unix: ts_to_unix(neg.inserted),
                 served: neg.served,
-            })
-            .collect();
+            });
+        }
         Snapshot {
             magic: MAGIC,
             version: VERSION,
@@ -192,12 +200,7 @@ impl Snapshot {
             let Some(entry) = dto_to_entry(dto, now, stale_window_secs) else {
                 continue;
             };
-            let tier = entry.tier;
-            match tier {
-                Tier::Hot => cache.hot.insert(entry.key.clone(), entry),
-                Tier::Warm => cache.warm.insert(entry.key.clone(), entry),
-                Tier::Cold => cache.cold.insert(entry.key.clone(), entry),
-            };
+            cache.restore_entry(entry, now);
             restored += 1;
         }
         for dto in &self.negatives {
@@ -280,7 +283,7 @@ pub fn load_from_limit(
 // Conversions
 // ---------------------------------------------------------------------------
 
-fn tier_maps(cache: &SemanticCache) -> Vec<(Tier, &BTreeMap<CacheKey, CacheEntry>)> {
+fn tier_maps(cache: &SemanticCache) -> Vec<(Tier, &TierMap)> {
     vec![
         (Tier::Hot, &cache.hot),
         (Tier::Warm, &cache.warm),
@@ -288,10 +291,14 @@ fn tier_maps(cache: &SemanticCache) -> Vec<(Tier, &BTreeMap<CacheKey, CacheEntry
     ]
 }
 
-fn record_wire(r: &Record) -> Vec<u8> {
+/// A record in DNS wire format, or `None` when it cannot be encoded (an
+/// RDATA that no longer fits its 16-bit length field). A snapshot is
+/// best-effort: an unencodable entry is skipped rather than written in a
+/// form the loader could not trust.
+fn record_wire(r: &Record) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(r.name.wire_len() + 40);
-    r.to_wire(&mut out, None);
-    out
+    r.to_wire(&mut out, None).ok()?;
+    Some(out)
 }
 
 fn parse_record(wire: &[u8]) -> Option<Record> {
@@ -349,18 +356,32 @@ fn entry_to_dto(e: &CacheEntry, tier: Tier) -> Option<EntryDto> {
     let name = e.key.name.to_wire_bytes();
     let kind = match &e.kind {
         EntryKind::Positive(rrset) => KindDto::Positive {
-            records: rrset.records.iter().map(record_wire).collect(),
-            rrsigs: rrset.rrsigs.iter().map(record_wire).collect(),
+            records: rrset
+                .records
+                .iter()
+                .map(record_wire)
+                .collect::<Option<Vec<_>>>()?,
+            rrsigs: rrset
+                .rrsigs
+                .iter()
+                .map(record_wire)
+                .collect::<Option<Vec<_>>>()?,
         },
         EntryKind::Negative {
             rcode,
             soa,
             ttl_secs,
-        } => KindDto::Negative {
-            rcode: rcode.0,
-            soa: soa.as_ref().map(record_wire),
-            ttl_secs: *ttl_secs,
-        },
+        } => {
+            let soa = match soa {
+                Some(r) => Some(record_wire(r)?),
+                None => None,
+            };
+            KindDto::Negative {
+                rcode: rcode.0,
+                soa,
+                ttl_secs: *ttl_secs,
+            }
+        }
     };
     Some(EntryDto {
         name,
@@ -557,7 +578,7 @@ mod tests {
             let mut e = cache.take_entry_any(&k).unwrap();
             e.expires = now() - 5_000_000_000; // 5 s ago
             e.tier = Tier::Warm;
-            cache.warm.insert(k, e);
+            cache.warm.insert(e);
         }
         let bytes = encode(&cache, 1_700_000_000).unwrap();
         let mut restored = SemanticCache::new(CacheConfig::default());
@@ -590,7 +611,7 @@ mod tests {
             let mut e = cache.take_entry_any(&k).unwrap();
             // Long dead: 3 days ago, well beyond the 1-day stale window.
             e.expires = now() - 3 * 86_400 * 1_000_000_000;
-            cache.warm.insert(k, e);
+            cache.warm.insert(e);
         }
         let bytes = encode(&cache, 1_700_000_000).unwrap();
         let mut restored = SemanticCache::new(CacheConfig::default());

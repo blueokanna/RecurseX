@@ -508,6 +508,8 @@ impl DsDigestType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::string::ToString;
 
     #[test]
     fn type_display() {

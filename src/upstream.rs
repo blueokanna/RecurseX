@@ -21,6 +21,20 @@ use core::net::IpAddr;
 
 use crate::time::Ts;
 
+/// The RTT assumed for a path with no measurements. It is the optimistic
+/// end of the range published for public DNS servers, so an unmeasured
+/// server ranks ahead of a measured one and gets probed — and because a
+/// failed probe now creates a model (see [`UpstreamSelector::record_timeout`]),
+/// a bad server is demoted after exactly one try.
+pub const ASSUMED_RTT_MS: f64 = 40.0;
+
+/// Paths idle for longer than this are dropped first when the path table
+/// is full. An hour of silence means the server is no longer on any live
+/// delegation path we observed.
+pub const PATH_RETENTION_SECS: Ts = 3600;
+/// Eviction stride for a path table full of freshly-measured entries.
+pub const EVICT_STRIDE: usize = 8;
+
 /// The transport used to reach an upstream.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum Proto {
@@ -182,16 +196,6 @@ impl PathModel {
         self.failures += 1;
     }
 
-    /// The empirical probability of a successful exchange.
-    pub fn success_probability(&self) -> f64 {
-        let n = self.successes + self.failures;
-        if n == 0 {
-            0.9 // optimistic prior
-        } else {
-            (self.successes as f64 + 1.0) / (n as f64 + 2.0)
-        }
-    }
-
     /// The SERVFAIL rate `0..1`.
     pub fn servfail_rate(&self) -> f64 {
         let n = self.successes + self.servfails;
@@ -254,22 +258,26 @@ impl UpstreamSelector {
 
     /// Record a successful exchange.
     pub fn record_success(&mut self, ep: Endpoint, rtt_ms: f64, now: Ts) {
-        let path = self.path_mut(ep, rtt_ms);
+        let path = self.path_mut(ep, rtt_ms, now);
         path.record_success(rtt_ms, now);
     }
 
     /// Record a timeout.
+    ///
+    /// A timeout on a path we have never measured is *the* first thing we
+    /// learn about it, so it must create the model: dropping the
+    /// observation would leave a black-holed server ranked by the
+    /// optimistic prior forever, and the resolver would keep dialling it
+    /// first on every query.
     pub fn record_timeout(&mut self, ep: Endpoint, now: Ts) {
-        if let Some(p) = self.paths.get_mut(&ep) {
-            p.record_timeout(now);
-        }
+        let path = self.path_mut(ep, ASSUMED_RTT_MS, now);
+        path.record_timeout(now);
     }
 
     /// Record a SERVFAIL.
     pub fn record_servfail(&mut self, ep: Endpoint, now: Ts) {
-        if let Some(p) = self.paths.get_mut(&ep) {
-            p.record_servfail(now);
-        }
+        let path = self.path_mut(ep, ASSUMED_RTT_MS, now);
+        path.record_servfail(now);
     }
 
     /// The model for an endpoint, if tracked.
@@ -299,27 +307,26 @@ impl UpstreamSelector {
             .map(|(ep, _)| *ep)
     }
 
-    /// Candidates sorted by expected cost, cheapest first. Unknown paths
-    /// use a neutral prior so they are not starved.
+    /// Candidates sorted by expected cost, cheapest first.
+    ///
+    /// A candidate with no history is ranked by a prior *below* what a
+    /// measured path costs: the assumption is one clean RTT
+    /// ([`ASSUMED_RTT_MS`]) with no loss and no SERVFAIL, i.e. the best case
+    /// this protocol can do. An unmeasured server is therefore probed once
+    /// and then ranked by what it actually did.
     pub fn sort_by_cost(
         &self,
         candidates: &[Endpoint],
         now: Ts,
         retransmit_budget: u32,
     ) -> Vec<(Endpoint, f64)> {
+        let _ = now;
         let mut ranked: Vec<(Endpoint, f64)> = candidates
             .iter()
             .map(|&ep| {
                 let cost = match self.paths.get(&ep) {
                     Some(p) => p.expected_cost_ms(retransmit_budget),
-                    None => {
-                        // Neutral prior: assume one RTT of 100 ms and no
-                        // history. Prefer unknown paths slightly so they
-                        // get probed.
-                        let prior = 100.0 + ep.proto.setup_rtts() * 100.0;
-                        let _ = now;
-                        prior
-                    }
+                    None => ASSUMED_RTT_MS + ep.proto.setup_rtts() * ASSUMED_RTT_MS,
                 };
                 (ep, cost)
             })
@@ -328,18 +335,16 @@ impl UpstreamSelector {
         ranked
     }
 
-    fn path_mut(&mut self, ep: Endpoint, rtt_ms: f64) -> &mut PathModel {
+    fn path_mut(&mut self, ep: Endpoint, rtt_ms: f64, now: Ts) -> &mut PathModel {
         if !self.paths.contains_key(&ep) {
             if self.paths.len() >= self.max_paths {
-                // Evict the least-recently-seen path.
-                if let Some(k) = self
-                    .paths
-                    .iter()
-                    .min_by_key(|(_, p)| p.last_seen)
-                    .map(|(k, _)| *k)
-                {
-                    self.paths.remove(&k);
-                }
+                let stale_before = now.saturating_sub(PATH_RETENTION_SECS * 1_000_000_000);
+                crate::bounded::evict_for_capacity(
+                    &mut self.paths,
+                    stale_before,
+                    EVICT_STRIDE,
+                    |p| p.last_seen,
+                );
             }
             self.paths.insert(ep, PathModel::new(ep, rtt_ms));
         }

@@ -27,6 +27,36 @@ Run the maintenance loop (`spawn_maintenance`) so sweeps, graph pruning and
 predictive prefetch actually happen, and so the persistent tier is written on
 schedule.
 
+## Stopping it
+
+Both the server and the resolver have a shutdown path, and a deployment
+should use it: dropping the process without it leaves the `persist` snapshot
+up to one `saveIntervalMs` old, and leaves connection state to the OS.
+
+```rust
+// SIGTERM handler, or the end of main:
+server.shutdown();      // every loop stops within 100 ms
+resolver.shutdown();
+server.join();          // returns once the threads have exited
+```
+
+Shutdown is a flag, not a signal: the UDP receivers wake on their socket
+timeout, the handler pool on its queue timeout, the TCP accept loop is
+released by a self-connect (so it does not wait for a real client) and each
+connection reader on its own socket timeout. The maintenance loop stops
+sleeping in at most 100 ms slices and writes a final snapshot on the way out,
+so the next start restores from a fresh file even if the last scheduled save
+had not fired yet.
+
+Two client-facing bounds protect the thread budget:
+
+- **TCP idle timeout** (`tcp_idle_timeout_ms`, default 30 s): a connection
+  that sends nothing between messages is closed (RFC 7766 section 6.2.3
+  recommends exactly this instead of holding an idle client forever).
+- **Message deadline**: a client that dribbles a message one byte at a time
+  cannot hold a reader past the idle timeout either, because the in-message
+  deadline is capped at the smaller of 10 s and the idle timeout.
+
 ## Security model
 
 - **Rate limiting**: a token-bucket limiter per client IP (`client_qps` /

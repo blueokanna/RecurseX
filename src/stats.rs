@@ -15,6 +15,12 @@ pub struct Stats {
     pub served_stale: AtomicU64,
     /// Background prefetches performed.
     pub prefetches: AtomicU64,
+    /// Alias refreshes queued by change propagation (entries whose data is
+    /// derived from a changed entry).
+    pub propagated: AtomicU64,
+    /// Alias edges currently recorded (gauge, updated by the maintenance
+    /// task).
+    pub alias_edges: AtomicU64,
     /// Queries sent upstream.
     pub upstream_queries: AtomicU64,
     /// Upstream timeouts.
@@ -52,6 +58,10 @@ pub struct StatsSnapshot {
     pub served_stale: u64,
     /// Background prefetches performed.
     pub prefetches: u64,
+    /// Alias refreshes queued by change propagation.
+    pub propagated: u64,
+    /// Alias edges recorded.
+    pub alias_edges: u64,
     /// Queries sent upstream.
     pub upstream_queries: u64,
     /// Upstream timeouts.
@@ -85,6 +95,8 @@ impl Stats {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             served_stale: self.served_stale.load(Ordering::Relaxed),
             prefetches: self.prefetches.load(Ordering::Relaxed),
+            propagated: self.propagated.load(Ordering::Relaxed),
+            alias_edges: self.alias_edges.load(Ordering::Relaxed),
             upstream_queries: self.upstream_queries.load(Ordering::Relaxed),
             upstream_timeouts: self.upstream_timeouts.load(Ordering::Relaxed),
             servfails: self.servfails.load(Ordering::Relaxed),

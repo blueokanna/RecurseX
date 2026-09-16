@@ -9,9 +9,16 @@ use crate::name::{Name, NameCompressor};
 use crate::qtype::{Opcode, Rcode, RrClass, RrType};
 use crate::rdata::Record;
 
-/// Upper bound on any section count in a single message (anti-amplification
-/// / parse-depth bound).
-pub const MAX_SECTION_RECORDS: usize = 512;
+/// Upper bound on any section count in a single message.
+///
+/// A record needs at least 11 octets on the wire (1 for the root owner
+/// name, 10 for type/class/TTL/RDLENGTH), so a 64 KiB DNS-over-TCP message
+/// cannot carry more than ~5950 of them. Bounding at 4096 keeps parsing
+/// linear in the message size while never rejecting a response that could
+/// legitimately exist — a larger cap would not make any legal message
+/// parseable, a smaller one (512) rejects real answers such as a name with
+/// a few hundred A records.
+pub const MAX_SECTION_RECORDS: usize = 4096;
 /// Upper bound on the number of questions in a message.
 pub const MAX_QUESTIONS: usize = 16;
 
@@ -276,17 +283,15 @@ impl Message {
             out.extend_from_slice(&q.qclass.to_u16().to_be_bytes());
         }
         for r in &self.answers {
-            r.to_wire(&mut out, Some(&mut comp));
+            r.to_wire(&mut out, Some(&mut comp))?;
         }
         for r in &self.authorities {
-            r.to_wire(&mut out, Some(&mut comp));
+            r.to_wire(&mut out, Some(&mut comp))?;
         }
         for r in &self.additionals {
-            r.to_wire(&mut out, Some(&mut comp));
+            r.to_wire(&mut out, Some(&mut comp))?;
         }
         if let Some(edns) = &self.edns {
-            // Write the OPT pseudo-record: owner = root, type = OPT,
-            // class = UDP payload size, TTL = ext rcode/version/flags.
             comp.write(&Name::root(), &mut out);
             out.extend_from_slice(&RrType::OPT.to_u16().to_be_bytes());
             out.extend_from_slice(&edns.udp_payload_size.to_be_bytes());
@@ -322,29 +327,73 @@ impl Message {
     ///
     /// Sets the TC bit and drops records — additional, then authority, then
     /// answer — from the end until the message fits. The question and the
-    /// EDNS OPT record are preserved (the OPT record is small; the limit is
-    /// a floor of 512 so a minimal message always fits). Used by the UDP
-    /// server to avoid sending oversized, fragmenting datagrams.
+    /// EDNS OPT record are preserved (the OPT record is small, and the
+    /// limit is floored at 512, so a minimal message always fits).
+    ///
+    /// The fit is computed in a single serialization pass: because name
+    /// compression never rewrites bytes it has already emitted, the encoded
+    /// prefix of a message is byte-identical to the prefix of its encoding,
+    /// so the accepted record counts can be derived without re-serializing
+    /// the message once per dropped record.
     pub fn truncate_for_udp(&mut self, limit: usize) {
         let limit = limit.max(512);
         if self.wire_len() <= limit {
             return;
         }
         self.flags.tc = true;
-        while self.wire_len() > limit {
-            if !self.additionals.is_empty() {
-                self.additionals.pop();
-            } else if !self.authorities.is_empty() {
-                self.authorities.pop();
-            } else if !self.answers.is_empty() {
-                self.answers.pop();
-            } else {
-                // Nothing left to drop; the header+question+EDNS still
-                // overflows the (≥512) limit, which cannot happen for a
-                // bounded message — stop to avoid an infinite loop.
-                break;
+        let (answers, authorities, additionals) = self.fit_sections(limit);
+        self.answers.truncate(answers);
+        self.authorities.truncate(authorities);
+        self.additionals.truncate(additionals);
+    }
+
+    /// How many records of each section fit in `limit` bytes (see
+    /// [`Message::truncate_for_udp`]). The OPT record's own footprint is
+    /// reserved so it survives truncation.
+    fn fit_sections(&self, limit: usize) -> (usize, usize, usize) {
+        let opt_len = self
+            .edns
+            .as_ref()
+            .map(|e| 1 + 10 + e.options_wire().len())
+            .unwrap_or(0);
+        let budget = limit.saturating_sub(opt_len);
+
+        let mut out: Vec<u8> = Vec::with_capacity(512);
+        let mut comp = NameCompressor::new();
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.extend_from_slice(&self.flags.to_u16().to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        for q in &self.questions {
+            comp.write(&q.qname, &mut out);
+            out.extend_from_slice(&q.qtype.to_u16().to_be_bytes());
+            out.extend_from_slice(&q.qclass.to_u16().to_be_bytes());
+        }
+
+        let mut counts = (0usize, 0usize, 0usize);
+        let sections: [(usize, &[Record]); 3] = [
+            (0, &self.answers),
+            (1, &self.authorities),
+            (2, &self.additionals),
+        ];
+        'sections: for (idx, recs) in sections {
+            for r in recs {
+                let before = out.len();
+                if r.to_wire(&mut out, Some(&mut comp)).is_err() {
+                    out.truncate(before);
+                    break 'sections;
+                }
+                if out.len() > budget {
+                    out.truncate(before);
+                    break 'sections;
+                }
+                match idx {
+                    0 => counts.0 += 1,
+                    1 => counts.1 += 1,
+                    _ => counts.2 += 1,
+                }
             }
         }
+        counts
     }
 
     /// Build a response with the same ID and question, the given flags, and
@@ -399,6 +448,8 @@ mod tests {
     use super::*;
     use crate::edns::EdnsOption;
     use crate::rdata::RData;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     fn sample_query() -> Vec<u8> {
         // A simple query for www.example.com A with RD.

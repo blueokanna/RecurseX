@@ -11,16 +11,30 @@
 //!
 //! Algorithm support is deliberately honest: **RSASHA256 (8)** is fully
 //! verified. SHA-1-based algorithms (5/7) are rejected as deprecated;
-//! ECDSA (13/14) and EdDSA (15/16) are recognized but not yet verified by
-//! this build, so signatures from zones that only use them yield
-//! `Verdict::Indeterminate` — never a fabricated "secure".
+//! ECDSA (13/14) and EdDSA (15/16) are recognized but not verified by this
+//! build, so signatures from zones that only use them yield
+//! [`Verdict::Indeterminate`] — never a fabricated "secure".
+//!
+//! # What `Verdict::Secure` means here
+//!
+//! A group of records is `Secure` when an RRSIG over it verifies against a
+//! DNSKEY of the signer zone *and* that key is covered by a DS record found
+//! for the signer in the parent zone. The DNSKEY and DS lookups ride the
+//! same hardened resolution path as every other query (ID/0x20/source
+//! checks, bailiwick filtering) but are not themselves chain-validated:
+//! this build ships no root trust anchor and does not validate the DS
+//! RRset's own signature, and while the validator is running, its nested
+//! lookups deliberately skip validation to bound the recursion depth.
+//! `Secure` therefore means "signed by a key that matches the parent's DS",
+//! not "chained to the IANA root". A caller that needs the stronger
+//! guarantee must anchor it itself.
 
 pub mod rsa;
 
 use alloc::vec::Vec;
 
 use crate::name::Name;
-use crate::qtype::{DnssecAlgorithm, DsDigestType, RrClass, RrType};
+use crate::qtype::{DnssecAlgorithm, DsDigestType, RrType};
 use crate::rdata::{RData, Record};
 
 /// The validation outcome for a set of records.
@@ -229,9 +243,16 @@ pub fn verify_rrsig(
 
 /// Validate a set of records against the RRSIGs that cover them.
 ///
-/// `dnskey_records` are candidate zone keys (already matched to a DS /
-/// trust anchor by the caller); `now_secs` gates the signature validity
-/// window.
+/// `dnskey_records` are candidate zone keys; `now_secs` gates the signature
+/// validity window.
+///
+/// The verdict distinguishes *why* validation did not succeed, because the
+/// two cases mean very different things to a caller: a signature that a
+/// supported algorithm failed to verify is [`Verdict::Bogus`] (the data is
+/// not what it claims to be), while a signature this build cannot even
+/// attempt (an unsupported algorithm, or a key that does not match) is
+/// [`Verdict::Indeterminate`] — never silently promoted to "secure", and
+/// never conflated with tampering.
 pub fn validate_rrset(
     records: &[Record],
     rrsigs: &[Record],
@@ -251,7 +272,7 @@ pub fn validate_rrset(
         };
     }
     let rec_refs: Vec<&Record> = records.iter().collect();
-    let mut any_supported = false;
+    let mut attempted = false;
     for rrsig in rrsigs {
         if !matches!(rrsig.rdata, RData::Rrsig { .. }) {
             continue;
@@ -259,18 +280,19 @@ pub fn validate_rrset(
         for key in dnskey_records {
             match verify_rrsig(key, rrsig, &rec_refs, now_secs) {
                 Ok(true) => return Verdict::Secure,
-                Ok(false) => continue,
-                Err(_) => {
-                    // Unsupported algorithm: mark so the verdict can be
-                    // Indeterminate instead of Bogus.
-                    any_supported = false;
-                    continue;
-                }
+                // The signature is well-formed for a supported algorithm and
+                // did not verify: this is a verdict of its own.
+                Ok(false) => attempted = true,
+                // Unsupported/deprecated algorithm: cannot be judged here.
+                Err(_) => continue,
             }
         }
     }
-    let _ = any_supported;
-    Verdict::Indeterminate
+    if attempted {
+        Verdict::Bogus
+    } else {
+        Verdict::Indeterminate
+    }
 }
 
 /// The set of RRSIG records that cover `rr_type`.
@@ -292,11 +314,6 @@ pub fn rrsig_signer(rrsig: &Record) -> Option<&Name> {
     }
 }
 
-/// Class of a record (used by tests and the validator).
-pub fn class_of(_r: &Record) -> RrClass {
-    RrClass::IN
-}
-
 // ---------------------------------------------------------------------
 // Resolver integration
 // ---------------------------------------------------------------------
@@ -306,6 +323,26 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Recursion guard: while the validator runs, sub-resolutions (DNSKEY / DS
 /// fetches) skip their own validation, bounding the recursion depth.
 static VALIDATING: AtomicBool = AtomicBool::new(false);
+
+/// Holds the single validation slot; releases it on drop, including when the
+/// validation unwinds. Leaving it set would turn every later answer into
+/// `Indeterminate` for the life of the process.
+struct ValidationGuard;
+
+impl ValidationGuard {
+    fn enter() -> Option<Self> {
+        if VALIDATING.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(ValidationGuard)
+    }
+}
+
+impl Drop for ValidationGuard {
+    fn drop(&mut self) {
+        VALIDATING.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Validate a completed [`crate::resolver::Resolution`]: group the answer
 /// chain, fetch the signer DNSKEYs (and the parent DS for anchoring) and
@@ -317,12 +354,10 @@ pub fn validate_resolution(
     if res.answers.is_empty() {
         return Verdict::Insecure;
     }
-    if VALIDATING.swap(true, Ordering::SeqCst) {
+    let Some(_guard) = ValidationGuard::enter() else {
         return Verdict::Indeterminate;
-    }
-    let v = validate_chain(resolver, &res.answers, &res.rrsigs);
-    VALIDATING.store(false, Ordering::SeqCst);
-    v
+    };
+    validate_chain(resolver, &res.answers, &res.rrsigs)
 }
 
 /// Validate a raw forwarder response.
@@ -334,9 +369,9 @@ pub fn validate_message(
     if resp.answers.is_empty() {
         return Verdict::Insecure;
     }
-    if VALIDATING.swap(true, Ordering::SeqCst) {
+    let Some(_guard) = ValidationGuard::enter() else {
         return Verdict::Indeterminate;
-    }
+    };
     let answers: Vec<Record> = resp
         .answers
         .iter()
@@ -349,11 +384,17 @@ pub fn validate_message(
         .filter(|r| r.rr_type == RrType::RRSIG)
         .cloned()
         .collect();
-    let v = validate_chain(resolver, &answers, &rrsigs);
-    VALIDATING.store(false, Ordering::SeqCst);
-    v
+    validate_chain(resolver, &answers, &rrsigs)
 }
 
+/// The verdict for a whole answer chain.
+///
+/// RFC 4035 §4.3 is the rule, and it is an "all" rule, not an "any" rule: the
+/// AD bit may only be set when every RRset in the answer was authenticated.
+/// Returning `Secure` as soon as *one* group verified would let an unsigned
+/// CNAME ride along with a signed target and still be advertised as
+/// authentic, so a single group that cannot be authenticated caps the verdict
+/// at `Indeterminate`/`Insecure` even when other groups verify.
 fn validate_chain(
     resolver: &crate::resolver::Resolver,
     answers: &[Record],
@@ -372,32 +413,53 @@ fn validate_chain(
             .or_default()
             .push(r.clone());
     }
-    let mut overall = Verdict::Insecure;
+    if groups.is_empty() {
+        return Verdict::Insecure;
+    }
+    let mut signed_groups = 0usize;
+    let mut all_secure = true;
+    let mut worst = Verdict::Insecure;
     for ((owner, rr_type), records) in groups {
         let covered = rrsigs_for(rrsigs, rr_type)
             .into_iter()
             .filter(|s| rrsig_signer(s) == Some(&owner) || s.name == owner)
             .collect::<Vec<Record>>();
         if covered.is_empty() {
-            continue; // unsigned group: keep overall Insecure
+            // Unsigned group (typically a delegation's CNAME in an unsigned
+            // zone): nothing can authenticate it, so the chain is not fully
+            // authenticated.
+            all_secure = false;
+            continue;
         }
-        match validate_group(resolver, &owner, &records, &covered, now_secs) {
-            Verdict::Secure => return Verdict::Secure,
-            Verdict::Bogus => overall = Verdict::Bogus,
+        signed_groups += 1;
+        match validate_group(resolver, &records, &covered, now_secs) {
+            Verdict::Secure => {}
+            Verdict::Bogus => {
+                all_secure = false;
+                worst = Verdict::Bogus;
+            }
             Verdict::Indeterminate => {
-                if overall == Verdict::Insecure {
-                    overall = Verdict::Indeterminate;
+                all_secure = false;
+                if worst == Verdict::Insecure {
+                    worst = Verdict::Indeterminate;
                 }
             }
-            Verdict::Insecure => {}
+            Verdict::Insecure => all_secure = false,
         }
     }
-    overall
+    if signed_groups > 0 && all_secure {
+        Verdict::Secure
+    } else if worst == Verdict::Bogus {
+        Verdict::Bogus
+    } else if signed_groups == 0 {
+        Verdict::Insecure
+    } else {
+        worst
+    }
 }
 
 fn validate_group(
     resolver: &crate::resolver::Resolver,
-    _owner: &Name,
     records: &[Record],
     rrsigs: &[Record],
     now_secs: u32,
@@ -420,47 +482,48 @@ fn validate_group(
     if keys.is_empty() {
         return Verdict::Indeterminate;
     }
-    let rec_refs: Vec<&Record> = records.iter().collect();
-    let mut verified_any = false;
-    for rrsig in rrsigs {
-        for key in &keys {
-            match verify_rrsig(key, rrsig, &rec_refs, now_secs) {
-                Ok(true) => {
-                    verified_any = true;
-                    // Anchor check: does a parent DS cover this key?
-                    if key_is_anchored(resolver, &signer, key) {
-                        return Verdict::Secure;
-                    }
-                }
-                Ok(false) => continue,
-                Err(_) => return Verdict::Indeterminate,
-            }
+    // The signature must verify against a key that is *also* covered by a DS
+    // in the parent zone; a key that verifies but is not anchored proves
+    // nothing about the delegation.
+    for key in &keys {
+        if verify_rrset_quietly(records, rrsigs, key, now_secs)
+            && key_is_anchored(resolver, &signer, key)
+        {
+            return Verdict::Secure;
         }
     }
-    if verified_any {
-        // Signature verifies but no anchor in the parent → insecure.
-        Verdict::Insecure
-    } else {
-        Verdict::Bogus
+    // No anchored key verified: reuse the shared verdict logic so the
+    // distinction between "wrong signature" and "cannot be judged" stays in
+    // one place.
+    validate_rrset(records, rrsigs, &keys, now_secs)
+}
+
+/// [`validate_rrset`] for a single key: `true` only when a signature over
+/// `records` verifies with it.
+fn verify_rrset_quietly(
+    records: &[Record],
+    rrsigs: &[Record],
+    key: &Record,
+    now_secs: u32,
+) -> bool {
+    let rec_refs: Vec<&Record> = records.iter().collect();
+    for rrsig in rrsigs {
+        if matches!(verify_rrsig(key, rrsig, &rec_refs, now_secs), Ok(true)) {
+            return true;
+        }
     }
+    false
 }
 
 fn key_is_anchored(resolver: &crate::resolver::Resolver, signer: &Name, key: &Record) -> bool {
-    let parent = match signer.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    // The DS for `signer` lives in the parent zone. Querying `signer` for
-    // DS reaches the parent's authoritative data through delegation.
+    // The DS for `signer` lives in the parent zone; querying `signer` for DS
+    // reaches the parent's authoritative data through the delegation.
     match resolver.resolve(signer, RrType::DS) {
         Ok(ds_res) => ds_res
             .answers
             .iter()
             .filter(|r| r.rr_type == RrType::DS && r.name == *signer)
             .any(|ds| dnskey_matches_ds(key, ds)),
-        Err(_) => {
-            let _ = parent;
-            false
-        }
+        Err(_) => false,
     }
 }

@@ -1,11 +1,11 @@
 [package]
 name = "recurse-x"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
 license = "Apache-2.0"
 authors = ["blueokanna", "HyphenTeam"]
-description = "A predictive adaptive recursive DNS resolver with a stability-aware multi-tier semantic cache, resolution graph, and adaptive upstream selection."
+description = "A predictive adaptive recursive DNS resolver: a stability-measured multi-tier cache, alias-coherent prefetch, and expected-cost upstream selection."
 homepage = "https://github.com/blueokanna/RecurseX"
 repository = "https://github.com/blueokanna/RecurseX"
 readme = "README.md"
@@ -43,13 +43,47 @@ rustbinary = { version = "0.1.8", default-features = false, features = [
     "static-size",
     "reflection",
 ], optional = true }
-courierust = { version = "1.0.3", optional = true }
+courierust = { version = "1.0.7", optional = true }
+
+[[example]]
+name = "custom_config"
+required-features = ["std"]
+
+[[example]]
+name = "doq_probe"
+required-features = ["std", "doq"]
+
+[[example]]
+name = "doq_resolver"
+required-features = ["std", "doq"]
+
+[[example]]
+name = "forward_resolver"
+required-features = ["std", "dot"]
+
+[[example]]
+name = "multi_type_resolve"
+required-features = ["std"]
 
 [[example]]
 name = "persist_cache"
 required-features = ["persist"]
 
+[[example]]
+name = "quick_check"
+required-features = ["std"]
+
+[[example]]
+name = "server_demo"
+required-features = ["std"]
+
 [dev-dependencies]
+
+[package.metadata.docs.rs]
+# Document the full surface: the transports and `persist` are part of the
+# public API, and a docs build that omits them would hide real items.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.release]
 lto = "fat"

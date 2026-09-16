@@ -107,6 +107,15 @@ pub const RECENT_MAX: usize = 64;
 pub const POPULARITY_REF_RATE: f64 = 10.0;
 /// Default number of tracked zones.
 pub const DEFAULT_MAX_DOMAINS: usize = 100_000;
+/// Zones idle for longer than this are dropped first when the table is
+/// full. Half an hour is deliberate: every horizon the planner and the
+/// prefetcher evaluate is a minute at most, so a demand history older than
+/// that cannot change a decision and costs memory for nothing. Zones are
+/// also forgotten across a table sweep.
+pub const ZONE_RETENTION_SECS: Ts = 30 * 60;
+/// Eviction stride used when the table is full of *fresh* zones (hostile
+/// distinct-zone load). See [`crate::bounded::evict_for_capacity`].
+pub const EVICT_STRIDE: usize = 8;
 
 /// Per-zone query statistics.
 #[derive(Clone, Debug)]
@@ -155,6 +164,9 @@ impl DomainStats {
 
     /// Record a query.
     pub fn record_query(&mut self, now: Ts) {
+        // The gap to the previous query *is* the instantaneous rate the
+        // EWMA is built from, so read `last_seen` before advancing it.
+        let gap_ns = now.saturating_sub(self.last_seen);
         self.queries += 1;
         self.last_seen = now;
         self.tod[tod_bucket(now)] = self.tod[tod_bucket(now)].saturating_add(1);
@@ -164,26 +176,10 @@ impl DomainStats {
         }
         // EWMA of the instantaneous rate: exponential-decayed inter-arrival
         // estimate. α = 0.1 gives a ~10-event time constant.
-        let inst_rate = if self.queries <= 1 {
+        let inst_rate = if gap_ns == 0 {
             0.0
         } else {
-            let dt = self
-                .last_seen
-                .saturating_sub(self.recent.back().copied().unwrap_or(now));
-            let _ = dt;
-            // Use the gap from the previous query in the ring for a stable
-            // rate estimate.
-            if self.recent.len() >= 2 {
-                let prev = self.recent[self.recent.len() - 2];
-                let gap_ns = now.saturating_sub(prev);
-                if gap_ns > 0 {
-                    1_000_000_000.0 / gap_ns as f64
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            }
+            1_000_000_000.0 / gap_ns as f64
         };
         let alpha = 0.1;
         self.ewma_rate = self.ewma_rate * (1.0 - alpha) + inst_rate * alpha;
@@ -294,13 +290,23 @@ impl QueryEstimator {
     }
 
     /// Observe a query for a name (aggregated at the apex).
+    ///
+    /// A new zone arriving while the table is at capacity triggers an
+    /// amortised sweep ([`crate::bounded::evict_for_capacity`]) instead of
+    /// an O(n) scan per query.
     pub fn observe_query(&mut self, name: &Name, now: Ts) {
         let apex = name.apex();
         if let Some(s) = self.domains.get_mut(&apex) {
             s.record_query(now);
         } else {
             if self.domains.len() >= self.max_domains {
-                self.evict_oldest();
+                let stale_before = now.saturating_sub(ZONE_RETENTION_SECS * 1_000_000_000);
+                crate::bounded::evict_for_capacity(
+                    &mut self.domains,
+                    stale_before,
+                    EVICT_STRIDE,
+                    |s| s.last_seen,
+                );
             }
             self.domains.insert(apex, DomainStats::new(now));
         }
@@ -374,18 +380,6 @@ impl QueryEstimator {
     pub fn iter(&self) -> impl Iterator<Item = (&Name, &DomainStats)> {
         self.domains.iter()
     }
-
-    fn evict_oldest(&mut self) {
-        // Drop the zone with the oldest last_seen.
-        if let Some(key) = self
-            .domains
-            .iter()
-            .min_by_key(|(_, s)| s.last_seen)
-            .map(|(k, _)| k.clone())
-        {
-            self.domains.remove(&key);
-        }
-    }
 }
 
 impl fmt::Debug for QueryEstimator {
@@ -397,6 +391,8 @@ impl fmt::Debug for QueryEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::format;
 
     fn now() -> Ts {
         1_700_000_000_000_000_000

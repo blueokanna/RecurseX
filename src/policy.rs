@@ -5,6 +5,19 @@
 //! (blocklists), and request validation. Anti-cache-poisoning checks
 //! (0x20, bailiwick, source/ID validation) live in the resolution engine,
 //! where the wire state they need is available.
+//!
+//! # What per-client rate limiting can and cannot do
+//!
+//! UDP source addresses are spoofable, so a token bucket keyed by source
+//! address is best-effort by construction: an attacker who forges sources
+//! gets a fresh bucket per packet. What the limiter *guarantees* is that
+//! the bucket table stays bounded and cheap to fill — capacity is enforced
+//! by an amortised sweep, never by a scan per packet — so a spoofing flood
+//! costs the resolver a bounded amount of memory and CPU rather than
+//! unbounded work per packet. Worth noting: the eviction order deliberately
+//! favours *idle* buckets over busy ones. Dropping an idle bucket is free
+//! (it would have refilled to capacity anyway), whereas dropping the
+//! busiest bucket would hand the most aggressive client a fresh burst.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -14,6 +27,13 @@ use crate::message::Message;
 use crate::name::Name;
 use crate::qtype::{Opcode, RrType};
 use crate::time::Ts;
+
+/// Buckets idle for longer than this are dropped first when the table is
+/// full. A bucket this quiet has refilled to capacity, so evicting it is
+/// indistinguishable from keeping it.
+pub const BUCKET_RETENTION_SECS: Ts = 60;
+/// Eviction stride for a table full of freshly-active buckets.
+pub const EVICT_STRIDE: usize = 8;
 
 /// A token bucket (used for both client and upstream rate limiting).
 ///
@@ -75,6 +95,19 @@ pub struct RateLimiter {
     max_buckets: usize,
 }
 
+impl core::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "RateLimiter(clients={}/{}, burst={}, refill={}/s)",
+            self.buckets.len(),
+            self.max_buckets,
+            self.capacity,
+            self.refill_per_sec
+        )
+    }
+}
+
 impl RateLimiter {
     /// A limiter with `capacity` burst and `refill_per_sec` steady state,
     /// tracking at most `max_buckets` distinct callers.
@@ -88,22 +121,25 @@ impl RateLimiter {
     }
 
     /// Whether a request from `key` is allowed (consuming one token).
+    ///
+    /// When the bucket table is full a new caller triggers an amortised
+    /// sweep ([`crate::bounded::evict_for_capacity`]) instead of an O(n)
+    /// scan per packet: buckets idle longer than
+    /// [`BUCKET_RETENTION_SECS`] go first — dropping an idle bucket is
+    /// semantically free, because a bucket that quiet has refilled to
+    /// capacity anyway, so a reappearing client sees exactly the same
+    /// state. See the module docs for why the eviction order is not
+    /// "the most throttled client".
     pub fn allow(&mut self, key: u64, now: Ts) -> bool {
         if !self.buckets.contains_key(&key) {
             if self.buckets.len() >= self.max_buckets {
-                // Evict the bucket with the lowest token level.
-                if let Some(k) = self
-                    .buckets
-                    .iter()
-                    .min_by(|a, b| {
-                        a.1.level(now)
-                            .partial_cmp(&b.1.level(now))
-                            .unwrap_or(core::cmp::Ordering::Equal)
-                    })
-                    .map(|(k, _)| *k)
-                {
-                    self.buckets.remove(&k);
-                }
+                let stale_before = now.saturating_sub(BUCKET_RETENTION_SECS * 1_000_000_000);
+                crate::bounded::evict_for_capacity(
+                    &mut self.buckets,
+                    stale_before,
+                    EVICT_STRIDE,
+                    |b| b.last_refill,
+                );
             }
             self.buckets.insert(
                 key,
@@ -189,6 +225,7 @@ impl Default for PolicyConfig {
 }
 
 /// The policy engine: filtering + request validation.
+#[derive(Debug)]
 pub struct PolicyEngine {
     config: PolicyConfig,
 }
@@ -262,6 +299,8 @@ impl PolicyEngine {
 mod tests {
     use super::*;
     use crate::message::Message;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     fn now() -> Ts {
         1_700_000_000_000_000_000

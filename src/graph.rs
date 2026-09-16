@@ -3,18 +3,25 @@
 //! A recursive resolution is not a linear walk — it is a dependency graph:
 //!
 //! ```text
-//! www.example.com ──CNAME──▶ cdn.example.net ──NS──▶ ns1/ns2.example.net
-//!       │                                              │
-//!       └──served_by──▶ example.com zone ──delegates_to──▶ .com
+//! (www.example.com, A) ──CNAME──▶ (cdn.example.net, A)
+//!          │                              │
+//!          └──freshness of this answer depends on that data
 //! ```
 //!
-//! The graph tracks the nodes and edges a resolution touched, so the
-//! planner can answer "what does this name actually depend on", fan out
-//! prefetch across a whole dependency set, and share sub-resolutions
-//! (e.g. the NS/addresses of a zone) across many queries. It is bounded:
-//! old and unused nodes are pruned by the background task.
+//! The cache can answer "what is stored at this key". It cannot answer the
+//! reverse question — *what else becomes wrong, or becomes worth
+//! refreshing, when this entry changes* — because a `BTreeMap<key, data>`
+//! has no notion of one entry depending on another. That reverse question
+//! is the only reason this module exists, so it is implemented directly:
+//! [`ResolutionGraph::dependents`] walks incoming edges, and the resolver
+//! uses it to keep an alias chain coherently fresh instead of refreshing a
+//! target while leaving the CNAME that points at it to expire on its own.
+//!
+//! Nodes and edges are bounded by [`GraphConfig::max_nodes`]; the
+//! background task prunes whatever has not been touched inside
+//! [`GraphConfig::prune_age_secs`].
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,17 +59,27 @@ impl NodeId {
     }
 }
 
-/// The kind of a node (used by the planner).
+/// The kind of a node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeKind {
     /// A domain name node.
     Domain,
-    /// A specific RRset node.
+    /// A specific RRset node (the unit the cache stores).
     Rrset,
     /// A nameserver name node.
     Ns,
     /// A concrete server address node.
     Server,
+}
+
+/// The kind implied by a node's identity.
+pub fn node_kind(id: &NodeId) -> NodeKind {
+    match id {
+        NodeId::Domain(_) => NodeKind::Domain,
+        NodeId::Rrset(_) => NodeKind::Rrset,
+        NodeId::Ns(_) => NodeKind::Ns,
+        NodeId::Server(_, _) => NodeKind::Server,
+    }
 }
 
 /// Edge semantics.
@@ -104,8 +121,6 @@ pub struct GraphNode {
     pub weight: u64,
     /// Last time this node was touched.
     pub last_seen: Ts,
-    /// Whether a resolution is currently in flight for this node.
-    pub in_flight: bool,
 }
 
 /// An edge record.
@@ -142,12 +157,17 @@ impl Default for GraphConfig {
 }
 
 /// The bounded resolution dependency graph.
+///
+/// Three maps hold the same relation from three directions: `edges` for a
+/// given pair (kind + weights), `fwd` for "what does X depend on", and `rev`
+/// for "what depends on X" — the second question is the one the resolver
+/// cannot answer from the cache, and it is why this structure exists.
 pub struct ResolutionGraph {
     config: GraphConfig,
     nodes: BTreeMap<NodeId, GraphNode>,
     edges: BTreeMap<(NodeId, NodeId), GraphEdge>,
-    /// Monotonic touch counter (for diagnostics / versioning).
-    pub version: u64,
+    fwd: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    rev: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
 
 impl ResolutionGraph {
@@ -157,7 +177,8 @@ impl ResolutionGraph {
             config,
             nodes: BTreeMap::new(),
             edges: BTreeMap::new(),
-            version: 0,
+            fwd: BTreeMap::new(),
+            rev: BTreeMap::new(),
         }
     }
 
@@ -167,8 +188,14 @@ impl ResolutionGraph {
     }
 
     /// Touch (create or update) a node.
+    ///
+    /// The node count is a hard cap: when the graph is full, a *new* node is
+    /// not admitted (its observation is dropped) rather than evicting one.
+    /// That keeps admission `O(log n)` in every case, and the background
+    /// prune is what makes room again. Evicting on the insert path instead
+    /// would put a scan of the graph on the path of every resolution once
+    /// the cap is reached.
     pub fn touch(&mut self, id: NodeId, kind: NodeKind, now: Ts) {
-        self.version += 1;
         match self.nodes.get_mut(&id) {
             Some(n) => {
                 n.weight = n.weight.saturating_add(1);
@@ -177,45 +204,39 @@ impl ResolutionGraph {
             }
             None => {
                 if self.nodes.len() >= self.config.max_nodes {
-                    self.prune(now, 0);
-                    if self.nodes.len() >= self.config.max_nodes {
-                        // Still full: drop the least-recently-seen node.
-                        if let Some(k) = self
-                            .nodes
-                            .iter()
-                            .min_by_key(|(_, n)| n.last_seen)
-                            .map(|(k, _)| k.clone())
-                        {
-                            self.nodes.remove(&k);
-                            self.edges.retain(|(a, b), _| *a != k && *b != k);
-                        }
-                    }
+                    return;
                 }
-                let key = id.clone();
                 self.nodes.insert(
-                    key,
+                    id.clone(),
                     GraphNode {
                         id,
                         kind,
                         weight: 1,
                         last_seen: now,
-                        in_flight: false,
                     },
                 );
             }
         }
     }
 
-    /// Record (or reinforce) a directed edge between two nodes, touching
-    /// both endpoints.
+    /// Record (or reinforce) a directed edge, creating either endpoint if it
+    /// is new (subject to the node cap).
     pub fn edge(&mut self, from: NodeId, to: NodeId, kind: EdgeKind, now: Ts) {
-        self.version += 1;
+        for (id, k) in [(&from, node_kind(&from)), (&to, node_kind(&to))] {
+            self.touch(id.clone(), k, now);
+        }
         match self.edges.get_mut(&(from.clone(), to.clone())) {
             Some(e) => {
                 e.weight = e.weight.saturating_add(1);
                 e.last_seen = now;
+                e.kind = kind;
             }
             None => {
+                self.fwd
+                    .entry(from.clone())
+                    .or_default()
+                    .insert(to.clone());
+                self.rev.entry(to.clone()).or_default().insert(from.clone());
                 self.edges.insert(
                     (from.clone(), to.clone()),
                     GraphEdge {
@@ -230,46 +251,61 @@ impl ResolutionGraph {
         }
     }
 
-    /// Mark a node as having a resolution in flight.
-    pub fn set_in_flight(&mut self, id: &NodeId, in_flight: bool) {
-        if let Some(n) = self.nodes.get_mut(id) {
-            n.in_flight = in_flight;
-        }
-    }
-
-    /// Whether a resolution is in flight for this node.
-    pub fn is_in_flight(&self, id: &NodeId) -> bool {
-        self.nodes.get(id).map(|n| n.in_flight).unwrap_or(false)
-    }
-
     /// The direct dependencies of a node (outgoing edges).
     pub fn dependencies(&self, id: &NodeId) -> Vec<(NodeId, EdgeKind)> {
-        self.edges
+        let Some(neighbours) = self.fwd.get(id) else {
+            return Vec::new();
+        };
+        neighbours
             .iter()
-            .filter(|((a, _), _)| a == id)
-            .map(|((_, b), e)| (b.clone(), e.kind))
+            .map(|to| {
+                let kind = self
+                    .edges
+                    .get(&(id.clone(), to.clone()))
+                    .map(|e| e.kind)
+                    .unwrap_or(EdgeKind::DependsOn);
+                (to.clone(), kind)
+            })
+            .collect()
+    }
+
+    /// The nodes that depend on `id` (incoming edges) — the question a cache
+    /// cannot answer, and the reason the resolver keeps this graph at all.
+    pub fn dependents(&self, id: &NodeId) -> Vec<(NodeId, EdgeKind)> {
+        let Some(neighbours) = self.rev.get(id) else {
+            return Vec::new();
+        };
+        neighbours
+            .iter()
+            .map(|from| {
+                let kind = self
+                    .edges
+                    .get(&(from.clone(), id.clone()))
+                    .map(|e| e.kind)
+                    .unwrap_or(EdgeKind::DependsOn);
+                (from.clone(), kind)
+            })
             .collect()
     }
 
     /// The full transitive dependency closure of a node (breadth-first,
-    /// bounded).
+    /// bounded to `max` nodes).
     pub fn dependency_closure(&self, id: &NodeId, max: usize) -> Vec<NodeId> {
-        let mut seen = Vec::new();
-        let mut queue = Vec::new();
-        queue.push(id.clone());
-        while let Some(cur) = queue.pop() {
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(id.clone());
+        seen.insert(id.clone());
+        while let Some(cur) = queue.pop_front() {
             if seen.len() >= max {
                 break;
             }
-            if seen.contains(&cur) {
-                continue;
-            }
-            seen.push(cur.clone());
             for (dep, _) in self.dependencies(&cur) {
-                queue.push(dep);
+                if seen.insert(dep.clone()) {
+                    queue.push_back(dep);
+                }
             }
         }
-        seen
+        seen.into_iter().collect()
     }
 
     /// Nodes of a given kind.
@@ -279,6 +315,11 @@ impl ResolutionGraph {
 
     /// Prune nodes (and their edges) not seen within `min_age_secs`, or
     /// older than the configured prune age when `min_age_secs == 0`.
+    ///
+    /// One pass decides what is dead and one pass removes the edges that
+    /// touch it: doing the edge cleanup per dead node would be
+    /// `O(dead × edges)`, which on a 100k-node graph is a minute of work for
+    /// a job that runs every second.
     pub fn prune(&mut self, now: Ts, min_age_secs: u64) {
         let age = if min_age_secs == 0 {
             self.config.prune_age_secs
@@ -286,15 +327,29 @@ impl ResolutionGraph {
             min_age_secs
         };
         let cutoff = now.saturating_sub(age as Ts * 1_000_000_000);
-        let dead: Vec<NodeId> = self
+        let dead: BTreeSet<NodeId> = self
             .nodes
             .iter()
             .filter(|(_, n)| n.last_seen < cutoff)
             .map(|(k, _)| k.clone())
             .collect();
-        for k in dead {
-            self.nodes.remove(&k);
-            self.edges.retain(|(a, b), _| *a != k && *b != k);
+        if dead.is_empty() {
+            return;
+        }
+        for k in &dead {
+            self.nodes.remove(k);
+        }
+        self.edges
+            .retain(|(a, b), _| !dead.contains(a) && !dead.contains(b));
+        for k in &dead {
+            self.fwd.remove(k);
+            self.rev.remove(k);
+        }
+        for neighbours in self.fwd.values_mut() {
+            neighbours.retain(|n| !dead.contains(n));
+        }
+        for neighbours in self.rev.values_mut() {
+            neighbours.retain(|n| !dead.contains(n));
         }
     }
 

@@ -56,6 +56,9 @@ pub struct CacheJson {
     /// Cold tier capacity (entries); absent = default.
     #[njson(default)]
     pub cold_capacity: Option<usize>,
+    /// NXDOMAIN store capacity (names); absent = default.
+    #[njson(default)]
+    pub nx_capacity: Option<usize>,
     /// Serve-stale window in seconds; absent = default.
     #[njson(default)]
     pub stale_window_secs: Option<u32>,
@@ -81,6 +84,7 @@ impl CacheJson {
             hot_capacity: self.hot_capacity.unwrap_or(d.hot_capacity),
             warm_capacity: self.warm_capacity.unwrap_or(d.warm_capacity),
             cold_capacity: self.cold_capacity.unwrap_or(d.cold_capacity),
+            nx_capacity: self.nx_capacity.unwrap_or(d.nx_capacity),
             stale_window_secs: self.stale_window_secs.unwrap_or(d.stale_window_secs),
             negative_ttl_cap: self.negative_ttl_cap.unwrap_or(d.negative_ttl_cap),
             max_ttl_cap: self.max_ttl_cap.unwrap_or(d.max_ttl_cap),
@@ -120,6 +124,10 @@ pub struct EngineJson {
     #[njson(default)]
     pub tcp_fallback: Option<bool>,
     /// Forwarding upstreams (optional): `{"proto":"dot","ip":"1.1.1.1","port":853,"host":"cloudflare-dns.com"}`.
+    ///
+    /// Configuring any forwarder switches the resolver to forwarding mode
+    /// (RD=1 to the listed upstreams); `host` is required for the encrypted
+    /// transports, because certificate verification uses it as the identity.
     #[njson(default)]
     pub forwarders: Vec<ForwarderJson>,
 }
@@ -169,6 +177,29 @@ impl ForwarderJson {
             self.port
         };
         Ok(Endpoint::new(ip, port, proto))
+    }
+
+    /// Convert to a [`Forwarder`](crate::forward::Forwarder).
+    ///
+    /// An encrypted transport without a `host` is rejected: the SNI would
+    /// fall back to the IP literal, and verification against an IP is not an
+    /// identity check. Failing here is better than a resolver that cannot
+    /// validate and degrades to full recursion.
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    pub fn forwarder(&self) -> Result<crate::forward::Forwarder> {
+        let endpoint = self.endpoint()?;
+        match endpoint.proto {
+            Proto::Udp | Proto::Tcp => Ok(crate::forward::Forwarder::plain(endpoint)),
+            Proto::Tls | Proto::DoH | Proto::DoH3 | Proto::DoQ => {
+                let host = self.host.clone().ok_or_else(|| {
+                    Error::config(format!(
+                        "forwarder {}:{} ({}) requires \"host\" for TLS verification",
+                        self.ip, self.port, self.proto
+                    ))
+                })?;
+                Ok(crate::forward::Forwarder::encrypted(endpoint, host))
+            }
+        }
     }
 }
 
@@ -225,7 +256,8 @@ impl Default for PersistJson {
 
 #[cfg(feature = "persist")]
 impl PersistJson {
-    /// Build a [`PersistConfig`]; `None` when no path is configured.
+    /// Build a [`crate::cache::persist::PersistConfig`]; `None` when no path
+    /// is configured.
     pub fn into_persist(&self) -> Option<crate::cache::persist::PersistConfig> {
         let path = self.path.as_ref()?;
         let mut c = crate::cache::persist::PersistConfig::new(
@@ -307,10 +339,8 @@ impl Config {
         let root_servers = engine
             .root_servers
             .iter()
-            .filter_map(|s| s.parse().ok())
+            .filter_map(|s| parse_root(s))
             .collect();
-        // Absent JSON fields (None) fall back to the resolver defaults, so
-        // a minimal document keeps sane timeouts/minimization/0x20 etc.
         let mut ec = EngineConfig {
             root_servers,
             timeout_ms: engine.timeout_ms.unwrap_or(d.engine.timeout_ms),
@@ -322,6 +352,20 @@ impl Config {
             tcp_fallback: engine.tcp_fallback.unwrap_or(d.engine.tcp_fallback),
             ..d.engine
         };
+        #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+        {
+            ec.forwarders = engine
+                .forwarders
+                .iter()
+                .map(ForwarderJson::forwarder)
+                .collect::<Result<Vec<_>>>()?;
+        }
+        #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
+        if !engine.forwarders.is_empty() {
+            return Err(Error::config(
+                "forwarders require a build with the dot, doh, doh3 or doq feature",
+            ));
+        }
         ec.dnssec = engine.dnssec.unwrap_or(d.engine.dnssec) && cfg!(feature = "dnssec");
         let client_burst = self.client_burst.unwrap_or(d.rate_limit.client_capacity);
         let client_qps = self
@@ -345,6 +389,18 @@ impl Config {
             ..d
         })
     }
+}
+
+/// Parse one `rootServers` entry: `"198.41.0.4"` (port 53) or
+/// `"198.41.0.4:5353"`. Returns `None` for anything else, so a typo drops
+/// that entry rather than silently querying an unintended address.
+fn parse_root(s: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return Some(sa);
+    }
+    s.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| std::net::SocketAddr::new(ip, 53))
 }
 
 /// A helper: parse a record-type name like `A`, `AAAA`, `HTTPS`.

@@ -8,7 +8,7 @@
 - [架构](Architecture-zh.md) —— 六层结构与数据流。
 - [PARR 预测核心](PARR-zh.md) —— 查询状态估计器、解析规划器、稳定性感知缓存、自适应解析器。
 - [缓存准入与稳定性数学](Cache-Admission-zh.md) —— `CacheScore` 由什么构成，为什么稳定性要「测」不能「猜」。
-- [解析图](Resolution-Graph-zh.md) —— 预取发散背后的依赖模型。
+- [别名依赖](Alias-Dependency-zh.md) —— 为什么缓存之外还需要一个结构，才能把 CNAME 链当作整体保持可服务。
 - [上游选择成本模型](Upstream-Selection-zh.md) —— 为什么裸 RTT 是错的信号。
 - [DNSSEC](DNSSEC-zh.md) —— 校验什么、怎么校验、诚实的边界。
 - [持久化](Persistence-zh.md) —— L3 层：格式、原子写、恢复规则。

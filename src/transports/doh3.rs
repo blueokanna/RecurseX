@@ -27,6 +27,21 @@ pub struct Doh3Transport {
     client: Mutex<Option<Client>>,
 }
 
+/// Identity and trust settings; the pooled client is deliberately not
+/// touched (`Debug` must never block on a lock).
+impl core::fmt::Debug for Doh3Transport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Doh3Transport(hostname={:?}, path={:?}, verify={}, roots={})",
+            self.hostname,
+            self.path,
+            self.verify,
+            self.roots.len()
+        )
+    }
+}
+
 impl Default for Doh3Transport {
     fn default() -> Self {
         Self {

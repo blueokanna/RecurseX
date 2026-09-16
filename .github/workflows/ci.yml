@@ -6,8 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ------------------------------------------------------------------
@@ -16,6 +26,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.78 (MSRV)
@@ -27,11 +38,13 @@ jobs:
         run: cargo fmt --all -- --check
 
   # ------------------------------------------------------------------
-  # Lint — clippy with warnings denied, on the MSRV toolchain.
+  # Lint — clippy with warnings denied, on every feature frontier that
+  # has its own code path.
   # ------------------------------------------------------------------
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.78 (MSRV)
@@ -43,55 +56,118 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Clippy (no_std core, lib only)
         run: cargo clippy --no-default-features --lib -- -D warnings
+      - name: Clippy (std only, all targets)
+        run: cargo clippy --no-default-features --features std --all-targets -- -D warnings
 
   # ------------------------------------------------------------------
-  # Build — every feature combination must compile.
+  # Documentation — rustdoc must be warning-free, and the doctests are
+  # part of the test suite rather than decoration.
   # ------------------------------------------------------------------
-  build:
-    name: build
+  doc:
+    name: doc
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.78 (MSRV)
         uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build (default features)
-        run: cargo build
-      - name: Build (no_std core)
-        run: cargo build --no-default-features
-      - name: Build (all features)
-        run: cargo build --all-features
-      - name: Check examples compile
-        run: cargo build --examples --all-features
+      - name: Rustdoc (all features, warnings denied)
+        run: cargo doc --all-features --no-deps
+      - name: Doctests (all features)
+        run: cargo test --doc --all-features
+      - name: Doctests (no_std core)
+        run: cargo test --doc --no-default-features
 
-  test-msrv:
-    name: test (1.78 MSRV)
-    runs-on: ubuntu-latest
+  test:
+    name: test (${{ matrix.toolchain }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        toolchain: [msrv, stable]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.78.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Test (all features)
-        run: cargo test --all-features
-      - name: Test (default features)
-        run: cargo test
-      - name: no_std core builds
-        run: cargo build --no-default-features
-
-  test-stable:
-    name: test (stable)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # rust-toolchain.toml pins 1.78; remove it here so this job actually
-      # runs on the latest stable compiler.
-      - name: Ignore the MSRV toolchain file for this job
+      - name: Ignore the pinned toolchain file (stable leg)
+        if: matrix.toolchain == 'stable'
+        shell: bash
         run: rm -f rust-toolchain.toml
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.78 (MSRV)
+        if: matrix.toolchain == 'msrv'
+        uses: dtolnay/rust-toolchain@1.78.0
+      - name: Install Rust stable
+        if: matrix.toolchain == 'stable'
+        uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test (all features)
         run: cargo test --all-features
       - name: Test (default features)
         run: cargo test
-      - name: no_std core builds
-        run: cargo build --no-default-features
+      # The release profile is what ships, and optimized code is where
+      # timing assumptions break. One leg is enough for it.
+      - name: Test (release, all features)
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo test --release --all-features
+  features:
+    name: features
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test (no_std core)
+        run: |
+          cargo build --no-default-features
+          cargo test --no-default-features --lib
+      - name: Build + test (std only)
+        run: |
+          cargo build --no-default-features --features std
+          cargo test --no-default-features --features std --lib
+      - name: Build (each optional feature alone)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in dot doh doh3 doq dnssec persist; do
+            echo "::group::feature $f"
+            cargo build --no-default-features --features "$f"
+            echo "::endgroup::"
+          done
+      - name: Build + test (all features)
+        run: |
+          cargo build --all-features
+          cargo test --all-features --lib
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release, all features)
+        run: cargo build --release --all-features
+      - name: Examples (release, all features)
+        run: cargo build --release --examples --all-features
+      # Each example declares the features it needs, so this builds exactly
+      # the std-only ones: a missing `required-features` shows up here.
+      - name: Examples (debug, std only)
+        run: cargo build --examples --no-default-features --features std
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.78 (MSRV)
+        uses: dtolnay/rust-toolchain@1.78.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Package (verify the published tarball)
+        run: cargo package --allow-dirty
+      - name: List the packaged files
+        run: tar -tzf target/package/recurse-x-*.crate

@@ -11,8 +11,8 @@ actually work and why they are shaped the way they are.
   Planner, stability-aware cache, adaptive resolver.
 - [Cache admission & stability math](Cache-Admission.md) — what `CacheScore`
   is made of and why stability is measured, not assumed.
-- [Resolution graph](Resolution-Graph.md) — the dependency model behind
-  prefetch fan-out.
+- [Alias dependency](Alias-Dependency.md) — why a cache needs a second
+  structure to keep a CNAME chain servable as a unit.
 - [Upstream selection cost model](Upstream-Selection.md) — why raw RTT is the
   wrong signal, and what we rank on instead.
 - [DNSSEC](DNSSEC.md) — what is validated, how, and the honest scope.

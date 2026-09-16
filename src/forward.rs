@@ -61,6 +61,20 @@ pub struct ForwarderSet {
     now: i64,
 }
 
+/// Which upstreams are configured and whether certificates are verified;
+/// the pooled transports are not touched (`Debug` must not block).
+impl core::fmt::Debug for ForwarderSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "ForwarderSet(forwarders={}, verify={}, roots={})",
+            self.forwarders.len(),
+            self.verify,
+            self.roots.len()
+        )
+    }
+}
+
 impl ForwarderSet {
     /// An empty set.
     pub fn new(roots: courierust::courierust_tls::RootStore, verify: bool, now: i64) -> Self {
@@ -212,27 +226,34 @@ impl ForwarderSet {
 }
 
 /// Build a query message for a forwarder (RD=1, EDNS as requested).
+///
+/// Returns the message itself; the caller serializes it once. Building it by
+/// serializing and re-parsing would be lossy in exactly the way that matters
+/// here — the question echo used for response validation must be the same
+/// message that goes on the wire.
 pub fn build_forward_query(
     key: &crate::query::QueryKey,
     edns_udp_size: u16,
     dnssec: bool,
     rng: &mut SplitMix64,
 ) -> Message {
-    let q = crate::engine::build_query(
-        (rng.next_u32() & 0xffff) as u16,
-        &key.name,
-        key.rr_type,
-        true,
-        Some(&crate::engine::EdnsSpec {
+    let mut m = Message::new((rng.next_u32() & 0xffff) as u16);
+    m.flags.rd = true;
+    m.questions.push(crate::message::Question {
+        qname: key.name.clone(),
+        qtype: key.rr_type,
+        qclass: key.class,
+    });
+    m.edns = Some(
+        crate::engine::EdnsSpec {
             udp_size: edns_udp_size,
             dnssec_ok: dnssec || key.want_dnssec,
             ecs: crate::query::ecs_option(key),
             client_cookie: None,
-        }),
-        false,
-        rng,
+        }
+        .to_edns(),
     );
-    Message::parse(&q.bytes).unwrap_or_default()
+    m
 }
 
 /// Convert a forwarder response into a [`crate::resolver::Resolution`].
@@ -254,11 +275,19 @@ pub fn response_to_resolution(
     if ttl == u32::MAX {
         ttl = 0;
     }
+    // The message-level rcode is 12 bits (RFC 6891 §6.1.3). Every extended
+    // value we would otherwise have to carry is an EDNS negotiation answer
+    // (BADVERS and friends), which is not something a client asked through
+    // us can act on; reporting it as SERVFAIL is honest, truncating it to
+    // `rcode as u8` would silently turn it into a different code.
+    let rcode = u8::try_from(resp.rcode())
+        .map(crate::qtype::Rcode)
+        .unwrap_or(crate::qtype::Rcode::SERVFAIL);
     crate::resolver::Resolution {
         name: key.name.clone(),
         rr_type: key.rr_type,
         class: key.class,
-        rcode: crate::qtype::Rcode(resp.rcode() as u8),
+        rcode,
         answers,
         authorities: resp.authorities.clone(),
         rrsigs,

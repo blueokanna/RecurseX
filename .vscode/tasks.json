@@ -1,0 +1,205 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "rx-q",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features > %TEMP%\\rx_q.txt 2>&1) & (cargo clippy --all-targets --all-features -- -D warnings >> %TEMP%\\rx_q.txt 2>&1) & (cargo fmt --check >> %TEMP%\\rx_q.txt 2>&1) & (cargo build --no-default-features >> %TEMP%\\rx_q.txt 2>&1) & (cargo clippy --no-default-features --lib -- -D warnings >> %TEMP%\\rx_q.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_q.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-doc",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && set RUSTDOCFLAGS=-D warnings & (cargo doc --all-features --no-deps > %TEMP%\\rx_doc.txt 2>&1) & (cargo test --doc --all-features >> %TEMP%\\rx_doc.txt 2>&1) & (cargo package --allow-dirty --no-verify >> %TEMP%\\rx_doc.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_doc.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-lint",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_lint.txt 2>&1) & (cargo check --no-default-features >> %TEMP%\\rx_lint.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_lint.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-lint2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_lint2.txt 2>&1) & (cargo check --no-default-features >> %TEMP%\\rx_lint2.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_lint2.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-lint3",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_lint3.txt 2>&1) & (cargo check --no-default-features >> %TEMP%\\rx_lint3.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_lint3.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-lint4",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_lint4.txt 2>&1) & (cargo check --no-default-features >> %TEMP%\\rx_lint4.txt 2>&1) & (cargo clippy --all-targets --all-features -- -D warnings >> %TEMP%\\rx_lint4.txt 2>&1) & (cargo test --all-features --lib >> %TEMP%\\rx_lint4.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_lint4.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-srv",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_srv.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_srv.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-srv2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo check --all-features --all-targets > %TEMP%\\rx_srv2.txt 2>&1) & (cargo clippy --all-targets --all-features -- -D warnings >> %TEMP%\\rx_srv2.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_srv2.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-sh",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features --lib server:: > %TEMP%\\rx_sh.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_sh.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-rs",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features --lib resolver:: > %TEMP%\\rx_rs.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_rs.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-it",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features > %TEMP%\\rx_it.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_it.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-it2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features > %TEMP%\\rx_it.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_it.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-verify",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features > %TEMP%\\rx_it.txt 2>&1) & (cargo check --no-default-features --features std > %TEMP%\\rx_c1.txt 2>&1) & (cargo clippy --all-targets --all-features -- -D warnings > %TEMP%\\rx_cl.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_cl.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-verify2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo clippy --all-targets --all-features -- -D warnings > %TEMP%\\rx_cl.txt 2>&1) & (cargo test --all-features --test wire_robustness -- --nocapture > %TEMP%\\rx_wr.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_wr.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-verify3",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo clippy --all-targets --all-features -- -D warnings > %TEMP%\\rx_cl.txt 2>&1) & (cargo test --all-features > %TEMP%\\rx_wr.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_wr.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-verify4",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features > %TEMP%\\rx_wr.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_wr.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-doc",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && (cargo test --all-features --doc > %TEMP%\\rx_doc.txt 2>&1) & (cargo test --all-features > %TEMP%\\rx_all.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_all.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-doc2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && set RUSTDOCFLAGS=-D warnings & (cargo doc --all-features --no-deps > %TEMP%\\rx_doc.txt 2>&1) & (cargo test --doc --all-features >> %TEMP%\\rx_doc.txt 2>&1) & echo ALLDONE >> %TEMP%\\rx_doc.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-ci-local",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && powershell -NoProfile -ExecutionPolicy Bypass -File target\\ci-local.ps1 > %TEMP%\\rx_ci_run.txt 2>&1 & echo ALLDONE >> %TEMP%\\rx_ci_run.txt"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "rx-ci-local2",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"cd /d d:\\RustProject\\RecurseX && powershell -NoProfile -ExecutionPolicy Bypass -File target\\ci-local.ps1 > %TEMP%\\rx_ci_run2.txt 2>&1 & echo ALLDONE >> %TEMP%\\rx_ci_run2.txt"
+			],
+			"isBackground": false
+		}
+	]
+}

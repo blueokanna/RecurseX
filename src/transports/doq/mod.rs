@@ -181,6 +181,25 @@ pub struct DoqTransport {
     conn: Mutex<Option<quic::QuicConnection>>,
 }
 
+/// Which server this transport talks to and how it verifies it; the live
+/// connection is not touched (`Debug` must never block on a lock).
+impl core::fmt::Debug for DoqTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "DoqTransport(host={:?}, verify={}, roots={}, provider={})",
+            self.host,
+            self.verify,
+            self.roots.len(),
+            if self.provider.is_some() {
+                "custom"
+            } else {
+                "builtin"
+            }
+        )
+    }
+}
+
 impl Default for DoqTransport {
     fn default() -> Self {
         Self {

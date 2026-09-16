@@ -874,7 +874,15 @@ impl Record {
     }
 
     /// Serialize this record into `out` with optional name compression.
-    pub fn to_wire(&self, out: &mut Vec<u8>, mut comp: Option<&mut NameCompressor>) {
+    ///
+    /// Fails when the encoded RDATA does not fit its 16-bit length field.
+    /// That is reachable with hostile input: a compressed name expands when
+    /// re-encoded (compression is per-message state, and RDATA names are
+    /// re-emitted uncompressed), so a 64 KiB RDATA full of pointers to a
+    /// long name can expand past 65535 octets. Silently writing a truncated
+    /// length would corrupt the message we hand to a client, so the write is
+    /// reported and the caller discards the buffer.
+    pub fn to_wire(&self, out: &mut Vec<u8>, mut comp: Option<&mut NameCompressor>) -> Result<()> {
         match comp.as_deref_mut() {
             Some(c) => c.write(&self.name, out),
             None => self.name.write_wire(out),
@@ -886,8 +894,11 @@ impl Record {
         out.extend_from_slice(&[0, 0]);
         self.rdata.to_wire(out, comp);
         let rdlen = out.len() - rdlen_pos - 2;
-        debug_assert!(rdlen <= u16::MAX as usize);
+        if rdlen > u16::MAX as usize {
+            return Err(Error::wire("RDATA exceeds the 16-bit length field"));
+        }
         out[rdlen_pos..rdlen_pos + 2].copy_from_slice(&(rdlen as u16).to_be_bytes());
+        Ok(())
     }
 }
 
@@ -1069,6 +1080,8 @@ pub fn hex(bytes: &[u8]) -> alloc::string::String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     fn parse_rdata(bytes: &[u8], rr_type: RrType) -> RData {
         let mut pos = 0;

@@ -3,23 +3,80 @@
 //! The crate is organized as a pipeline: a client-facing layer, a query
 //! processing layer, a multi-tier semantic cache, a recursive resolution
 //! engine, upstream transports, and a security/policy layer. The
-//! algorithmic cores (wire codec, cache, estimator, graph, upstream model)
-//! are `no_std`; the networked resolver requires the `std` feature.
+//! algorithmic cores (wire codec, cache, estimator, alias graph, upstream
+//! model) are `no_std`; the networked resolver requires the `std` feature.
+//!
+//! ## Resolving
+//!
+//! The wire codec needs no network and no `std`:
+//!
+//! ```
+//! use recurse_x::{Message, Name, RrType};
+//!
+//! let query = Message::query(0x1234, Name::from_ascii("www.example.com")?, RrType::A, true);
+//! let bytes = query.to_bytes()?;
+//! assert_eq!(Message::parse(&bytes)?, query);
+//! # Ok::<(), recurse_x::Error>(())
+//! ```
+//!
+//! A resolver is built from a [`ResolverConfig`], most commonly parsed from
+//! a JSON document:
+//!
+//! ```
+//! # #[cfg(feature = "std")]
+//! # {
+//! use recurse_x::config::Config;
+//! use recurse_x::Resolver;
+//!
+//! let json = r#"{
+//!     "cache": { "hotCapacity": 256 },
+//!     "engine": { "qnameMinimization": true }
+//! }"#;
+//! let resolver = Resolver::new(Config::from_json_str(json)?.into_resolver_config()?);
+//! assert_eq!(resolver.stats_snapshot().queries, 0);
+//! # }
+//! # Ok::<(), recurse_x::Error>(())
+//! ```
+//!
+//! Serving clients needs a [`Server`] around the resolver; both stop on
+//! request and `join` returns once every loop has exited:
+//!
+//! ```
+//! # #[cfg(feature = "std")]
+//! # {
+//! use recurse_x::{Resolver, ResolverConfig, Server};
+//!
+//! let resolver = Resolver::new(ResolverConfig::default());
+//! let server = Server::new(resolver.clone());
+//! let addr = server.bind_udp("127.0.0.1:0".parse().unwrap())?;
+//! assert_ne!(addr.port(), 0);
+//! server.shutdown();
+//! resolver.shutdown();
+//! server.join();
+//! # }
+//! # Ok::<(), recurse_x::Error>(())
+//! ```
+//!
+//! [`Config`]: config::Config
+//! [`Server`]: server::Server
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
+#![deny(missing_debug_implementations)]
+#![deny(clippy::todo, clippy::unimplemented, clippy::dbg_macro)]
 #![warn(missing_docs)]
 #![allow(clippy::needless_return)]
 
 extern crate alloc;
 
+pub mod alias;
+pub mod bounded;
 pub mod cache;
 pub mod edns;
 pub mod engine;
 pub mod error;
 pub mod estimator;
 pub mod float;
-pub mod graph;
 pub mod message;
 pub mod name;
 pub mod planner;

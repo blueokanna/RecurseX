@@ -68,10 +68,10 @@ probability clears the bar, bounded per tick.
 ## Stage 4 — Adaptive resolver
 
 Upstream selection is adaptive per authority ([Upstream-Selection](Upstream-Selection.md)),
-and the resolution graph ([Resolution-Graph](Resolution-Graph.md)) lets a
-single prefetch decision fan out across an entire dependency set. Both feed
-their observations back into the estimator and the upstream model, closing
-the loop.
+and the alias dependency graph ([Alias-Dependency](Alias-Dependency.md)) makes a
+single refresh decision cover a whole CNAME chain instead of one hop of it.
+Both feed their observations back into the estimator and the upstream model,
+closing the loop.
 
 ## The one rule that keeps it honest
 

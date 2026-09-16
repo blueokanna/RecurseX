@@ -10,6 +10,11 @@
 #[cfg(feature = "std")]
 use core::fmt;
 
+/// The type returned by [`format_rfc3339`]; under `std` it comes from the
+/// prelude, in a `no_std` test build it has to be named.
+#[cfg(all(test, not(feature = "std")))]
+use alloc::string::String;
+
 /// Nanoseconds since the Unix epoch (matches `tzcraft::Ticks`'s axis).
 pub type Ts = i128;
 
@@ -141,7 +146,6 @@ pub fn to_ticks(t: Ts) -> tzcraft::Ticks {
 /// Render a timestamp as an RFC 3339 UTC string.
 #[cfg(any(feature = "std", test))]
 pub fn format_rfc3339(t: Ts) -> String {
-    use alloc::string::String;
     let mut buf = [0u8; 64];
     match to_ticks(t).write_rfc3339(&mut buf, tzcraft::FractionDigits::None) {
         Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
@@ -170,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn manual_clock_advances() {
         let c = ManualClock::at_secs(100);
         assert_eq!(c.now(), 100 * NS_PER_SEC);

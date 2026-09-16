@@ -28,6 +28,22 @@ pub struct DohTransport {
     client: Mutex<Option<Client>>,
 }
 
+/// Identity and trust settings; the pooled client is deliberately not
+/// touched, because `Debug` is called from log lines and panic messages and
+/// must never block on a lock.
+impl core::fmt::Debug for DohTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "DohTransport(hostname={:?}, path={:?}, verify={}, roots={})",
+            self.hostname,
+            self.path,
+            self.verify,
+            self.roots.len()
+        )
+    }
+}
+
 impl Default for DohTransport {
     fn default() -> Self {
         Self {

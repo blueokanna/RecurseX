@@ -4,7 +4,7 @@
 //! bytes. The engine composes them: retries, server selection, fallback
 //! from UDP to TCP, and the forwarders (DoT / DoH / DoH3 / DoQ).
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::transports::{tcp, udp};
 use crate::upstream::{Endpoint, Proto};
 
@@ -44,6 +44,23 @@ pub struct Transports {
     pub doq: crate::transports::doq::DoqTransport,
 }
 
+/// Lists the protocols compiled into this build, which is the only thing
+/// worth knowing about a transport set in a log line.
+impl core::fmt::Debug for Transports {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Transports(udp, tcp")?;
+        #[cfg(feature = "dot")]
+        write!(f, ", dot")?;
+        #[cfg(feature = "doh")]
+        write!(f, ", doh")?;
+        #[cfg(feature = "doh3")]
+        write!(f, ", doh3")?;
+        #[cfg(feature = "doq")]
+        write!(f, ", doq")?;
+        write!(f, ")")
+    }
+}
+
 impl Transports {
     /// A default transport set (UDP + TCP always available under `std`).
     pub fn new() -> Self {
@@ -75,32 +92,25 @@ impl Transports {
             #[cfg(feature = "doq")]
             Proto::DoQ => self.doq.exchange(query, endpoint, timeout_ms),
             #[cfg(not(feature = "dot"))]
-            Proto::Tls => Err(Error::new(
+            Proto::Tls => Err(crate::error::Error::new(
                 crate::error::ErrorKind::Unsupported,
                 "DoT transport not compiled in (enable the `dot` feature)",
             )),
             #[cfg(not(feature = "doh"))]
-            Proto::DoH => Err(Error::new(
+            Proto::DoH => Err(crate::error::Error::new(
                 crate::error::ErrorKind::Unsupported,
                 "DoH transport not compiled in (enable the `doh` feature)",
             )),
             #[cfg(not(feature = "doh3"))]
-            Proto::DoH3 => Err(Error::new(
+            Proto::DoH3 => Err(crate::error::Error::new(
                 crate::error::ErrorKind::Unsupported,
                 "DoH3 transport not compiled in (enable the `doh3` feature)",
             )),
             #[cfg(not(feature = "doq"))]
-            Proto::DoQ => Err(Error::new(
+            Proto::DoQ => Err(crate::error::Error::new(
                 crate::error::ErrorKind::Unsupported,
                 "DoQ transport not compiled in (enable the `doq` feature)",
             )),
         }
     }
-}
-
-/// Fallback helper: when a UDP exchange returns a truncated response or
-/// fails with a framing issue, the engine may retry the same endpoint over
-/// TCP.
-pub fn tcp_retry_needed(error: &Error) -> bool {
-    matches!(error.kind, crate::error::ErrorKind::Transport)
 }

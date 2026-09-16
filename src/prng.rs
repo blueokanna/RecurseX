@@ -63,10 +63,15 @@ impl SplitMix64 {
         (self.next_u64() >> 32) as u32
     }
 
-    /// A value in `0..n` (rejection sampling, unbiased).
+    /// A value in `0..n` (rejection sampling, unbiased). `n == 0` yields 0
+    /// rather than dividing by zero: every caller derives `n` from the
+    /// length of a collection, and an empty collection is a legitimate
+    /// input that must not panic a server.
     #[inline]
     pub fn below(&mut self, n: u64) -> u64 {
-        debug_assert!(n > 0);
+        if n <= 1 {
+            return 0;
+        }
         let limit = (u64::MAX / n) * n;
         loop {
             let v = self.next_u64();
@@ -187,6 +192,8 @@ pub fn siphash24_128(k0: u64, k1: u64, input: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
 
     /// Reference vectors from the SipHash reference implementation
     /// (`vectors.h` in veorq/SipHash), key bytes 00..0f, input bytes 00..i.

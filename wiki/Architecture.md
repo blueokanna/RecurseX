@@ -4,32 +4,14 @@ RecurseX is a pipeline, not a blob. Each layer owns one job and talks to the
 next through narrow interfaces, so the algorithmic core is `no_std` and the
 networked parts are isolated behind the `std` feature.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 1. Client Layer            server.rs        UDP/TCP listeners,          │
-│                                              per-query response builder │
-├────────────────────────────────────────────────────────────────────────┤
-│ 2. Query Processing        query.rs         normalize, dedup,           │
-│                            policy.rs        coalesce, 0x20, rate-limit  │
-├────────────────────────────────────────────────────────────────────────┤
-│ 3. Multi-tier Cache        cache/           hot/warm/cold + NXDOMAIN,   │
-│                            stability.rs     stability model, score      │
-│                            cache/score.rs   admission, serve-stale,     │
-│                            cache/persist.rs prefetch, L3 persistence    │
-├────────────────────────────────────────────────────────────────────────┤
-│ 4. Resolution Engine       resolver.rs      root→TLD→authoritative,     │
-│                            engine.rs        CNAME/DNAME, referrals,     │
-│                            dnssec/          DNSSEC validation           │
-├────────────────────────────────────────────────────────────────────────┤
-│ 5. Upstream Transport      transport.rs     DnsTransport trait,         │
-│                            transports/      UDP/TCP/DoT/DoH/DoH3/DoQ    │
-│                            forward.rs       forwarder set               │
-├────────────────────────────────────────────────────────────────────────┤
-│ 6. Security / Policy       policy.rs        rate limits, filtering,     │
-│                            query.rs         anti-spoofing checks,       │
-│                            dnssec/          DNSSEC verdicts             │
-└────────────────────────────────────────────────────────────────────────┘
-```
+| # | 架构层 | 主要文件 / 模块 | 核心职责 |
+|---:|---|---|---|
+| **1** | **Client Layer**<br>客户端层 | `server.rs` | UDP/TCP 监听器<br>每次查询的响应构建器 |
+| **2** | **Query Processing**<br>查询处理 | `query.rs`<br>`policy.rs` | 规范化（Normalize）<br>请求去重（Dedup）<br>请求合并（Coalesce）<br>0x20 编码<br>速率限制（Rate Limit） |
+| **3** | **Multi-tier Cache**<br>多级缓存 | `cache/`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>缓存稳定性模型<br>评分准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
+| **4** | **Resolution Engine**<br>解析引擎 | `resolver.rs`<br>`engine.rs`<br>`dnssec/` | Root → TLD → Authoritative<br>CNAME / DNAME<br>Referral 处理<br>DNSSEC 验证 |
+| **5** | **Upstream Transport**<br>上游传输 | `transport.rs`<br>`transports/`<br>`forward.rs` | `DnsTransport` Trait<br>UDP / TCP / DoT / DoH / DoH3 / DoQ<br>Forwarder 集合 |
+| **6** | **Security / Policy**<br>安全与策略 | `policy.rs`<br>`query.rs`<br>`dnssec/` | 速率限制<br>内容过滤<br>防欺骗检查（Anti-spoofing）<br>DNSSEC 判定（Verdicts） |
 
 ## Data flow for one recursive query
 

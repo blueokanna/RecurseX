@@ -26,6 +26,18 @@ pub struct DotTransport {
     pub connect_timeout_ms: u64,
 }
 
+impl core::fmt::Debug for DotTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "DotTransport(hostname={:?}, verify={}, roots={})",
+            self.hostname,
+            self.verify,
+            self.roots.len()
+        )
+    }
+}
+
 impl Default for DotTransport {
     fn default() -> Self {
         Self {

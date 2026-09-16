@@ -20,6 +20,15 @@ use crate::prng::SplitMix64;
 pub const MAX_NAME_LEN: usize = 255;
 /// Maximum number of labels in a name (implicit in the 255-byte limit).
 pub const MAX_LABELS: usize = 127;
+/// Maximum compression-pointer hops a single name may take.
+///
+/// Every pointer hop adds at least two octets to the reconstructed name
+/// (a length octet plus a one-octet label), so a valid name — at most 255
+/// octets — can never be reached through more than 127 hops. Guarding at
+/// 128 therefore rejects every pointer loop and never rejects a name the
+/// wire format can legitimately express. (A fixed small limit such as 40
+/// would reject deeply compressed but perfectly valid names.)
+pub const MAX_POINTER_HOPS: usize = MAX_LABELS + 1;
 
 /// A DNS domain name in canonical wire form.
 ///
@@ -252,7 +261,7 @@ impl Name {
                     }
                     p = off;
                     hops += 1;
-                    if hops > 40 {
+                    if hops > MAX_POINTER_HOPS {
                         return Err(Error::wire("compression pointer loop"));
                     }
                 }
@@ -472,10 +481,20 @@ impl Default for Name {
 /// written, and emits compression pointers when a suffix is already
 /// present. Pointers always reference earlier bytes, so this is safe to
 /// feed a streaming writer.
+///
+/// A compression pointer carries a 14-bit offset (RFC 1035 §4.1.4), so only
+/// suffixes written at or below [`MAX_POINTER_OFFSET`] are recorded: a
+/// message that grows past 16 KiB (any large TCP response) stops
+/// compressing new suffixes instead of emitting a truncated pointer that
+/// would corrupt the message.
 #[derive(Debug, Default)]
 pub struct NameCompressor {
     offsets: BTreeMap<Name, usize>,
 }
+
+/// The largest message offset a name compression pointer can encode
+/// (RFC 1035 §4.1.4: 14 bits).
+pub const MAX_POINTER_OFFSET: usize = 0x3fff;
 
 impl NameCompressor {
     /// An empty compressor.
@@ -488,8 +507,8 @@ impl NameCompressor {
     /// Write `name` to `out`, compressing any suffix already emitted.
     pub fn write(&mut self, name: &Name, out: &mut Vec<u8>) {
         // Enumerate suffixes (full name → single label), each with its
-        // relative offset inside the name. The bare root is excluded from
-        // compression targets.
+        // offset relative to the start of the name. The bare root is
+        // excluded from compression targets.
         let mut suffixes: Vec<(Name, usize)> = Vec::with_capacity(8);
         let mut cur = name.clone();
         let total = name.wire_len();
@@ -516,22 +535,27 @@ impl NameCompressor {
             None => {
                 name.write_wire(out);
                 for (s, rel) in &suffixes {
-                    self.offsets.entry(s.clone()).or_insert(base + rel);
+                    self.record(base, s, *rel);
                 }
             }
             Some(i) => {
-                // Write the prefix not covered by the found suffix, then a
-                // pointer to it. The suffix start offset is exactly the
-                // number of prefix bytes to emit.
                 let prefix_len = suffixes[i].1;
                 out.extend_from_slice(&name.as_bytes()[..prefix_len]);
                 let off = self.offsets[&suffixes[i].0];
                 out.push(0xc0 | ((off >> 8) as u8));
                 out.push((off & 0xff) as u8);
                 for (s, rel) in suffixes.iter().take(i) {
-                    self.offsets.entry(s.clone()).or_insert(base + rel);
+                    self.record(base, s, *rel);
                 }
             }
+        }
+    }
+
+    /// Record the absolute offset of a suffix when a pointer can express it.
+    fn record(&mut self, base: usize, suffix: &Name, rel: usize) {
+        let abs = base + rel;
+        if abs <= MAX_POINTER_OFFSET {
+            self.offsets.entry(suffix.clone()).or_insert(abs);
         }
     }
 }
@@ -548,6 +572,8 @@ impl From<&str> for Name {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     #[test]
     fn roundtrip_ascii() {

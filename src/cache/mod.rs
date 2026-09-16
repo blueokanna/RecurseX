@@ -9,7 +9,7 @@
 //!   for serve-stale (RFC 8767) and eviction.
 //! * **NXDOMAIN store** — negative answers for a name, shared across types.
 //!
-//! Admission is score-driven ([`score::compute_full`]); eviction picks the
+//! Admission is score-driven ([`score::score`]); eviction picks the
 //! lowest-scored entry by sampling, so the cache is honest about what it
 //! keeps. TTLs are authoritative values — the cache never invents TTLs; it
 //! only decides *internal* timing (refresh, stale fallback, admission).
@@ -20,15 +20,18 @@ pub mod score;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::fmt;
 
 use crate::edns::Ecs;
 use crate::name::Name;
-use crate::prng::SplitMix64;
 use crate::qtype::{Rcode, RrClass, RrType};
 use crate::rdata::Record;
 use crate::rrset::RrSet;
 use crate::stability::StabilityModel;
 use crate::time::Ts;
+
+/// Eviction stride for a table that is full of live entries.
+const EVICT_STRIDE: usize = 8;
 
 /// A compact, hashable representation of the ECS network used as part of
 /// the cache key (RFC 7871 §7.2: ECS and non-ECS answers must not mix).
@@ -273,6 +276,13 @@ pub struct CacheConfig {
     pub warm_capacity: usize,
     /// Cold tier capacity (entries).
     pub cold_capacity: usize,
+    /// NXDOMAIN store capacity (entries, one per name).
+    ///
+    /// NXDOMAIN has its own bound because it is the cheapest entry to make
+    /// an attacker's way: any random name produces one, so without a cap a
+    /// stream of distinct nonexistent names would grow memory until the
+    /// negative TTLs start expiring.
+    pub nx_capacity: usize,
     /// How long an expired entry stays servable (serve-stale, RFC 8767).
     pub stale_window_secs: u32,
     /// Cap on negative TTLs (RFC 2308 §5 recommends ≤ 300 s).
@@ -301,6 +311,7 @@ impl Default for CacheConfig {
             hot_capacity: 2_048,
             warm_capacity: 131_072,
             cold_capacity: 32_768,
+            nx_capacity: 65_536,
             // RFC 8767 suggests keeping stale data up to 1-3 days.
             stale_window_secs: 86_400,
             negative_ttl_cap: 300,
@@ -340,38 +351,147 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
+/// One capacity-bounded tier of the cache.
+///
+/// `map` holds the entries; `rank` is a secondary index keyed by
+/// `(score rank, key)` so the lowest-scored entry can be found *and removed*
+/// in `O(log n)`. The index is what makes eviction affordable: a cache that
+/// scans its own contents to choose a victim does `O(n)` work per insert
+/// once it is full — `O(n²)` to fill, with no upper bound on the per-insert
+/// cost, which is exactly the kind of work an attacker who can force
+/// evictions would like the resolver to do.
+///
+/// Every mutation goes through this type, so `map` and `rank` cannot drift
+/// apart: an entry is removed from both together, and a score change is
+/// always a remove + insert of the entry carrying the new score.
+struct TierMap {
+    map: BTreeMap<CacheKey, CacheEntry>,
+    rank: BTreeMap<(u64, CacheKey), ()>,
+    capacity: usize,
+}
+
+impl TierMap {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: BTreeMap::new(),
+            rank: BTreeMap::new(),
+            capacity,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the tier holds `key` (test/diagnostic accessor).
+    #[cfg(test)]
+    fn contains_key(&self, key: &CacheKey) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn get_mut(&mut self, key: &CacheKey) -> Option<&mut CacheEntry> {
+        self.map.get_mut(key)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &CacheEntry> {
+        self.map.values()
+    }
+
+    /// Insert (or replace) an entry. When the tier is full and the key is
+    /// new, the lowest-scored entry is evicted and returned.
+    fn insert(&mut self, entry: CacheEntry) -> Option<CacheEntry> {
+        let victim = if self.capacity > 0
+            && !self.map.contains_key(&entry.key)
+            && self.map.len() >= self.capacity
+        {
+            self.pop_lowest()
+        } else {
+            None
+        };
+        let key = entry.key.clone();
+        if let Some(old) = self.map.remove(&key) {
+            self.rank.remove(&(score::rank_of(old.score), key.clone()));
+        }
+        self.rank
+            .insert((score::rank_of(entry.score), key.clone()), ());
+        self.map.insert(key, entry);
+        victim
+    }
+
+    fn remove(&mut self, key: &CacheKey) -> Option<CacheEntry> {
+        let entry = self.map.remove(key)?;
+        self.rank
+            .remove(&(score::rank_of(entry.score), key.clone()));
+        Some(entry)
+    }
+
+    /// Remove and return the lowest-scored entry in the tier.
+    fn pop_lowest(&mut self) -> Option<CacheEntry> {
+        while let Some(((rank, key), _)) = self.rank.pop_first() {
+            if let Some(entry) = self.map.remove(&key) {
+                debug_assert_eq!(score::rank_of(entry.score), rank);
+                return Some(entry);
+            }
+            // Index entry without a live entry: keep draining. Dropping it
+            // here is what keeps `rank` honest rather than leaking.
+        }
+        None
+    }
+
+    /// Keep only the entries the predicate accepts.
+    fn retain(&mut self, mut keep: impl FnMut(&CacheKey, &CacheEntry) -> bool) {
+        let dead: Vec<CacheKey> = self
+            .map
+            .iter()
+            .filter(|(k, e)| !keep(k, e))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in dead {
+            self.remove(&key);
+        }
+    }
+}
+
 /// The semantic multi-tier cache.
 pub struct SemanticCache {
     config: CacheConfig,
-    hot: BTreeMap<CacheKey, CacheEntry>,
-    warm: BTreeMap<CacheKey, CacheEntry>,
-    cold: BTreeMap<CacheKey, CacheEntry>,
+    hot: TierMap,
+    warm: TierMap,
+    cold: TierMap,
+    /// NXDOMAIN store: one entry per name, shared across types.
     nx: BTreeMap<Name, NegativeEntry>,
     stats: CacheStats,
-    rng: SplitMix64,
+}
+
+/// Sizes only: an entry dump would be megabytes of records and tells a log
+/// reader nothing a per-tier count does not.
+impl fmt::Debug for SemanticCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SemanticCache(hot={}, warm={}, cold={}, nx={})",
+            self.hot.len(),
+            self.warm.len(),
+            self.cold.len(),
+            self.nx.len()
+        )
+    }
 }
 
 impl SemanticCache {
     /// A cache with the given configuration.
     pub fn new(config: CacheConfig) -> Self {
-        let rng = {
-            #[cfg(feature = "std")]
-            {
-                SplitMix64::seeded()
-            }
-            #[cfg(not(feature = "std"))]
-            {
-                SplitMix64::new(0x6a09e667f3bcc909)
-            }
-        };
         Self {
-            config,
-            hot: BTreeMap::new(),
-            warm: BTreeMap::new(),
-            cold: BTreeMap::new(),
+            hot: TierMap::new(config.hot_capacity),
+            warm: TierMap::new(config.warm_capacity),
+            cold: TierMap::new(config.cold_capacity),
             nx: BTreeMap::new(),
             stats: CacheStats::default(),
-            rng,
+            config,
         }
     }
 
@@ -427,7 +547,7 @@ impl SemanticCache {
 
     fn lookup_exact(&mut self, key: &CacheKey, now: Ts) -> Option<LookupOutcome> {
         for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
-            let Some(mut entry) = self.take_entry(key, tier) else {
+            let Some(mut entry) = self.tier_map_mut(tier).remove(key) else {
                 continue;
             };
             entry.last_served = now;
@@ -436,15 +556,16 @@ impl SemanticCache {
                 self.stats.hits += 1;
                 entry.score = self.score_entry(&entry, now, score::ScoreInputs::default());
                 let outcome = LookupOutcome::Fresh(entry.clone());
-                self.reinsert(entry, now);
+                self.place(entry);
                 return Some(outcome);
             } else if entry.is_stale_servable(now, self.config.stale_window_secs) {
                 self.stats.hits += 1;
                 self.stats.stale_served += 1;
                 let outcome = LookupOutcome::Stale(entry.clone());
-                // Park the stale entry in the cold tier so it stays servable.
+                // Park the expired entry in the cold tier, whose whole job
+                // is to keep stale-servable data around.
                 entry.tier = Tier::Cold;
-                self.cold.insert(key.clone(), entry);
+                self.park(entry);
                 return Some(outcome);
             } else {
                 // Fully dead: drop it and keep looking.
@@ -454,9 +575,102 @@ impl SemanticCache {
         None
     }
 
+    /// The storage behind a tier label.
+    fn tier_map(&self, tier: Tier) -> &TierMap {
+        match tier {
+            Tier::Hot => &self.hot,
+            Tier::Warm => &self.warm,
+            Tier::Cold => &self.cold,
+        }
+    }
+
+    fn tier_map_mut(&mut self, tier: Tier) -> &mut TierMap {
+        match tier {
+            Tier::Hot => &mut self.hot,
+            Tier::Warm => &mut self.warm,
+            Tier::Cold => &mut self.cold,
+        }
+    }
+
+    /// The tier a score earns, or `None` when the entry is not worth
+    /// caching at all.
+    fn tier_for(&self, score: f64) -> Option<Tier> {
+        let cfg = &self.config;
+        let tier = if score >= cfg.hot_admit_score {
+            Tier::Hot
+        } else if score >= cfg.warm_admit_score {
+            Tier::Warm
+        } else if score >= cfg.min_admit_score {
+            Tier::Cold
+        } else {
+            return None;
+        };
+        // A tier configured with capacity 0 is disabled.
+        if self.tier_map(tier).capacity() == 0 {
+            let fallback = match tier {
+                Tier::Hot => Some(Tier::Warm),
+                Tier::Warm => Some(Tier::Cold),
+                Tier::Cold => None,
+            };
+            return fallback.filter(|t| self.tier_map(*t).capacity() > 0);
+        }
+        Some(tier)
+    }
+
+    /// Store an entry in the tier its score earns, evicting (and, for a
+    /// full hot/warm tier, demoting) as needed.
+    ///
+    /// Work per insert is bounded: at most one eviction here plus at most
+    /// one in [`SemanticCache::spill`], each `O(log n)`.
+    fn place(&mut self, mut entry: CacheEntry) {
+        let Some(tier) = self.tier_for(entry.score) else {
+            return; // below min_admit_score: not cached at all
+        };
+        entry.tier = tier;
+        if let Some(victim) = self.tier_map_mut(tier).insert(entry) {
+            self.spill(victim, tier);
+        }
+    }
+
+    /// Park an expired entry in the cold tier (serve-stale). The cold tier
+    /// is bounded like every other, so this can evict — but it never grows
+    /// past its capacity.
+    fn park(&mut self, mut entry: CacheEntry) {
+        entry.tier = Tier::Cold;
+        // An evicted stale entry is simply dropped: stale data is only ever
+        // served as a fallback, never migrated upward.
+        let _ = self.cold.insert(entry);
+    }
+
+    /// One demotion step for an entry evicted from `from`.
+    ///
+    /// The victim moves one tier down if that tier has room; if it does not,
+    /// the lower tier's own lowest-scored entry is dropped. Passing the
+    /// victim further down is deliberately not attempted: a recursively
+    /// cascading demotion would make the cost of one insert unbounded.
+    fn spill(&mut self, victim: CacheEntry, from: Tier) {
+        self.stats.evictions += 1;
+        let next = match from {
+            Tier::Hot => Some(Tier::Warm),
+            Tier::Warm => Some(Tier::Cold),
+            Tier::Cold => None,
+        };
+        let Some(next) = next else {
+            return; // evicted from cold: dropped
+        };
+        if self.tier_map(next).capacity() == 0 {
+            return;
+        }
+        let mut v = victim;
+        v.tier = next;
+        // The lower tier may evict its own lowest to make room; that entry is
+        // dropped rather than pushed further down.
+        let _dropped = self.tier_map_mut(next).insert(v);
+    }
+
     fn lookup_cname(&mut self, key: &CacheKey, now: Ts) -> Option<LookupOutcome> {
         for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
-            let Some(mut entry) = self.take_entry(key, tier) else {
+            let Some(mut entry) = self.tier_map_mut(tier).remove(key) else {
                 continue;
             };
             let target = match &entry.kind {
@@ -464,14 +678,14 @@ impl SemanticCache {
                 _ => None,
             };
             let Some(target) = target else {
-                self.reinsert(entry, now);
+                self.place(entry);
                 continue;
             };
             if !entry.is_fresh(now) {
                 // Expired CNAME: keep it only if still stale-servable.
                 if entry.is_stale_servable(now, self.config.stale_window_secs) {
                     entry.tier = Tier::Cold;
-                    self.cold.insert(key.clone(), entry);
+                    self.park(entry);
                 }
                 continue;
             }
@@ -488,7 +702,7 @@ impl SemanticCache {
                 expires,
                 validated,
             };
-            self.reinsert(entry, now);
+            self.place(entry);
             return Some(outcome);
         }
         None
@@ -516,11 +730,14 @@ impl SemanticCache {
             entry.stability.observe(rrset.ttl, changed, now);
             entry.inserted = now;
             entry.expires = expires;
-            entry.validated = validated;
+            // A CD=1 (checking disabled) resolution arrives unvalidated, but
+            // it must not erase the validation state of identical data that
+            // was validated before.
+            entry.validated = validated || (!changed && entry.validated);
             entry.refreshing = false;
             entry.kind = EntryKind::Positive(rrset);
             entry.score = self.score_entry(&entry, now, inputs);
-            self.reinsert(entry, now);
+            self.place(entry);
             return;
         }
 
@@ -539,7 +756,8 @@ impl SemanticCache {
         };
         entry.stability.observe(entry.ttl_secs(), false, now);
         entry.score = self.score_entry(&entry, now, inputs);
-        self.admit(entry, now);
+        self.stats.inserts += 1;
+        self.place(entry);
     }
 
     /// Insert a negative (NODATA) answer for `key`.
@@ -566,7 +784,7 @@ impl SemanticCache {
             };
             entry.refreshing = false;
             entry.score = self.score_entry(&entry, now, inputs);
-            self.reinsert(entry, now);
+            self.place(entry);
             return;
         }
         let mut entry = CacheEntry {
@@ -587,7 +805,22 @@ impl SemanticCache {
             refreshing: false,
         };
         entry.score = self.score_entry(&entry, now, inputs);
-        self.admit(entry, now);
+        self.stats.inserts += 1;
+        self.place(entry);
+    }
+
+    /// Insert an entry restored from the persistent tier.
+    ///
+    /// Restoring goes through the same capacity machinery as any other
+    /// insert: a snapshot cannot overflow the tiers, and an entry that was
+    /// already expired when it was loaded is parked in the cold tier
+    /// (serve-stale), where it belongs.
+    pub fn restore_entry(&mut self, entry: CacheEntry, now: Ts) {
+        if entry.expires <= now {
+            self.park(entry);
+        } else {
+            self.place(entry);
+        }
     }
 
     /// Insert an NXDOMAIN answer for `name`.
@@ -608,6 +841,15 @@ impl SemanticCache {
                 e.soa = soa.or_else(|| e.soa.clone());
             }
             None => {
+                if self.nx.len() >= self.config.nx_capacity {
+                    // Bounded like every other table: drop entries that are
+                    // already expired, then (if the store is genuinely full
+                    // of live entries) a stride of them. Never an O(n) scan
+                    // per insert.
+                    crate::bounded::evict_for_capacity(&mut self.nx, now, EVICT_STRIDE, |e| {
+                        e.expires
+                    });
+                }
                 self.nx.insert(
                     name.clone(),
                     NegativeEntry {
@@ -623,7 +865,7 @@ impl SemanticCache {
     }
 
     fn score_entry(&self, entry: &CacheEntry, now: Ts, inputs: score::ScoreInputs) -> f64 {
-        score::compute_full(
+        score::score(
             &self.config.weights,
             entry.ttl_secs(),
             now,
@@ -640,7 +882,7 @@ impl SemanticCache {
         let Some(mut entry) = self.take_entry_any(key) else {
             return;
         };
-        entry.score = score::compute_full(
+        entry.score = score::score(
             &self.config.weights,
             entry.ttl_secs(),
             now,
@@ -649,140 +891,15 @@ impl SemanticCache {
             &inputs,
             entry.estimated_bytes(),
         );
-        self.reinsert(entry, now);
-    }
-
-    /// Admit a brand-new entry to the tier its score earns, evicting as
-    /// needed.
-    fn admit(&mut self, mut entry: CacheEntry, now: Ts) {
-        self.stats.inserts += 1;
-        let cfg = self.config;
-        if entry.score >= cfg.hot_admit_score {
-            entry.tier = Tier::Hot;
-            if self.hot.len() >= cfg.hot_capacity {
-                if let Some(v) =
-                    Self::evict_lowest(&mut self.rng, &mut self.hot, cfg.warm_admit_score)
-                {
-                    self.demote_or_drop(v, now);
-                }
-            }
-            self.hot.insert(entry.key.clone(), entry);
-        } else if entry.score >= cfg.warm_admit_score {
-            entry.tier = Tier::Warm;
-            if self.warm.len() >= cfg.warm_capacity {
-                if let Some(v) =
-                    Self::evict_lowest(&mut self.rng, &mut self.warm, cfg.min_admit_score)
-                {
-                    self.demote_or_drop(v, now);
-                }
-            }
-            self.warm.insert(entry.key.clone(), entry);
-        } else if entry.score >= cfg.min_admit_score {
-            entry.tier = Tier::Cold;
-            if self.cold.len() >= cfg.cold_capacity {
-                Self::evict_lowest(&mut self.rng, &mut self.cold, 0.0);
-            }
-            self.cold.insert(entry.key.clone(), entry);
-        }
-        // Below min_admit: not cached at all.
-    }
-
-    /// Reinsert an entry that was removed for serving/updating, choosing
-    /// the best tier its (possibly changed) score earns.
-    fn reinsert(&mut self, entry: CacheEntry, now: Ts) {
-        let cfg = self.config;
-        let mut e = entry;
-        let desired = if e.score >= cfg.hot_admit_score {
-            Tier::Hot
-        } else if e.score >= cfg.warm_admit_score {
-            Tier::Warm
-        } else if e.score >= cfg.min_admit_score {
-            Tier::Cold
-        } else {
-            return; // no longer worth caching
-        };
-        e.tier = desired;
-        match desired {
-            Tier::Hot => {
-                if self.hot.len() >= cfg.hot_capacity {
-                    if let Some(v) =
-                        Self::evict_lowest(&mut self.rng, &mut self.hot, cfg.warm_admit_score)
-                    {
-                        self.demote_or_drop(v, now);
-                    }
-                }
-                self.hot.insert(e.key.clone(), e);
-            }
-            Tier::Warm => {
-                if self.warm.len() >= cfg.warm_capacity {
-                    if let Some(v) =
-                        Self::evict_lowest(&mut self.rng, &mut self.warm, cfg.min_admit_score)
-                    {
-                        self.demote_or_drop(v, now);
-                    }
-                }
-                self.warm.insert(e.key.clone(), e);
-            }
-            Tier::Cold => {
-                if self.cold.len() >= cfg.cold_capacity {
-                    Self::evict_lowest(&mut self.rng, &mut self.cold, 0.0);
-                }
-                self.cold.insert(e.key.clone(), e);
-            }
-        }
-    }
-
-    /// Move an evicted entry to a lower tier, or drop it.
-    fn demote_or_drop(&mut self, victim: CacheEntry, now: Ts) {
-        self.stats.evictions += 1;
-        let cfg = self.config;
-        let v = victim;
-        if v.score >= cfg.warm_admit_score {
-            if self.warm.len() >= cfg.warm_capacity {
-                if let Some(x) =
-                    Self::evict_lowest(&mut self.rng, &mut self.warm, cfg.min_admit_score)
-                {
-                    self.demote_or_drop(x, now);
-                }
-            }
-            self.warm.insert(v.key.clone(), v);
-        } else if v.score >= cfg.min_admit_score || v.is_stale_servable(now, cfg.stale_window_secs)
-        {
-            if self.cold.len() >= cfg.cold_capacity {
-                Self::evict_lowest(&mut self.rng, &mut self.cold, 0.0);
-            }
-            self.cold.insert(v.key.clone(), v);
-        }
-    }
-
-    /// Remove the lowest-scored entry in `tier` (sampled, to bound cost).
-    fn evict_lowest(
-        rng: &mut SplitMix64,
-        tier: &mut BTreeMap<CacheKey, CacheEntry>,
-        floor: f64,
-    ) -> Option<CacheEntry> {
-        let mut keys: Vec<CacheKey> = tier.keys().cloned().collect();
-        if keys.is_empty() {
-            return None;
-        }
-        let sample_size = keys.len().min(24);
-        let mut best: Option<(f64, CacheKey)> = None;
-        for _ in 0..sample_size {
-            let idx = rng.below(keys.len() as u64) as usize;
-            let key = &keys[idx];
-            let s = tier.get(key).map(|e| e.score).unwrap_or(0.0);
-            if best.as_ref().map(|(bs, _)| s < *bs).unwrap_or(true) {
-                best = Some((s, key.clone()));
-            }
-        }
-        let (score, key) = best.unwrap_or((0.0, keys.remove(0)));
-        if score < floor {
-            return None; // nothing worth evicting
-        }
-        tier.remove(&key)
+        self.place(entry);
     }
 
     /// Remove every entry that is past its stale window (background task).
+    ///
+    /// The NXDOMAIN store is swept at *expiry*, not at the end of the stale
+    /// window: a stale NXDOMAIN is never served (`lookup` requires it to be
+    /// fresh), so keeping it longer would only let a stream of random names
+    /// grow memory for a day.
     pub fn sweep(&mut self, now: Ts) {
         let stale_window = self.config.stale_window_secs as Ts * 1_000_000_000;
         self.hot
@@ -791,11 +908,16 @@ impl SemanticCache {
             .retain(|_, e| e.expires.saturating_add(stale_window) >= now);
         self.cold
             .retain(|_, e| e.expires.saturating_add(stale_window) >= now);
-        self.nx
-            .retain(|_, e| e.expires >= now.saturating_sub(stale_window));
+        self.nx.retain(|_, e| e.expires > now);
     }
 
-    /// Record a refresh failure for a key (updates the stability model).
+    /// Record a refresh failure for a key (updates the stability model) and
+    /// end the refresh.
+    ///
+    /// Ending it here is not cosmetic: the `refreshing` flag is what
+    /// suppresses duplicate prefetches, so a key left marked after a failed
+    /// refresh could never be prefetched again — the entry would sit in the
+    /// cache, unreachable by the prefetcher, until it was evicted.
     pub fn record_refresh_failure(&mut self, key: &CacheKey, now: Ts) {
         if let Some(e) = self
             .hot
@@ -804,6 +926,19 @@ impl SemanticCache {
             .or_else(|| self.cold.get_mut(key))
         {
             e.stability.record_failure(now);
+            e.refreshing = false;
+        }
+    }
+
+    /// Clear the in-flight mark of a key (a queued refresh that never ran).
+    pub fn clear_refreshing(&mut self, key: &CacheKey) {
+        if let Some(e) = self
+            .hot
+            .get_mut(key)
+            .or_else(|| self.warm.get_mut(key))
+            .or_else(|| self.cold.get_mut(key))
+        {
+            e.refreshing = false;
         }
     }
 
@@ -879,14 +1014,6 @@ impl SemanticCache {
             .chain(self.cold.values())
     }
 
-    fn take_entry(&mut self, key: &CacheKey, tier: Tier) -> Option<CacheEntry> {
-        match tier {
-            Tier::Hot => self.hot.remove(key),
-            Tier::Warm => self.warm.remove(key),
-            Tier::Cold => self.cold.remove(key),
-        }
-    }
-
     fn take_entry_any(&mut self, key: &CacheKey) -> Option<CacheEntry> {
         self.hot
             .remove(key)
@@ -899,6 +1026,8 @@ impl SemanticCache {
 mod tests {
     use super::*;
     use crate::rdata::RData;
+    #[cfg(not(feature = "std"))]
+    use alloc::format;
 
     fn now() -> Ts {
         1_700_000_000_000_000_000
@@ -1141,5 +1270,134 @@ mod tests {
             }
             other => panic!("expected fresh, got {other:?}"),
         }
+    }
+
+    /// The NXDOMAIN store has its own capacity: a stream of distinct
+    /// nonexistent names must not grow it without bound.
+    #[test]
+    fn nxdomain_store_is_bounded() {
+        let mut cache = SemanticCache::new(CacheConfig {
+            nx_capacity: 16,
+            ..cfg()
+        });
+        for i in 0..200 {
+            let name = Name::from_ascii(&format!("missing{i}.example.com")).unwrap();
+            cache.insert_nxdomain(&name, Rcode::NXDOMAIN, None, 300, now());
+        }
+        assert!(
+            cache.nx.len() <= 16,
+            "nxdomain store grew to {}",
+            cache.nx.len()
+        );
+        // And the store still works for a name that is in it.
+        let last = Name::from_ascii("missing199.example.com").unwrap();
+        assert!(matches!(
+            cache.lookup(&CacheKey::plain(last, RrType::A, RrClass::IN), now()),
+            LookupOutcome::NxDomain { .. }
+        ));
+    }
+
+    /// Parking an expired entry for serve-stale must respect the cold tier's
+    /// capacity — previously it bypassed it entirely.
+    #[test]
+    fn stale_parking_respects_cold_capacity() {
+        let small = CacheConfig {
+            hot_capacity: 0,
+            warm_capacity: 0,
+            cold_capacity: 4,
+            stale_window_secs: 3_600,
+            ..CacheConfig::default()
+        };
+        let mut cache = SemanticCache::new(small);
+        // 20 entries with a 1-second TTL, all expired but stale-servable.
+        for i in 0..20 {
+            let name = format!("h{i}.example.com");
+            let k = key(&name, RrType::A);
+            cache.insert_positive(
+                &k,
+                RrSet::a(&name, "192.0.2.1", 1),
+                now(),
+                score::ScoreInputs::default(),
+                false,
+            );
+        }
+        let later = now() + 2_000_000_000;
+        for i in 0..20 {
+            let name = format!("h{i}.example.com");
+            let _ = cache.lookup(&key(&name, RrType::A), later);
+        }
+        assert!(
+            cache.cold.len() <= 4,
+            "cold tier grew to {}",
+            cache.cold.len()
+        );
+    }
+
+    /// Eviction is exact, not sampled: with the rank index the lowest-scored
+    /// entry of the full tier is the one that goes.
+    #[test]
+    fn eviction_takes_the_lowest_scored_entry() {
+        let one_tier = CacheConfig {
+            hot_capacity: 0,
+            warm_capacity: 3,
+            cold_capacity: 0,
+            min_admit_score: 0.0,
+            warm_admit_score: 0.0,
+            ..CacheConfig::default()
+        };
+        let mut cache = SemanticCache::new(one_tier);
+        // Popularity rises with i, so scores do too.
+        for i in 0..3u32 {
+            let name = format!("h{i}.example.com");
+            cache.insert_positive(
+                &key(&name, RrType::A),
+                RrSet::a(&name, "192.0.2.1", 300),
+                now(),
+                score::ScoreInputs {
+                    popularity: 0.2 + i as f64 * 0.2,
+                    est_cost_ms: 10.0,
+                },
+                false,
+            );
+        }
+        assert_eq!(cache.warm.len(), 3);
+        // A fourth entry with the highest score forces one eviction.
+        cache.insert_positive(
+            &key("h9.example.com", RrType::A),
+            RrSet::a("h9.example.com", "192.0.2.1", 300),
+            now(),
+            score::ScoreInputs {
+                popularity: 1.0,
+                est_cost_ms: 10.0,
+            },
+            false,
+        );
+        assert!(!cache.warm.contains_key(&key("h0.example.com", RrType::A)));
+        assert!(cache.warm.contains_key(&key("h2.example.com", RrType::A)));
+        assert!(cache.warm.contains_key(&key("h9.example.com", RrType::A)));
+    }
+
+    /// A refresh that fails must end the refresh, or that key could never be
+    /// prefetched again.
+    #[test]
+    fn refresh_failure_clears_the_in_flight_mark() {
+        let mut cache = SemanticCache::new(cfg());
+        let k = key("pf.example.com", RrType::A);
+        cache.insert_positive(
+            &k,
+            RrSet::a("pf.example.com", "192.0.2.1", 30),
+            now(),
+            score::ScoreInputs::default(),
+            false,
+        );
+        assert!(cache.mark_refreshing(&k));
+        assert!(!cache.mark_refreshing(&k), "double-mark must be refused");
+        cache.record_refresh_failure(&k, now());
+        assert!(
+            cache.mark_refreshing(&k),
+            "a failed refresh must free the key"
+        );
+        cache.clear_refreshing(&k);
+        assert!(cache.mark_refreshing(&k));
     }
 }

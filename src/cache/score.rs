@@ -80,49 +80,18 @@ impl Default for ScoreInputs {
     }
 }
 
-/// Compute the admission score of an entry.
-///
-/// * `weights` — the linear weights.
-/// * `ttl_secs` — the entry's TTL in seconds.
-/// * `now` — current wall time.
-/// * `last_served` — when the entry was last served.
-/// * `stability` — the stability model.
-/// * `inputs` — external signals.
-pub fn compute(
-    weights: &ScoreWeights,
-    ttl_secs: u32,
-    now: Ts,
-    last_served: Ts,
-    stability: &StabilityModel,
-    inputs: &ScoreInputs,
-) -> f64 {
-    let age_secs = now.saturating_sub(last_served) as f64 / 1_000_000_000.0;
-    let locality = (1.0 - (age_secs / LOCALITY_WINDOW_SECS).min(1.0)).max(0.0);
-
-    let pop = inputs.popularity.clamp(0.0, 1.0);
-    let stab = stability.score().clamp(0.0, 1.0);
-    let ttl = (ttl_secs as f64 / TTL_REF_SECS).clamp(0.0, 1.0);
-    let cost = (inputs.est_cost_ms / COST_REF_MS).clamp(0.0, 1.0);
-    // Memory term grows with the RRset size.
-    let mem = (0.0f64).min(1.0); // populated by the caller via entry size below
-
-    let raw = weights.popularity * pop
-        + weights.locality * locality
-        + weights.stability * stab
-        + weights.ttl * ttl
-        + weights.cost * cost
-        - weights.memory * mem;
-
-    raw.clamp(0.0, 1.0)
-}
-
 /// The memory term for an entry of `bytes` size.
 pub fn memory_term(bytes: usize) -> f64 {
     (bytes as f64 / MEM_REF_BYTES).clamp(0.0, 1.0)
 }
 
-/// A full score including the memory term (call this in the cache).
-pub fn compute_full(
+/// The admission score of one entry: the weighted sum of all six terms
+/// (the memory term is subtracted), clamped to `0..1`.
+///
+/// This is the only scoring entry point — admission, re-scoring on a serve,
+/// and eviction ranking all call it with the same arguments, so an entry's
+/// tier and its position in the eviction order can never disagree.
+pub fn score(
     weights: &ScoreWeights,
     ttl_secs: u32,
     now: Ts,
@@ -131,9 +100,32 @@ pub fn compute_full(
     inputs: &ScoreInputs,
     entry_bytes: usize,
 ) -> f64 {
-    let mut s = compute(weights, ttl_secs, now, last_served, stability, inputs);
-    s -= weights.memory * memory_term(entry_bytes);
-    s.clamp(0.0, 1.0)
+    let age_secs = now.saturating_sub(last_served) as f64 / 1_000_000_000.0;
+    let locality = (1.0 - (age_secs / LOCALITY_WINDOW_SECS).min(1.0)).max(0.0);
+
+    let pop = inputs.popularity.clamp(0.0, 1.0);
+    let stab = stability.score().clamp(0.0, 1.0);
+    let ttl = (ttl_secs as f64 / TTL_REF_SECS).clamp(0.0, 1.0);
+    let cost = (inputs.est_cost_ms / COST_REF_MS).clamp(0.0, 1.0);
+
+    let raw = weights.popularity * pop
+        + weights.locality * locality
+        + weights.stability * stab
+        + weights.ttl * ttl
+        + weights.cost * cost
+        - weights.memory * memory_term(entry_bytes);
+    raw.clamp(0.0, 1.0)
+}
+
+/// A monotone `f64 → u64` map used to key ordered (rank) indices on a score.
+///
+/// `0.0` maps to `0`, `1.0` maps to `u32::MAX`; two scores that differ by
+/// less than 2⁻³² land on the same rank and are then ordered by their key,
+/// which is all the eviction index needs (it must pick *a* lowest-scored
+/// entry, and must never disagree with `f64` comparison on the ordering of
+/// two scores that differ materially).
+pub fn rank_of(score: f64) -> u64 {
+    (score.clamp(0.0, 1.0) * u32::MAX as f64) as u64
 }
 
 #[cfg(test)]
@@ -149,7 +141,7 @@ mod tests {
         let weights = ScoreWeights::default();
         let stable = StabilityModel::new(now());
         // Popular, just served, long TTL.
-        let hot = compute_full(
+        let hot = score(
             &weights,
             3600,
             now(),
@@ -162,7 +154,7 @@ mod tests {
             512,
         );
         // Unpopular, never served, short TTL.
-        let cold = compute_full(
+        let cold = score(
             &weights,
             30,
             now(),
@@ -180,7 +172,7 @@ mod tests {
     #[test]
     fn score_is_bounded() {
         let weights = ScoreWeights::default();
-        let s = compute_full(
+        let s = score(
             &weights,
             u32::MAX,
             now(),
@@ -192,9 +184,37 @@ mod tests {
         assert!((0.0..=1.0).contains(&s));
     }
 
+    /// The memory term must actually reduce the score: a 16 KiB entry is
+    /// more expensive to keep than a 64-byte one, everything else equal.
+    #[test]
+    fn memory_term_lowers_the_score() {
+        let weights = ScoreWeights::default();
+        let inputs = ScoreInputs {
+            popularity: 0.8,
+            est_cost_ms: 120.0,
+        };
+        let stability = StabilityModel::new(now());
+        let small = score(&weights, 300, now(), now(), &stability, &inputs, 64);
+        let large = score(&weights, 300, now(), now(), &stability, &inputs, 65_536);
+        assert!(large < small, "large = {large}, small = {small}");
+        let expected = weights.memory * memory_term(65_536);
+        assert!(expected > 0.0);
+    }
+
     #[test]
     fn memory_term_grows() {
         assert!(memory_term(0) < memory_term(4096));
         assert!(memory_term(8192) <= 1.0);
+    }
+
+    /// Ranks are monotone in the score and bounded — the eviction index
+    /// relies on both.
+    #[test]
+    fn rank_is_monotone() {
+        assert_eq!(rank_of(0.0), 0);
+        assert_eq!(rank_of(1.0), u32::MAX as u64);
+        assert_eq!(rank_of(-1.0), 0);
+        assert_eq!(rank_of(2.0), u32::MAX as u64);
+        assert!(rank_of(0.2) < rank_of(0.8));
     }
 }

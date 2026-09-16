@@ -3,31 +3,14 @@
 RecurseX 是流水线，不是一坨。每层只干一件事，通过窄接口往下传，所以算法核心是 `no_std`，
 联网部分隔离在 `std` feature 后面。
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│ 1. 客户端层      server.rs      UDP/TCP 监听、按查询构造应答            │
-├────────────────────────────────────────────────────────────────────────┤
-│ 2. 查询处理      query.rs       normalize、去重、合并、0x20、限速       │
-│                  policy.rs                                               │
-├────────────────────────────────────────────────────────────────────────┤
-│ 3. 多层缓存      cache/         hot/warm/cold + NXDOMAIN、稳定性模型、  │
-│                  stability.rs   分数准入、serve-stale、预取、L3 持久化   │
-│                  cache/score.rs                                          │
-│                  cache/persist.rs                                        │
-├────────────────────────────────────────────────────────────────────────┤
-│ 4. 解析引擎      resolver.rs    root→TLD→权威、CNAME/DNAME、委派、      │
-│                  engine.rs      DNSSEC 校验                             │
-│                  dnssec/                                                 │
-├────────────────────────────────────────────────────────────────────────┤
-│ 5. 上游传输      transport.rs   DnsTransport trait、                    │
-│                  transports/    UDP/TCP/DoT/DoH/DoH3/DoQ、转发器        │
-│                  forward.rs                                              │
-├────────────────────────────────────────────────────────────────────────┤
-│ 6. 安全/策略      policy.rs      限速、过滤、防欺骗校验、DNSSEC 判定     │
-│                  query.rs                                                 │
-│                  dnssec/                                                 │
-└────────────────────────────────────────────────────────────────────────┘
-```
+| # | 架构层 | 主要文件 / 模块 | 核心职责 |
+|---:|---|---|---|
+| **1** | **客户端层** | `server.rs` | UDP/TCP 监听<br>按查询构造应答 |
+| **2** | **查询处理** | `query.rs`<br>`policy.rs` | Normalize（规范化）<br>请求去重（Dedup）<br>请求合并（Coalesce）<br>0x20 编码<br>速率限制（Rate Limit） |
+| **3** | **多层缓存** | `cache/`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>缓存稳定性模型<br>分数准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
+| **4** | **解析引擎** | `resolver.rs`<br>`engine.rs`<br>`dnssec/` | Root → TLD → 权威服务器<br>CNAME / DNAME<br>委派（Referrals）<br>DNSSEC 校验 |
+| **5** | **上游传输** | `transport.rs`<br>`transports/`<br>`forward.rs` | `DnsTransport` Trait<br>UDP / TCP / DoT / DoH / DoH3 / DoQ<br>转发器（Forwarder） |
+| **6** | **安全 / 策略** | `policy.rs`<br>`query.rs`<br>`dnssec/` | 限速（Rate Limit）<br>过滤（Filtering）<br>防欺骗校验（Anti-spoofing）<br>DNSSEC 判定（Verdict） |
 
 ## 一次递归查询的数据流
 
