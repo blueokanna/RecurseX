@@ -2,7 +2,7 @@
 
 *[English](README.md)*
 
-RecurseX 是一个用 Rust 写的递归 DNS 解析器。它和 BIND、Unbound 一样沿委派树逐级往下问，
+RecurseX 是一个用 Rust 写的递归 DNS 的相关解析器。它和 BIND、Unbound 一样沿委派树逐级往下问，
 读过 `named.conf` 的人不会有陌生感。区别在于它**怎么用已经看到的数据**：每条缓存条目都带着
 自己被测出来的历史，所有缓存决策都出自同一个评分函数，而解析器里每一张可能被攻击者撑大的表
 都有一个明确的上限。
