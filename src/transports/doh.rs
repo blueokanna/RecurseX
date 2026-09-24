@@ -1,8 +1,8 @@
 //! DNS over HTTPS (RFC 8484) via courierust's HTTP/1.1 + HTTP/2 client.
 
+use crate::sync::Mutex;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::sync::Mutex;
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_tls::RootStore;

@@ -15,10 +15,10 @@
 pub mod quic;
 pub mod tls;
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use crate::sync::Mutex;
 use crate::wire::WireBytes;
+use alloc::string::String;
+use alloc::vec::Vec;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use courierust::courierust_tls::RootStore;

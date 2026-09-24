@@ -599,12 +599,8 @@ impl ClientHandshake {
         // A handshake length is three octets (RFC 8446 §4). Read as a `u32` and
         // masked it would be one bad edit away from consuming `msg[4]`, which
         // is the first byte of the body it is supposed to describe.
-        let len = (u32::from_be_bytes([
-            0,
-            msg.byte_at(1)?,
-            msg.byte_at(2)?,
-            msg.byte_at(3)?,
-        ])) as usize;
+        let len =
+            (u32::from_be_bytes([0, msg.byte_at(1)?, msg.byte_at(2)?, msg.byte_at(3)?])) as usize;
         if 4 + len != msg.len() {
             return Err(Error::wire("TLS handshake message length mismatch"));
         }
@@ -1290,8 +1286,10 @@ mod tests {
         // An entry with no room for its own length field.
         assert!(parse_certificate_list(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00]).is_err());
         // Entry extensions that run past the list.
-        assert!(parse_certificate_list(&[0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x01, 0xAA, 0x00, 0x10])
-            .is_err());
+        assert!(parse_certificate_list(&[
+            0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x01, 0xAA, 0x00, 0x10
+        ])
+        .is_err());
 
         // A non-empty request context belongs to a stream handshake.
         assert!(parse_certificate_list(&[0x01, 0x00, 0x00, 0x00]).is_err());
@@ -1350,7 +1348,10 @@ mod tests {
         // A lone `0x00` is the encoding of zero, not a sign byte.
         assert_eq!(strip_int_leading_zero(&[0x00]), vec![0x00]);
         // Exactly one byte is a sign byte.
-        assert_eq!(strip_int_leading_zero(&[0x00, 0x00, 0x05]), vec![0x00, 0x05]);
+        assert_eq!(
+            strip_int_leading_zero(&[0x00, 0x00, 0x05]),
+            vec![0x00, 0x05]
+        );
         // No leading zero: the bytes are the value.
         assert_eq!(strip_int_leading_zero(&[0x7F]), vec![0x7F]);
         assert_eq!(strip_int_leading_zero(&[0x80, 0x01]), vec![0x80, 0x01]);
@@ -1365,10 +1366,8 @@ mod tests {
         assert_eq!((n, e), (vec![0x05], vec![0x03]));
 
         // With the positive-sign octet on the modulus.
-        let (n, _) = parse_rsa_public_key(&[
-            0x30, 0x07, 0x02, 0x02, 0x00, 0x05, 0x02, 0x01, 0x03,
-        ])
-        .unwrap();
+        let (n, _) =
+            parse_rsa_public_key(&[0x30, 0x07, 0x02, 0x02, 0x00, 0x05, 0x02, 0x01, 0x03]).unwrap();
         assert_eq!(n, vec![0x05]);
 
         // Declared two octets, one present.
@@ -1395,7 +1394,9 @@ mod tests {
         let mut params = vec![0x42, 0x01, 0x00];
         params.extend_from_slice(&[0x04, 0x01, 0x10]);
         assert_eq!(
-            decode_server_transport_params(&params).unwrap().initial_max_data,
+            decode_server_transport_params(&params)
+                .unwrap()
+                .initial_max_data,
             0x10
         );
     }

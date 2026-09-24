@@ -209,10 +209,7 @@ impl Name {
             // `byte_at` carries the "is there a byte here" check, so the loop
             // needs no separate guard to be safe — and there is no index
             // expression left for the compiler to bounds-check.
-            let len = usize::from(
-                buf.byte_at(p)
-                    .map_err(|_| Error::wire("truncated name"))?,
-            );
+            let len = usize::from(buf.byte_at(p).map_err(|_| Error::wire("truncated name"))?);
             match len & 0xc0 {
                 0x00 => {
                     if len == 0 {
@@ -536,9 +533,7 @@ impl NameCompressor {
         // compression pointer needs — which suffix, and the offset it was
         // written at — rather than a position to look up again.
         let hit = suffixes.iter().enumerate().find_map(|(i, (suffix, _))| {
-            self.offsets
-                .get(suffix)
-                .map(|offset| (i, suffix, *offset))
+            self.offsets.get(suffix).map(|offset| (i, suffix, *offset))
         });
         let base = out.len();
         match hit {

@@ -454,7 +454,8 @@ fn parse_ip6_arpa(name: &Name) -> Option<Ipv6Addr> {
     if labels.len() != 34 {
         return None;
     }
-    if !labels.get(32)?.eq_ignore_ascii_case(b"ip6") || !labels.get(33)?.eq_ignore_ascii_case(b"arpa")
+    if !labels.get(32)?.eq_ignore_ascii_case(b"ip6")
+        || !labels.get(33)?.eq_ignore_ascii_case(b"arpa")
     {
         return None;
     }
@@ -938,11 +939,7 @@ impl Resolver {
             .lock()
             .observe_query(&key.name, now);
 
-        let claim = self
-            .inner
-            .inflight
-            .lock()
-            .claim(key, &self.inner);
+        let claim = self.inner.inflight.lock().claim(key, &self.inner);
         let owner = match claim {
             Claim::Waiter(slot) => {
                 self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
@@ -1347,12 +1344,7 @@ impl Resolver {
                 return None;
             }
             let cache_key = current.cache_key();
-            let outcome = self
-                .inner
-                .shared
-                .cache
-                .lock()
-                .lookup(&cache_key, now);
+            let outcome = self.inner.shared.cache.lock().lookup(&cache_key, now);
             match outcome {
                 LookupOutcome::Fresh(entry) => {
                     validated &= entry.validated;
@@ -1982,11 +1974,11 @@ impl Resolver {
                 };
 
                 let t0 = Instant::now();
-                let resp_bytes = match self.inner.transports.exchange(
-                    &endpoint,
-                    &q.bytes,
-                    attempt_ms,
-                ) {
+                let resp_bytes = match self
+                    .inner
+                    .transports
+                    .exchange(&endpoint, &q.bytes, attempt_ms)
+                {
                     Ok(b) => b,
                     Err(e) => {
                         last_err = Some(e.clone());
@@ -2023,11 +2015,11 @@ impl Resolver {
                         proto: Proto::Tcp,
                         ..endpoint
                     };
-                    if let Ok(b) = self.inner.transports.exchange(
-                        &tcp_ep,
-                        &q.bytes,
-                        attempt_ms,
-                    ) {
+                    if let Ok(b) = self
+                        .inner
+                        .transports
+                        .exchange(&tcp_ep, &q.bytes, attempt_ms)
+                    {
                         if let Ok(m) = Message::parse(&b) {
                             if response_matches_query(&query_msg, &m) {
                                 self.inner.shared.selector.lock().record_success(
@@ -2090,11 +2082,7 @@ impl Resolver {
                         .selector
                         .lock()
                         .record_servfail(endpoint, now);
-                    self.inner
-                        .shared
-                        .estimator
-                        .lock()
-                        .observe_failure(qname);
+                    self.inner.shared.estimator.lock().observe_failure(qname);
                     last_err = Some(Error::new(
                         ErrorKind::Servfail,
                         format!("upstream answered {}", msg.flags.rcode),
@@ -2102,11 +2090,11 @@ impl Resolver {
                     continue;
                 }
 
-                self.inner.shared.selector.lock().record_success(
-                    endpoint,
-                    rtt_ms as f64,
-                    now,
-                );
+                self.inner
+                    .shared
+                    .selector
+                    .lock()
+                    .record_success(endpoint, rtt_ms as f64, now);
                 return Ok((msg, rtt_ms));
             }
         }
@@ -2204,21 +2192,13 @@ impl Resolver {
     /// prefetch for that entry forever.
     pub fn queue_background_refresh(&self, key: &CacheKey) -> bool {
         {
-            let mut cache = self
-                .inner
-                .shared
-                .cache
-                .lock();
+            let mut cache = self.inner.shared.cache.lock();
             if !cache.mark_refreshing(key) {
                 return false;
             }
         }
         if !self.acquire_refresh_slot() {
-            self.inner
-                .shared
-                .cache
-                .lock()
-                .clear_refreshing(key);
+            self.inner.shared.cache.lock().clear_refreshing(key);
             return false;
         }
         self.inner.stats.prefetches.fetch_add(1, Ordering::Relaxed);
@@ -2273,11 +2253,7 @@ impl Resolver {
     fn link_alias(&self, name: &Name, target: &Name, rr_type: RrType, class: RrClass, now: Ts) {
         let alias = CacheKey::plain(name.clone(), RrType::CNAME, class);
         let data = CacheKey::plain(target.clone(), rr_type, class);
-        self.inner
-            .shared
-            .aliases
-            .lock()
-            .link(&alias, &data, now);
+        self.inner.shared.aliases.lock().link(&alias, &data, now);
     }
 
     /// Refresh `key` and the alias entries it keeps servable.
@@ -2291,12 +2267,7 @@ impl Resolver {
     /// the same bounded, de-duplicated refresh path.
     pub fn refresh_with_dependents(&self, key: &CacheKey, max_dependents: usize) {
         self.queue_background_refresh(key);
-        let dependents = self
-            .inner
-            .shared
-            .aliases
-            .lock()
-            .dependents(key);
+        let dependents = self.inner.shared.aliases.lock().dependents(key);
         let mut queued = 0usize;
         for dep_key in dependents {
             if queued >= max_dependents {
@@ -2381,17 +2352,9 @@ impl Resolver {
                 slept = 0;
                 let r = &this;
                 let now = r.inner.clock.now();
-                r.inner
-                    .shared
-                    .cache
-                    .lock()
-                    .sweep(now);
+                r.inner.shared.cache.lock().sweep(now);
                 {
-                    let mut aliases = r
-                        .inner
-                        .shared
-                        .aliases
-                        .lock();
+                    let mut aliases = r.inner.shared.aliases.lock();
                     aliases.prune(now, 0);
                     r.inner
                         .stats
@@ -2406,11 +2369,7 @@ impl Resolver {
                 // pass, because the pool is behind a lock and a status
                 // endpoint must not have to take it.
                 if r.inner.config.dns.fake_ip.is_some() {
-                    let mut guard = r
-                        .inner
-                        .shared
-                        .fake_ip
-                        .lock();
+                    let mut guard = r.inner.shared.fake_ip.lock();
                     if let Some(pool) = guard.as_mut() {
                         pool.cleanup_expired(now);
                         r.inner
@@ -2424,16 +2383,8 @@ impl Resolver {
                     }
                 }
                 let candidates = {
-                    let mut cache = r
-                        .inner
-                        .shared
-                        .cache
-                        .lock();
-                    let est = r
-                        .inner
-                        .shared
-                        .estimator
-                        .lock();
+                    let mut cache = r.inner.shared.cache.lock();
+                    let est = r.inner.shared.estimator.lock();
                     cache.prefetch_candidates(now, |apex, horizon| {
                         est.probability(apex, now, horizon)
                     })
@@ -3015,11 +2966,7 @@ mod tests {
             res.answers[0].rdata
         );
         assert!(!res.from_cache);
-        assert_eq!(
-            r.shared().cache.lock().len(),
-            0,
-            "a pin must not be cached"
-        );
+        assert_eq!(r.shared().cache.lock().len(), 0, "a pin must not be cached");
     }
 
     /// The other family is NODATA, not a leak: a client must not reach the

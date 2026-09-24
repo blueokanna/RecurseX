@@ -218,7 +218,10 @@ impl Message {
             let (qname, p) = Name::from_wire(buf, pos)?;
             // The two reads below carry the truncation check: `u16_at(p + 2)`
             // fails unless all four bytes are there.
-            let qtype = RrType(buf.u16_at(p).map_err(|_| Error::wire("question truncated"))?);
+            let qtype = RrType(
+                buf.u16_at(p)
+                    .map_err(|_| Error::wire("question truncated"))?,
+            );
             let qclass = RrClass(
                 buf.u16_at(p + 2)
                     .map_err(|_| Error::wire("question truncated"))?,

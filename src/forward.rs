@@ -5,10 +5,10 @@
 //! `ForwarderSet` serves forwarding deployments and can be extended to
 //! query authoritative servers over encrypted transports.
 
+use crate::sync::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::sync::Mutex;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::message::Message;

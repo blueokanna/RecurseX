@@ -291,10 +291,7 @@ mod tests {
         );
         assert_eq!(one.records.len(), 1);
 
-        let two = RrSet::from_records(
-            vec![cname("a.example.net"), cname("b.example.net")],
-            86_400,
-        );
+        let two = RrSet::from_records(vec![cname("a.example.net"), cname("b.example.net")], 86_400);
         assert!(two.is_err(), "a two-record CNAME set must be refused");
 
         let dname = |target: &str| Record {
@@ -304,11 +301,10 @@ mod tests {
             ttl: 300,
             rdata: RData::Dname(Name::from_ascii(target).unwrap()),
         };
-        assert!(RrSet::from_records(
-            vec![dname("a.example.net"), dname("b.example.net")],
-            86_400
-        )
-        .is_err());
+        assert!(
+            RrSet::from_records(vec![dname("a.example.net"), dname("b.example.net")], 86_400)
+                .is_err()
+        );
 
         // The rule is specific to those two types: an NS set with two servers
         // is the normal case, not an error.
@@ -320,11 +316,8 @@ mod tests {
             ttl: 300,
             rdata: RData::Ns(Name::from_ascii(target).unwrap()),
         };
-        let set = RrSet::from_records(
-            vec![ns("ns1.example.net"), ns("ns2.example.net")],
-            86_400,
-        )
-        .unwrap();
+        let set = RrSet::from_records(vec![ns("ns1.example.net"), ns("ns2.example.net")], 86_400)
+            .unwrap();
         assert_eq!(set.ns_names().len(), 2);
     }
 

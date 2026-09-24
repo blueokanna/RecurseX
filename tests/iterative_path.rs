@@ -126,7 +126,12 @@ impl Stub {
                 }
             }
         });
-        Stub { addr, seen, asked, stop }
+        Stub {
+            addr,
+            seen,
+            asked,
+            stop,
+        }
     }
 
     /// A stub that receives and **discards**: queries are never answered, and
@@ -330,7 +335,10 @@ fn an_nxdomain_is_cached_and_not_re_asked() {
 
     let second = r.resolve(&name, RrType::A).expect("second answer");
     assert_eq!(second.rcode, Rcode::NXDOMAIN);
-    assert!(second.from_cache, "the negative answer must come from cache");
+    assert!(
+        second.from_cache,
+        "the negative answer must come from cache"
+    );
     assert_eq!(
         stub.queries_seen(),
         after_first,

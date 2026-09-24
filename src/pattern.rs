@@ -126,7 +126,10 @@ impl WildcardPattern {
             // labels is allowed, so `*.a.b` matches `a.b` — the same reading
             // `Subtree` gives `*.a.b`.
             match labels.len().checked_sub(self.labels.len()) {
-                Some(skip) => (labels.get(skip..).unwrap_or_default(), self.labels.as_slice()),
+                Some(skip) => (
+                    labels.get(skip..).unwrap_or_default(),
+                    self.labels.as_slice(),
+                ),
                 None => return false,
             }
         } else {

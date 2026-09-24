@@ -456,7 +456,10 @@ mod tests {
         // Structures that do not hold together are refused, not guessed at.
         assert!(parse_dnskey_rsa(&[]).is_none());
         assert!(parse_dnskey_rsa(&[0]).is_none(), "truncated length field");
-        assert!(parse_dnskey_rsa(&[0, 0]).is_none(), "truncated length field");
+        assert!(
+            parse_dnskey_rsa(&[0, 0]).is_none(),
+            "truncated length field"
+        );
         assert!(
             parse_dnskey_rsa(&[0, 0, 0, 1, 0, 1, 0xab, 0xab, 0xab]).is_none(),
             "a zero exponent length is not a key"
@@ -487,6 +490,10 @@ mod tests {
         assert_eq!(trim_leading_zeros(&[]), vec![0]);
         assert_eq!(trim_leading_zeros(&[0, 0, 0]), vec![0]);
         // And the whole verifier, which is where an attacker actually stands.
-        assert!(!verify_pkcs1v15_sha256(&[3, 1, 0, 1, 0xff, 0xff, 0xff], &[0u8; 32], &[]));
+        assert!(!verify_pkcs1v15_sha256(
+            &[3, 1, 0, 1, 0xff, 0xff, 0xff],
+            &[0u8; 32],
+            &[]
+        ));
     }
 }

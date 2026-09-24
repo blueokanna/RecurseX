@@ -218,7 +218,8 @@ impl CryptoRx {
             // An already-consumed prefix. `get` cannot come up short for a
             // well-formed stream, and dropping the bytes is the safe reading
             // if it somehow does.
-            data.get((self.start - offset) as usize..).unwrap_or_default()
+            data.get((self.start - offset) as usize..)
+                .unwrap_or_default()
         } else {
             data
         };
@@ -856,11 +857,7 @@ impl QuicConnection {
             // The `is_empty` test above is what makes a first byte exist; the
             // reads below are still checked ones, because everything after the
             // first byte is a length the peer chose.
-            trace(format_args!(
-                "recv {}B {:02x?}",
-                dg.len(),
-                capped(dg, 24)
-            ));
+            trace(format_args!("recv {}B {:02x?}", dg.len(), capped(dg, 24)));
             let first = dg
                 .first()
                 .copied()
@@ -1259,8 +1256,7 @@ impl QuicConnection {
                     *self.crypto_tx.at(Space::Handshake),
                     false,
                 )?;
-                *self.crypto_tx.at_mut(Space::Handshake) +=
-                    completed.client_finished.len() as u64;
+                *self.crypto_tx.at_mut(Space::Handshake) += completed.client_finished.len() as u64;
                 self.handshake_confirmed = true;
                 self.pto_count = 0;
                 trace(format_args!("handshake completed suite=0x{suite:04x}"));
@@ -1592,9 +1588,7 @@ fn random_cid() -> Vec<u8> {
 /// out-of-memory: a server that opens a stream, writes one byte at offset 2^40,
 /// and closes it must cost nothing.
 fn reassembly_end(offset: u64, data_len: usize, cap: usize) -> Option<usize> {
-    let end = usize::try_from(offset)
-        .ok()?
-        .checked_add(data_len)?;
+    let end = usize::try_from(offset).ok()?.checked_add(data_len)?;
     (end <= cap).then_some(end)
 }
 

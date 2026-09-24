@@ -91,7 +91,10 @@ mod tests {
         }));
         std::panic::set_hook(previous);
 
-        assert!(outcome.is_err(), "the panic must have unwound through the guard");
+        assert!(
+            outcome.is_err(),
+            "the panic must have unwound through the guard"
+        );
         assert!(
             m.inner.is_poisoned(),
             "the mutex must actually be poisoned, or this test proves nothing"

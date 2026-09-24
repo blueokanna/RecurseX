@@ -808,9 +808,7 @@ impl Config {
         let mut ec = EngineConfig {
             root_servers,
             timeout_ms: engine.timeout_ms.unwrap_or(d.engine.timeout_ms),
-            query_budget_ms: engine
-                .query_budget_ms
-                .unwrap_or(d.engine.query_budget_ms),
+            query_budget_ms: engine.query_budget_ms.unwrap_or(d.engine.query_budget_ms),
             auth_port: engine.auth_port.unwrap_or(d.engine.auth_port),
             qname_minimization: engine
                 .qname_minimization
@@ -1000,7 +998,10 @@ mod tests {
             .unwrap()
             .into_resolver_config()
             .unwrap();
-        assert_eq!(rc.engine.query_budget_ms, EngineConfig::default().query_budget_ms);
+        assert_eq!(
+            rc.engine.query_budget_ms,
+            EngineConfig::default().query_budget_ms
+        );
         assert!(rc.engine.query_budget_ms > 0);
     }
 

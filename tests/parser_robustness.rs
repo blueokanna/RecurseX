@@ -134,7 +134,8 @@ fn every_rdata_decoder_survives_garbage() {
                 let mut back_pos = 0usize;
                 match RData::parse(&out, &mut back_pos, out.len(), rr_type) {
                     Ok(again) => assert_eq!(
-                        again, rd,
+                        again,
+                        rd,
                         "{rr_type}: re-parsing the encoding changed the value \
                          (encoded to {} bytes)",
                         out.len()
@@ -207,7 +208,10 @@ fn well_formed_rdata_round_trips() {
         (RrType::NS, name(&["ns1", "example"])),
         (RrType::CNAME, name(&["target", "example"])),
         (RrType::DNAME, name(&["example"])),
-        (RrType::PTR, name(&["1", "0", "2", "192", "in-addr", "arpa"])),
+        (
+            RrType::PTR,
+            name(&["1", "0", "2", "192", "in-addr", "arpa"]),
+        ),
         (RrType::MX, mx),
         // TXT: length-prefixed character-strings.
         (RrType::TXT, b"\x05hello\x05world".to_vec()),
@@ -219,9 +223,8 @@ fn well_formed_rdata_round_trips() {
 
     for (rr_type, bytes) in &cases {
         let mut pos = 0usize;
-        let rd = RData::parse(bytes, &mut pos, bytes.len(), *rr_type).unwrap_or_else(|e| {
-            panic!("{rr_type}: a well-formed rdata was rejected: {e}")
-        });
+        let rd = RData::parse(bytes, &mut pos, bytes.len(), *rr_type)
+            .unwrap_or_else(|e| panic!("{rr_type}: a well-formed rdata was rejected: {e}"));
         assert_eq!(
             pos,
             bytes.len(),
@@ -292,7 +295,10 @@ fn edns_option_walking_survives_garbage() {
     let mut buf = vec![0x00, 0x0cu8];
     buf.extend_from_slice(&0x0004u16.to_be_bytes());
     buf.extend_from_slice(&[0, 0]); // two bytes, not four
-    assert!(parse_options(&buf).is_err(), "short padding must be rejected");
+    assert!(
+        parse_options(&buf).is_err(),
+        "short padding must be rejected"
+    );
 }
 
 /// A verifier is handed bytes chosen by whoever signed — or did not sign —
@@ -304,7 +310,13 @@ fn rsa_verification_rejects_malformed_input() {
 
     // The shapes that reach the arithmetic: no signature, a one-byte
     // signature, and a signature that is all zeros.
-    for sig in [vec![], vec![0u8], vec![0u8; 1], vec![0u8; 64], vec![0xff; 64]] {
+    for sig in [
+        vec![],
+        vec![0u8],
+        vec![0u8; 1],
+        vec![0u8; 64],
+        vec![0xff; 64],
+    ] {
         // A well-formed RSA DNSKEY so the parse succeeds and the signature
         // is what is actually under test.
         let key = well_formed_rsa_dnskey();

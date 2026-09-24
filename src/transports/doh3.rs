@@ -1,8 +1,8 @@
 //! DNS over HTTP/3 (QUIC) via courierust's HTTP/3 client (ALPN `h3`).
 
+use crate::sync::Mutex;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::sync::Mutex;
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_tls::RootStore;

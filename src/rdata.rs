@@ -237,7 +237,8 @@ impl RData {
             if p > end {
                 return Err(Error::wire("RDATA truncated"));
             }
-            buf.get(p..end).ok_or_else(|| Error::wire("RDATA truncated"))
+            buf.get(p..end)
+                .ok_or_else(|| Error::wire("RDATA truncated"))
         };
         let read_name = |p: &mut usize| -> Result<Name> {
             let (n, next) = Name::from_wire(buf, *p)?;
@@ -909,7 +910,10 @@ impl Record {
         // The fixed ten-octet record header (RFC 1035 §4.1.3). `u16_at(p + 8)`
         // is the read that fails unless all ten octets are present, so the
         // guard above and these reads say the same thing.
-        let rr_type = RrType(buf.u16_at(p).map_err(|_| Error::wire("record header truncated"))?);
+        let rr_type = RrType(
+            buf.u16_at(p)
+                .map_err(|_| Error::wire("record header truncated"))?,
+        );
         let class = RrClass(
             buf.u16_at(p + 2)
                 .map_err(|_| Error::wire("record header truncated"))?,
