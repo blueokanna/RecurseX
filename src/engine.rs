@@ -299,7 +299,7 @@ pub fn synthesize_dname_cname(
     let owner_labels = dname_owner.label_count();
     let keep = q_labels.len().saturating_sub(owner_labels);
     let mut out: Vec<u8> = Vec::with_capacity(64);
-    for l in &q_labels[..keep] {
+    for l in q_labels.iter().take(keep) {
         out.push(l.len() as u8);
         out.extend_from_slice(l);
     }

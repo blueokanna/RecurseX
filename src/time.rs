@@ -148,7 +148,7 @@ pub fn to_ticks(t: Ts) -> tzcraft::Ticks {
 pub fn format_rfc3339(t: Ts) -> String {
     let mut buf = [0u8; 64];
     match to_ticks(t).write_rfc3339(&mut buf, tzcraft::FractionDigits::None) {
-        Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Ok(n) => String::from_utf8_lossy(crate::wire::capped(&buf, n)).into_owned(),
         Err(_) => String::from("(invalid timestamp)"),
     }
 }

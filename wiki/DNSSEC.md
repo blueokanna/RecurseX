@@ -24,17 +24,29 @@ establish).
 
 `dnssec/rsa.rs` implements RSA PKCS#1 v1.5 verification with a from-scratch
 u32-limb big integer (modular exponentiation via square-and-multiply,
-bitwise long-division reduction), plus RFC 3110 DNSKEY RSA parsing
-(1-byte exponent length; 0 means a 4-byte exponent). The test suite includes
-an **authentic 1024-bit RSA/SHA-256 vector generated with openssl** — not a
-fabricated constant — plus tamper checks on both the digest and the
-signature.
+bitwise long-division reduction), plus RFC 3110 DNSKEY RSA parsing. The
+exponent length is one octet, or — when that octet is zero — the two octets
+that follow it (RFC 3110 §2), which is how an exponent longer than 255 octets
+is expressed; the exponent then starts at offset 3, not at offset 1. The test
+suite includes an **authentic 1024-bit RSA/SHA-256 vector generated with
+openssl** — not a fabricated constant — plus tamper checks on both the digest
+and the signature.
+
+The verifier is a **total function over attacker-controlled input**: both the
+DNSKEY (public data an on-path attacker can replay) and the signature (theirs
+to choose) arrive from the wire, so a malformed key or signature is answered
+with `false` — never a panic. `tests/parser_robustness.rs` holds it to that,
+including the degenerate shapes an arithmetic helper gets wrong: an empty
+signature, a zero modulus, an exponent declared longer than the key.
 
 ## Honest scope
 
 - RSA PKCS#1 v1.5 with SHA-256 is implemented. ECDSA and SHA-1 signatures
   are recognized but not yet validated, so a chain that relies on them is
   reported as `Indeterminate` rather than falsely `Secure`.
+- The encoded message is checked strictly: the full DigestInfo prefix, the
+  exact digest, and at least the 8 padding octets RFC 8017 §9.2 requires, so
+  a low-exponent forgery cannot pass through a short padding run.
 - The `do` bit is honored when requesting DNSSEC; the resolver stores the
   RRSIGs alongside the RRset so validated data stays validated across cache
   hits, and the `validated` flag survives persistence.

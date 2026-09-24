@@ -2,7 +2,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::sync::Mutex;
+use crate::sync::Mutex;
 
 use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_tls::RootStore;
@@ -71,7 +71,7 @@ impl DohTransport {
     }
 
     fn client(&self) -> Result<Client> {
-        let mut guard = self.client.lock().unwrap();
+        let mut guard = self.client.lock();
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }

@@ -125,7 +125,9 @@ fn read_exact(r: &mut impl courierust::courierust_io::Read, mut buf: &mut [u8]) 
         if n == 0 {
             return Err(Error::transport("dot connection closed early"));
         }
-        buf = &mut buf[n..];
+        buf = buf.get_mut(n..).ok_or_else(|| {
+            Error::transport("dot read reported more bytes than the buffer holds")
+        })?;
     }
     Ok(())
 }

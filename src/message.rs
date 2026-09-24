@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::name::{Name, NameCompressor};
 use crate::qtype::{Opcode, Rcode, RrClass, RrType};
 use crate::rdata::Record;
+use crate::wire::WireBytes;
 
 /// Upper bound on any section count in a single message.
 ///
@@ -197,12 +198,12 @@ impl Message {
         if buf.len() < 12 {
             return Err(Error::wire("message shorter than header"));
         }
-        let id = u16::from_be_bytes([buf[0], buf[1]]);
-        let flags = HeaderFlags::from_u16(u16::from_be_bytes([buf[2], buf[3]]));
-        let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
-        let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-        let ns = u16::from_be_bytes([buf[8], buf[9]]) as usize;
-        let ar = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+        let id = buf.u16_at(0)?;
+        let flags = HeaderFlags::from_u16(buf.u16_at(2)?);
+        let qd = usize::from(buf.u16_at(4)?);
+        let an = usize::from(buf.u16_at(6)?);
+        let ns = usize::from(buf.u16_at(8)?);
+        let ar = usize::from(buf.u16_at(10)?);
         if qd > MAX_QUESTIONS
             || an > MAX_SECTION_RECORDS
             || ns > MAX_SECTION_RECORDS
@@ -215,11 +216,13 @@ impl Message {
         let mut questions = Vec::with_capacity(qd);
         for _ in 0..qd {
             let (qname, p) = Name::from_wire(buf, pos)?;
-            if p + 4 > buf.len() {
-                return Err(Error::wire("question truncated"));
-            }
-            let qtype = RrType(u16::from_be_bytes([buf[p], buf[p + 1]]));
-            let qclass = RrClass(u16::from_be_bytes([buf[p + 2], buf[p + 3]]));
+            // The two reads below carry the truncation check: `u16_at(p + 2)`
+            // fails unless all four bytes are there.
+            let qtype = RrType(buf.u16_at(p).map_err(|_| Error::wire("question truncated"))?);
+            let qclass = RrClass(
+                buf.u16_at(p + 2)
+                    .map_err(|_| Error::wire("question truncated"))?,
+            );
             pos = p + 4;
             questions.push(Question {
                 qname,
@@ -303,16 +306,24 @@ impl Message {
 
         // Patch the section counts.
         let extra = self.additionals.len() + usize::from(self.edns.is_some());
-        out[count_pos..count_pos + 8].copy_from_slice(&[
-            (self.questions.len() as u16).to_be_bytes()[0],
-            (self.questions.len() as u16).to_be_bytes()[1],
-            (self.answers.len() as u16).to_be_bytes()[0],
-            (self.answers.len() as u16).to_be_bytes()[1],
-            (self.authorities.len() as u16).to_be_bytes()[0],
-            (self.authorities.len() as u16).to_be_bytes()[1],
-            (extra as u16).to_be_bytes()[0],
-            (extra as u16).to_be_bytes()[1],
-        ]);
+        let counts = [
+            self.questions.len() as u16,
+            self.answers.len() as u16,
+            self.authorities.len() as u16,
+            extra as u16,
+        ];
+        let mut header_tail = [0u8; 8];
+        for (dst, n) in header_tail.chunks_exact_mut(2).zip(counts) {
+            dst.copy_from_slice(&n.to_be_bytes());
+        }
+        // `count_pos` was recorded where the header was written, so the range
+        // is in bounds by construction — the check is what keeps that a fact
+        // rather than an assumption.
+        let dst = out
+            .get_mut(count_pos..)
+            .and_then(|tail| tail.get_mut(..header_tail.len()))
+            .ok_or_else(|| Error::internal("header count offset out of range"))?;
+        dst.copy_from_slice(&header_tail);
         Ok(out)
     }
 

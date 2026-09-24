@@ -85,7 +85,7 @@ impl SplitMix64 {
     pub fn fill_bytes(&mut self, out: &mut [u8]) {
         for chunk in out.chunks_mut(8) {
             let v = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&v[..chunk.len()]);
+            chunk.copy_from_slice(crate::wire::capped(&v, chunk.len()));
         }
     }
 }
@@ -150,20 +150,22 @@ pub fn siphash24(k0: u64, k1: u64, input: &[u8]) -> u64 {
     let mut v2 = Wrapping(k0) ^ Wrapping(0x6c7967656e657261);
     let mut v3 = Wrapping(k1) ^ Wrapping(0x7465646279746573);
 
-    let mut i = 0usize;
-    let n = input.len() / 8;
-    for _ in 0..n {
-        let m = u64::from_le_bytes(input[i..i + 8].try_into().unwrap());
+    // `chunks_exact(8)` hands out eight-byte blocks and keeps the tail, so
+    // neither the block loop nor the tail loop needs an offset into `input`.
+    let mut chunks = input.chunks_exact(8);
+    for block in chunks.by_ref() {
+        let mut m = 0u64;
+        for (i, &b) in block.iter().enumerate() {
+            m |= u64::from(b) << (8 * i);
+        }
         v3 ^= Wrapping(m);
         sip_round(&mut v0.0, &mut v1.0, &mut v2.0, &mut v3.0);
         sip_round(&mut v0.0, &mut v1.0, &mut v2.0, &mut v3.0);
         v0 ^= Wrapping(m);
-        i += 8;
     }
 
     let mut last = (input.len() as u64) << 56;
-    let rem = &input[i..];
-    for (j, &b) in rem.iter().enumerate() {
+    for (j, &b) in chunks.remainder().iter().enumerate() {
         last |= (b as u64) << (8 * j);
     }
 

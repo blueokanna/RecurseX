@@ -126,7 +126,7 @@ impl WildcardPattern {
             // labels is allowed, so `*.a.b` matches `a.b` — the same reading
             // `Subtree` gives `*.a.b`.
             match labels.len().checked_sub(self.labels.len()) {
-                Some(skip) => (&labels[skip..], &self.labels[..]),
+                Some(skip) => (labels.get(skip..).unwrap_or_default(), self.labels.as_slice()),
                 None => return false,
             }
         } else {
@@ -456,7 +456,10 @@ mod tests {
         assert!(p.matches(&n("time.windows.com")));
         // Exactly one label, and the whole name.
         assert!(!p.matches(&n("time.a.b.com")), "one label, not several");
-        assert!(!p.matches(&n("x.time.apple.com")), "no implicit suffix match");
+        assert!(
+            !p.matches(&n("x.time.apple.com")),
+            "no implicit suffix match"
+        );
         assert!(!p.matches(&n("time.com")), "the label is required");
         assert!(!p.matches(&n("ntp.apple.com")), "the literal label matters");
         assert!(!p.matches(&n("time.apple.org")), "the tail matters");
@@ -505,7 +508,10 @@ mod tests {
     #[test]
     fn malformed_embedded_patterns_are_refused() {
         assert!(DomainPattern::parse("time..com").is_err(), "empty label");
-        assert!(DomainPattern::parse("*.time.*..com").is_err(), "empty label");
+        assert!(
+            DomainPattern::parse("*.time.*..com").is_err(),
+            "empty label"
+        );
         let e = DomainPattern::parse("a\\.b.com").unwrap_err();
         assert!(e.msg.contains("escapes"), "{}", e.msg);
     }

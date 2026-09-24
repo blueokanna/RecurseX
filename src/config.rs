@@ -113,6 +113,19 @@ pub struct EngineJson {
     /// Query timeout in ms; absent = default.
     #[njson(default)]
     pub timeout_ms: Option<u64>,
+    /// Wall-clock budget for one client query in ms, covering the whole
+    /// delegated tree it spawns; absent = default (20 000).
+    ///
+    /// Accepted as `queryBudgetMs`, `query_budget_ms` or `query-budget-ms`:
+    /// this struct denies unknown keys, so a wrong guess is a hard error rather
+    /// than a silently ignored setting, and the three spellings cost nothing.
+    #[njson(default, alias = "query_budget_ms", alias = "query-budget-ms")]
+    pub query_budget_ms: Option<u64>,
+    /// Port for authoritative servers discovered during a resolution; absent =
+    /// 53. Exists so the iterative walk can be tested without a privileged
+    /// port — see `EngineConfig::auth_port`.
+    #[njson(default, alias = "auth_port", alias = "auth-port")]
+    pub auth_port: Option<u16>,
     /// Enable QNAME minimization; absent = default.
     #[njson(default)]
     pub qname_minimization: Option<bool>,
@@ -304,6 +317,11 @@ pub struct DnsJson {
     /// The fake-IP address range.
     #[njson(default, alias = "fake-ip-range", alias = "fake_ip_range")]
     pub fake_ip_range: Option<String>,
+    /// The IPv6 fake-IP range. **Its presence is what makes `AAAA`
+    /// synthesized instead of answered NODATA** — synthesizing a v6 address
+    /// is what lets a dual-stack client connect over IPv6, so it is opt-in.
+    #[njson(default, alias = "fake-ip-range6", alias = "fake_ip_range6")]
+    pub fake_ip_range6: Option<String>,
     /// Names excluded from fake-IP. **Absent** takes the built-in list
     /// (connectivity probes, NTP, STUN and local names, which break in
     /// visible ways when they are faked); an explicit empty list means "no
@@ -667,6 +685,7 @@ impl Config {
                     dns.fake_ip_range
                         .as_deref()
                         .unwrap_or(DEFAULT_FAKE_IP_RANGE),
+                    dns.fake_ip_range6.as_deref(),
                     dns.fake_ip_filter.as_deref(),
                     dns.fake_ip_ttl.unwrap_or(DEFAULT_FAKE_IP_TTL_SECS),
                     dns.fake_ip_max_entries
@@ -789,6 +808,10 @@ impl Config {
         let mut ec = EngineConfig {
             root_servers,
             timeout_ms: engine.timeout_ms.unwrap_or(d.engine.timeout_ms),
+            query_budget_ms: engine
+                .query_budget_ms
+                .unwrap_or(d.engine.query_budget_ms),
+            auth_port: engine.auth_port.unwrap_or(d.engine.auth_port),
             qname_minimization: engine
                 .qname_minimization
                 .unwrap_or(d.engine.qname_minimization),
@@ -958,6 +981,29 @@ mod tests {
         assert_eq!(ep.proto, Proto::Tls);
     }
 
+    /// The query budget is a different bound from the per-attempt timeout, so
+    /// it needs to be settable — and all three spellings of the key must be
+    /// accepted, because the struct denies unknown keys and a user who guesses
+    /// the other convention would otherwise get a hard parse error.
+    #[test]
+    fn query_budget_is_configurable_in_three_spellings() {
+        for key in ["queryBudgetMs", "query_budget_ms", "query-budget-ms"] {
+            let json = alloc::format!(r#"{{"engine":{{"{key}":5000}}}}"#);
+            let rc = Config::from_json_str(&json)
+                .unwrap_or_else(|e| panic!("{key} was rejected: {e}"))
+                .into_resolver_config()
+                .unwrap();
+            assert_eq!(rc.engine.query_budget_ms, 5000, "for {key}");
+        }
+        // Absent means the default, and the default is finite.
+        let rc = Config::from_json_str(r#"{"listen":[]}"#)
+            .unwrap()
+            .into_resolver_config()
+            .unwrap();
+        assert_eq!(rc.engine.query_budget_ms, EngineConfig::default().query_budget_ms);
+        assert!(rc.engine.query_budget_ms > 0);
+    }
+
     #[test]
     fn rr_type_parsing() {
         assert_eq!(parse_rr_type("A"), Some(RrType::A));
@@ -1058,6 +1104,50 @@ mod tests {
                 .into_resolver_config()
                 .unwrap_err();
             assert!(e.msg.contains("fake-ip"), "{}", e.msg);
+        }
+
+        /// `fake-ip-range6` accepts all three spellings, and its presence is
+        /// what turns `AAAA` synthesis on. Absent means IPv6 stays NODATA,
+        /// which is the pre-existing behaviour.
+        #[test]
+        fn fake_ip_range6_is_opt_in_and_spelled_three_ways() {
+            use crate::fakeip::Family;
+            for key in ["fake-ip-range6", "fake_ip_range6", "fakeIpRange6"] {
+                let json = format!(
+                    r#"{{"dns": {{"enhanced-mode": "fake-ip", "{key}": "fdfe:dcba:9876::/48"}}}}"#
+                );
+                let rc = Config::from_json_str(&json)
+                    .unwrap_or_else(|e| panic!("{key} should parse: {e}"))
+                    .into_resolver_config()
+                    .unwrap();
+                let s = rc.dns.fake_ip.as_ref().expect("fake-ip mode is on");
+                assert_eq!(
+                    s.range6.expect("range6 must be set").to_string(),
+                    "fdfe:dcba:9876::/48",
+                    "{key}"
+                );
+                assert!(s.synthesizes(Family::V6), "{key} must enable v6 synthesis");
+                assert!(s.synthesizes(Family::V4), "v4 stays on");
+            }
+
+            // Absent: v4 only.
+            let rc = Config::from_json_str(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#)
+                .unwrap()
+                .into_resolver_config()
+                .unwrap();
+            let s = rc.dns.fake_ip.as_ref().unwrap();
+            assert!(s.range6.is_none());
+            assert!(!s.synthesizes(Family::V6));
+            assert!(s.synthesizes(Family::V4));
+
+            // A malformed v6 range is refused by name, not ignored.
+            let e = Config::from_json_str(
+                r#"{"dns": {"enhanced-mode": "fake-ip", "fake-ip-range6": "198.18.0.0/16"}}"#,
+            )
+            .unwrap()
+            .into_resolver_config()
+            .unwrap_err();
+            assert!(e.msg.contains("range6"), "{}", e.msg);
         }
 
         /// `hosts` accepts both a bare string and a list, and both are

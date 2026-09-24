@@ -43,6 +43,7 @@ use courierust::courierust_tls::RootStore;
 use super::tls::{self, ClientHandshake};
 use crate::error::{Error, Result};
 use crate::upstream::Endpoint;
+use crate::wire::{capped, WireBytes};
 
 /// The minimum size of a UDP datagram carrying an Initial packet
 /// (RFC 9000 §14.1).
@@ -101,9 +102,38 @@ enum Space {
     Application = 2,
 }
 
-impl Space {
-    fn idx(self) -> usize {
-        self as usize
+/// The per-space state a connection keeps, keyed by [`Space`].
+///
+/// A fixed-size array would do the same job, but every read of it would be an
+/// index expression, and an index expression over network-facing state is a
+/// panic looking for a length that changed. The accessors below are total
+/// matches, and they are accessors rather than `Index`/`IndexMut` impls on
+/// purpose: `x[space]` *reads* as a possible panic to a reviewer and to a
+/// linter, and the whole point of this type is that it cannot be one.
+#[derive(Debug, Default)]
+struct PerSpace<T> {
+    initial: T,
+    handshake: T,
+    application: T,
+}
+
+impl<T> PerSpace<T> {
+    /// The entry for `space`.
+    fn at(&self, space: Space) -> &T {
+        match space {
+            Space::Initial => &self.initial,
+            Space::Handshake => &self.handshake,
+            Space::Application => &self.application,
+        }
+    }
+
+    /// The mutable entry for `space`.
+    fn at_mut(&mut self, space: Space) -> &mut T {
+        match space {
+            Space::Initial => &mut self.initial,
+            Space::Handshake => &mut self.handshake,
+            Space::Application => &mut self.application,
+        }
     }
 }
 
@@ -185,13 +215,17 @@ impl CryptoRx {
         // Overlaps or is contiguous with the buffered region. Slice off
         // any portion that lies before `start` (already consumed).
         let data = if offset < self.start {
-            &data[(self.start - offset) as usize..]
+            // An already-consumed prefix. `get` cannot come up short for a
+            // well-formed stream, and dropping the bytes is the safe reading
+            // if it somehow does.
+            data.get((self.start - offset) as usize..).unwrap_or_default()
         } else {
             data
         };
         let present = (contiguous_end.saturating_sub(offset.max(self.start))) as usize;
         if data.len() > present {
-            self.buf.extend_from_slice(&data[present..]);
+            self.buf
+                .extend_from_slice(data.get(present..).unwrap_or_default());
         }
         self.drain_pending();
         Ok(())
@@ -206,7 +240,8 @@ impl CryptoRx {
                     let end = off + chunk.len() as u64;
                     if end > contiguous_end {
                         let skip = (contiguous_end.saturating_sub(off)) as usize;
-                        self.buf.extend_from_slice(&chunk[skip..]);
+                        self.buf
+                            .extend_from_slice(chunk.get(skip..).unwrap_or_default());
                     }
                     advance = Some(off);
                     break;
@@ -227,13 +262,22 @@ impl CryptoRx {
         if self.buf.len() < 4 {
             return None;
         }
-        let len = u32::from_be_bytes([0, self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        // A TLS handshake header is one type octet followed by a three-octet
+        // length, so a whole four-octet read has to have its top octet — the
+        // message type — masked off.
+        let len = match self.buf.u32_at(0) {
+            Ok(header) => (header & 0x00ff_ffff) as usize,
+            Err(_) => return None,
+        };
         if self.buf.len() < 4 + len {
             return None;
         }
-        let msg = self.buf[..4 + len].to_vec();
-        self.buf.drain(..4 + len);
-        self.start += (4 + len) as u64;
+        // Clamping the take to what is present keeps `drain`'s range valid;
+        // the check above already made the clamp a no-op.
+        let take = (4 + len).min(self.buf.len());
+        let msg = self.buf.get(..take).unwrap_or_default().to_vec();
+        self.buf.drain(..take);
+        self.start += take as u64;
         self.drain_pending();
         Some(msg)
     }
@@ -261,14 +305,16 @@ pub struct QuicConnection {
     app_write: Option<PacketKey>,
     app_read: Option<PacketKey>,
     // Packet-number spaces.
-    next_pn: [u64; 3],
-    largest_rx: [u64; 3],
+    next_pn: PerSpace<u64>,
+    largest_rx: PerSpace<u64>,
     /// Received ack-eliciting packet numbers not yet acknowledged.
-    pending_acks: [BTreeSet<u64>; 3],
+    pending_acks: PerSpace<BTreeSet<u64>>,
     handshake_confirmed: bool,
-    // CRYPTO streams (Initial, Handshake).
-    crypto_rx: [CryptoRx; 2],
-    crypto_tx: [u64; 2],
+    // CRYPTO streams, keyed by space. A CRYPTO frame exists only in the
+    // Initial and Handshake spaces (RFC 9000 §19.6); the Application slot is
+    // carried for uniformity and never written.
+    crypto_rx: PerSpace<CryptoRx>,
+    crypto_tx: PerSpace<u64>,
     // Query stream state.
     stream_id: u64,
     query_tx: Option<QuerySend>,
@@ -317,7 +363,10 @@ impl core::fmt::Debug for QuicConnection {
 impl QuicConnection {
     /// Establish a QUIC connection to `endpoint`, performing the full
     /// TLS 1.3 handshake with ALPN `doq`. `host` is the certificate
-    /// verification name (and SNI) when known.
+    /// verification name (and SNI) when known. `timeout_ms` bounds the whole
+    /// handshake and is used as given: a QUIC handshake costs about two round
+    /// trips, so the value the caller chose is a statement about the network it
+    /// expects, not a hint to be rounded up.
     pub fn connect(
         endpoint: &Endpoint,
         host: Option<&str>,
@@ -375,12 +424,12 @@ impl QuicConnection {
             hs_read: None,
             app_write: None,
             app_read: None,
-            next_pn: [0; 3],
-            largest_rx: [0; 3],
-            pending_acks: Default::default(),
+            next_pn: PerSpace::default(),
+            largest_rx: PerSpace::default(),
+            pending_acks: PerSpace::default(),
             handshake_confirmed: false,
-            crypto_rx: Default::default(),
-            crypto_tx: [0; 2],
+            crypto_rx: PerSpace::default(),
+            crypto_tx: PerSpace::default(),
             stream_id: 0,
             query_tx: None,
             query_rx: QueryRecv::default(),
@@ -413,8 +462,8 @@ impl QuicConnection {
             hex_dump(&ch)
         ));
         c.send_crypto(Space::Initial, &ch, 0, true)?;
-        c.crypto_tx[0] = ch.len() as u64;
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1000));
+        *c.crypto_tx.at_mut(Space::Initial) = ch.len() as u64;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         c.drive_until(|c| c.tls.is_done(), deadline)?;
         Ok(c)
     }
@@ -453,7 +502,7 @@ impl QuicConnection {
             fin_sent: false,
         });
         self.query_rx = QueryRecv::default();
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1000));
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         self.flush_query_send()?;
         self.drive_until(|c| c.query_rx.complete(), deadline)?;
         if self.query_rx.buf.len() > MAX_RESPONSE_BUFFER {
@@ -505,7 +554,13 @@ impl QuicConnection {
                     Ok((n, src)) => {
                         if src == self.remote {
                             received_any = true;
-                            self.process_datagram(&buf[..n])?;
+                            // `recv_from` reports a length it claims to have
+                            // just written; that promise is not checkable from
+                            // here, so it is checked here.
+                            let datagram = buf.get(..n).ok_or_else(|| {
+                                Error::internal("doq recv reported a length past the buffer")
+                            })?;
+                            self.process_datagram(datagram)?;
                         }
                         // Datagrams from other sources are ignored
                         // (source validation).
@@ -552,7 +607,7 @@ impl QuicConnection {
     /// for the first Initial and for Initial ACKs until the handshake is
     /// confirmed, RFC 9000 §14.1).
     fn send_packet(&mut self, space: Space, frames: Vec<Frame>, pad_initial: bool) -> Result<()> {
-        let pn = self.next_pn[space.idx()];
+        let pn = *self.next_pn.at(space);
         let (key, is_long, token) = match space {
             Space::Initial => (self.initial_write.clone(), true, self.retry_token.clone()),
             Space::Handshake => {
@@ -635,7 +690,7 @@ impl QuicConnection {
             ack_eliciting,
             wire.len()
         ));
-        self.next_pn[space.idx()] = pn.wrapping_add(1);
+        *self.next_pn.at_mut(space) = pn.wrapping_add(1);
         if ack_eliciting {
             self.sent.push(SentPacket {
                 space,
@@ -653,15 +708,15 @@ impl QuicConnection {
     /// pending ACKs are dropped.
     fn flush_acks(&mut self) {
         for space in [Space::Initial, Space::Handshake, Space::Application] {
-            if self.pending_acks[space.idx()].is_empty() {
+            if self.pending_acks.at(space).is_empty() {
                 continue;
             }
             if space == Space::Initial && self.handshake_confirmed {
-                self.pending_acks[space.idx()].clear();
+                self.pending_acks.at_mut(space).clear();
                 continue;
             }
-            let pns: Vec<u64> = self.pending_acks[space.idx()].iter().copied().collect();
-            self.pending_acks[space.idx()].clear();
+            let pns: Vec<u64> = self.pending_acks.at(space).iter().copied().collect();
+            self.pending_acks.at_mut(space).clear();
             let frames = vec![build_ack_frame(&pns)];
             let pad = space == Space::Initial && !self.handshake_confirmed;
             if let Err(e) = self.send_packet(space, frames, pad) {
@@ -694,13 +749,16 @@ impl QuicConnection {
             usize,
         )>,
     > {
-        let first = dg[0];
+        let first = dg
+            .first()
+            .copied()
+            .ok_or_else(|| Error::wire("doq empty datagram"))?;
         if first & 0x80 != 0 {
             // Long header.
             if dg.len() < 7 {
                 return Err(Error::wire("doq long header truncated"));
             }
-            let version = u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]);
+            let version = dg.u32_at(1)?;
             if version != VERSION_1 {
                 return Err(Error::wire("doq unsupported QUIC version"));
             }
@@ -710,43 +768,53 @@ impl QuicConnection {
                 2 => LongType::Handshake,
                 _ => LongType::Retry,
             };
-            let dcid_len = dg[5] as usize;
+            let dcid_len = usize::from(dg.byte_at(5)?);
             let mut pos = 6usize;
             if dcid_len > 20 || pos + dcid_len > dg.len() {
                 return Err(Error::wire("doq DCID malformed"));
             }
-            let dcid = dg[pos..pos + dcid_len].to_vec();
+            let dcid = dg.slice_at(pos, dcid_len)?.to_vec();
             pos += dcid_len;
             if pos >= dg.len() {
                 return Err(Error::wire("doq long header truncated"));
             }
-            let scid_len = dg[pos] as usize;
+            let scid_len = usize::from(dg.byte_at(pos)?);
             pos += 1;
             if scid_len > 20 || pos + scid_len > dg.len() {
                 return Err(Error::wire("doq SCID malformed"));
             }
-            let scid = dg[pos..pos + scid_len].to_vec();
+            let scid = dg.slice_at(pos, scid_len)?.to_vec();
             pos += scid_len;
             let mut token = Vec::new();
             if ptype == LongType::Initial {
-                let (tlen, used) = varint::decode(&dg[pos..])
+                let (tlen, used) = varint::decode(dg.rest_at(pos)?)
                     .map_err(|_| Error::wire("doq token length malformed"))?;
                 pos += used;
                 let tlen = usize::try_from(tlen).map_err(|_| Error::wire("doq token too long"))?;
-                if pos + tlen > dg.len() {
-                    return Err(Error::wire("doq token truncated"));
-                }
-                token = dg[pos..pos + tlen].to_vec();
-                pos += tlen;
+                // A token length is chosen by the peer, so the end offset is
+                // computed with checked arithmetic: `pos + tlen` on a hostile
+                // value is a wrap, and a wrapped bound passes the check it is
+                // supposed to fail.
+                let token_end = pos
+                    .checked_add(tlen)
+                    .filter(|end| *end <= dg.len())
+                    .ok_or_else(|| Error::wire("doq token truncated"))?;
+                token = dg.slice_at(pos, tlen)?.to_vec();
+                pos = token_end;
             }
-            let (plen, used) = varint::decode(&dg[pos..])
+            let (plen, used) = varint::decode(dg.rest_at(pos)?)
                 .map_err(|_| Error::wire("doq payload length malformed"))?;
             pos += used;
             let pn_offset = pos;
             if plen < PN_LEN as u64 {
                 return Err(Error::wire("doq payload shorter than packet number"));
             }
-            let payload_end = pn_offset + plen as usize;
+            let payload_end = pn_offset
+                .checked_add(
+                    usize::try_from(plen)
+                        .map_err(|_| Error::wire("doq payload length overflow"))?,
+                )
+                .ok_or_else(|| Error::wire("doq payload length overflow"))?;
             if payload_end > dg.len() {
                 return Err(Error::wire("doq packet payload truncated"));
             }
@@ -760,12 +828,13 @@ impl QuicConnection {
                 payload_end,
             )))
         } else {
-            // Short header.
+            // Short header. Its DCID is exactly our own connection ID, so the
+            // length is not read from the wire at all (RFC 9000 §17.3.1).
             let start = 1 + self.local_cid.len();
             if dg.len() < start + 1 {
                 return Err(Error::wire("doq short header truncated"));
             }
-            let dcid = dg[1..start].to_vec();
+            let dcid = dg.slice_at(1, self.local_cid.len())?.to_vec();
             Ok(Some((
                 false,
                 None,
@@ -784,17 +853,20 @@ impl QuicConnection {
         // ServerHello Initial with the Handshake flight, so each packet
         // in the datagram is processed in turn.
         while !dg.is_empty() {
+            // The `is_empty` test above is what makes a first byte exist; the
+            // reads below are still checked ones, because everything after the
+            // first byte is a length the peer chose.
             trace(format_args!(
                 "recv {}B {:02x?}",
                 dg.len(),
-                &dg[..dg.len().min(24)]
+                capped(dg, 24)
             ));
-            let first = dg[0];
+            let first = dg
+                .first()
+                .copied()
+                .ok_or_else(|| Error::wire("doq empty datagram"))?;
             // Version negotiation packet (version 0 in a long header).
-            if first & 0x80 != 0
-                && dg.len() >= 5
-                && u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]) == 0
-            {
+            if first & 0x80 != 0 && dg.len() >= 5 && dg.u32_at(1)? == 0 {
                 self.closed = Some(Error::transport(
                     "doq server does not support QUIC version 1 (version negotiation)",
                 ));
@@ -804,7 +876,7 @@ impl QuicConnection {
             if first & 0x80 != 0
                 && (first >> 4) & 0x03 == 3
                 && dg.len() >= 5
-                && u32::from_be_bytes([dg[1], dg[2], dg[3], dg[4]]) == VERSION_1
+                && dg.u32_at(1)? == VERSION_1
             {
                 return self.process_retry(dg);
             }
@@ -866,16 +938,16 @@ impl QuicConnection {
             if !(1..=4).contains(&pn_len) {
                 return Ok(());
             }
-            let expected = self.largest_rx[space.idx()].wrapping_add(1);
-            let pn = packet::decode_pn(&packet[pn_offset..pn_offset + pn_len], expected, pn_len);
+            let expected = self.largest_rx.at(space).wrapping_add(1);
+            let pn = packet::decode_pn(packet.slice_at(pn_offset, pn_len)?, expected, pn_len);
             let payload_start = pn_offset + pn_len;
             if payload_start > payload_end {
                 return Ok(());
             }
             let plaintext = match key.open(
                 pn,
-                &packet[..payload_start],
-                &packet[payload_start..payload_end],
+                packet.slice_at(0, payload_start)?,
+                packet.slice_at(payload_start, payload_end - payload_start)?,
             ) {
                 Ok(p) => p,
                 Err(_) => {
@@ -887,36 +959,42 @@ impl QuicConnection {
                 "recv ok space={space:?} pn={pn} plaintext={}B",
                 plaintext.len()
             ));
-            if pn > self.largest_rx[space.idx()] {
-                self.largest_rx[space.idx()] = pn;
+            if pn > *self.largest_rx.at(space) {
+                *self.largest_rx.at_mut(space) = pn;
             }
             self.process_plaintext(space, pn, &plaintext)?;
             // Advance to the next coalesced packet, if any.
-            dg = &dg[payload_end..];
+            dg = dg.rest_at(payload_end)?;
         }
         Ok(())
     }
 
     fn process_retry(&mut self, dg: &[u8]) -> Result<()> {
-        if dg.len() < 7 + 20 {
+        // A Retry is `u8 first || u32 version || u8 dcid_len || dcid ||
+        // u8 scid_len || scid || token || 16-octet integrity tag`, with the tag
+        // last (RFC 9000 §17.2.5). Every offset below is derived from the tag
+        // position, so the length check first is not merely a fast path — it is
+        // what keeps `dg.len() - TAG_LEN` from underflowing.
+        if dg.len() < 7 + TAG_LEN {
             return Err(Error::wire("doq Retry packet truncated"));
         }
-        let dcid_len = dg[5] as usize;
+        let dcid_len = usize::from(dg.byte_at(5)?);
         let mut pos = 6usize;
         if dcid_len > 20 || pos + dcid_len + 1 > dg.len() {
             return Err(Error::wire("doq Retry malformed"));
         }
-        let dcid = dg[pos..pos + dcid_len].to_vec();
+        let dcid = dg.slice_at(pos, dcid_len)?.to_vec();
         pos += dcid_len;
-        let scid_len = dg[pos] as usize;
+        let scid_len = usize::from(dg.byte_at(pos)?);
         pos += 1;
-        if scid_len > 20 || pos + scid_len + 16 > dg.len() {
+        if scid_len > 20 || pos + scid_len + TAG_LEN > dg.len() {
             return Err(Error::wire("doq Retry malformed"));
         }
-        let scid = dg[pos..pos + scid_len].to_vec();
+        let scid = dg.slice_at(pos, scid_len)?.to_vec();
         pos += scid_len;
-        let tag = dg[dg.len() - 16..].to_vec();
-        let token = dg[pos..dg.len() - 16].to_vec();
+        let tag_at = dg.len() - TAG_LEN;
+        let tag = dg.slice_at(tag_at, TAG_LEN)?.to_vec();
+        let token = dg.slice_at(pos, tag_at - pos)?.to_vec();
         if dcid != self.local_cid {
             return Ok(()); // Retry for another connection
         }
@@ -925,7 +1003,7 @@ impl QuicConnection {
             return Err(self.closed.clone().unwrap());
         }
         // Verify the integrity tag (RFC 9001 §5.8).
-        let retry_wire = &dg[..dg.len() - 16];
+        let retry_wire = dg.slice_at(0, tag_at)?;
         let ok = protection::verify_retry_integrity(&self.original_dcid, retry_wire, &tag)
             .map_err(|e| Error::wire(format!("doq Retry integrity check failed: {e}")))?;
         if !ok {
@@ -947,11 +1025,11 @@ impl QuicConnection {
             .map_err(|e| Error::transport(format!("doq initial keys: {e}")))?;
         self.initial_read = PacketKey::initial(&self.server_cid, true)
             .map_err(|e| Error::transport(format!("doq initial keys: {e}")))?;
-        self.next_pn[Space::Initial.idx()] = 0;
-        self.largest_rx[Space::Initial.idx()] = 0;
-        self.pending_acks[Space::Initial.idx()].clear();
-        self.crypto_rx[0] = CryptoRx::default();
-        self.crypto_tx[0] = 0;
+        *self.next_pn.at_mut(Space::Initial) = 0;
+        *self.largest_rx.at_mut(Space::Initial) = 0;
+        self.pending_acks.at_mut(Space::Initial).clear();
+        *self.crypto_rx.at_mut(Space::Initial) = CryptoRx::default();
+        *self.crypto_tx.at_mut(Space::Initial) = 0;
         self.sent.retain(|p| p.space != Space::Initial);
         // Regenerate the ClientHello: a fresh ClientHandshake keeps the
         // transcript clean and lets the transport parameters carry the
@@ -971,7 +1049,7 @@ impl QuicConnection {
         self.tls_cfg = tls_cfg;
         self.tls = tls;
         self.send_crypto(Space::Initial, &ch, 0, true)?;
-        self.crypto_tx[0] = ch.len() as u64;
+        *self.crypto_tx.at_mut(Space::Initial) = ch.len() as u64;
         Ok(())
     }
 
@@ -979,7 +1057,7 @@ impl QuicConnection {
         let mut pos = 0usize;
         let mut ack_eliciting = false;
         while pos < plaintext.len() {
-            let (frame, used) = match Frame::decode(&plaintext[pos..]) {
+            let (frame, used) = match Frame::decode(plaintext.rest_at(pos)?) {
                 Ok(v) => v,
                 Err(_) => break, // malformed frame: ignore the rest
             };
@@ -1073,7 +1151,7 @@ impl QuicConnection {
             }
         }
         if ack_eliciting {
-            self.pending_acks[space.idx()].insert(pn);
+            self.pending_acks.at_mut(space).insert(pn);
         }
         Ok(())
     }
@@ -1131,16 +1209,18 @@ impl QuicConnection {
     }
 
     fn on_crypto(&mut self, space: Space, offset: u64, data: &[u8]) -> Result<()> {
-        let idx = match space {
-            Space::Initial => 0,
-            Space::Handshake => 1,
-            _ => return Ok(()),
-        };
-        self.crypto_rx[idx].insert(offset, data)?;
-        while let Some(msg) = self.crypto_rx[idx].pop_message() {
+        // A CRYPTO frame only exists in the Initial and Handshake spaces
+        // (RFC 9000 §19.6). One in the 1-RTT space is not something to
+        // reassemble, so it is ignored here exactly as an unknown frame type
+        // would be.
+        if space == Space::Application {
+            return Ok(());
+        }
+        self.crypto_rx.at_mut(space).insert(offset, data)?;
+        while let Some(msg) = self.crypto_rx.at_mut(space).pop_message() {
             trace(format_args!(
                 "crypto msg type={} len={} space={space:?}",
-                msg[0],
+                msg.first().copied().unwrap_or(0),
                 msg.len()
             ));
             if let Some(completed) = self.tls.feed(&msg)? {
@@ -1176,10 +1256,11 @@ impl QuicConnection {
                 self.send_crypto(
                     Space::Handshake,
                     &completed.client_finished,
-                    self.crypto_tx[1],
+                    *self.crypto_tx.at(Space::Handshake),
                     false,
                 )?;
-                self.crypto_tx[1] += completed.client_finished.len() as u64;
+                *self.crypto_tx.at_mut(Space::Handshake) +=
+                    completed.client_finished.len() as u64;
                 self.handshake_confirmed = true;
                 self.pto_count = 0;
                 trace(format_args!("handshake completed suite=0x{suite:04x}"));
@@ -1281,13 +1362,34 @@ impl QuicConnection {
         // The query response stream.
         let expected = self.query_rx.buf.len() as u64;
         if offset > expected {
-            // Out-of-order response data: buffer it for reassembly.
-            self.query_rx.buf.resize(offset as usize + data.len(), 0);
-            self.query_rx.buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+            // Out-of-order response data: pad the gap so the new bytes land at
+            // their real offset. `offset` is a u64 straight off the wire, so the
+            // target length is computed with checked arithmetic and compared
+            // against the cap *before* the allocation. Growing first and checking
+            // `buf.len()` afterwards — which is what this used to do — asks the
+            // allocator for whatever a peer felt like naming, and that is a
+            // remote out-of-memory, exactly the failure the length check was
+            // written to prevent.
+            let Some(end) = reassembly_end(offset, data.len(), MAX_RESPONSE_BUFFER) else {
+                self.closed = Some(Error::transport("doq response exceeds buffer limit"));
+                return Err(self.closed.clone().unwrap());
+            };
+            self.query_rx.buf.resize(end, 0);
+            // `end - data.len()` is where the new bytes start; it is not
+            // re-derived from `offset`, so the two cannot disagree.
+            let at = end - data.len();
+            let dst = self
+                .query_rx
+                .buf
+                .get_mut(at..)
+                .ok_or_else(|| Error::internal("doq reassembly window vanished"))?;
+            dst.copy_from_slice(data);
         } else {
-            let skip = (expected - offset) as usize;
-            if skip < data.len() {
-                self.query_rx.buf.extend_from_slice(&data[skip..]);
+            // Overlapping or duplicate data: keep only the part we do not have.
+            let skip = usize::try_from(expected - offset)
+                .map_err(|_| Error::internal("doq response offset overflow"))?;
+            if let Some(fresh) = data.get(skip..) {
+                self.query_rx.buf.extend_from_slice(fresh);
             }
         }
         if fin {
@@ -1380,15 +1482,26 @@ impl QuicConnection {
             let mut chunks = Vec::new();
             let mut sent = 0u64;
             while sent < allow {
-                let chunk_start = (q.offset + sent) as usize;
-                let chunk_end = (chunk_start + MAX_CHUNK).min(q.data.len());
-                let fin = q.offset + sent + (chunk_end - chunk_start) as u64 >= q.data.len() as u64;
-                chunks.push((
-                    q.offset + sent,
-                    q.data[chunk_start..chunk_end].to_vec(),
-                    fin,
-                ));
-                sent += (chunk_end - chunk_start) as u64;
+                let at = usize::try_from(q.offset + sent)
+                    .map_err(|_| Error::internal("doq query offset overflow"))?;
+                // The rest of the query from `at`. `allow` never exceeds what is
+                // left, so this read cannot run past the end — and if that
+                // reasoning is ever wrong, `get` says so instead of panicking in
+                // the middle of a write.
+                let rest = q
+                    .data
+                    .get(at..)
+                    .ok_or_else(|| Error::internal("doq query chunk starts past the end"))?;
+                let take = rest.len().min(MAX_CHUNK);
+                if take == 0 {
+                    // Unreachable while `allow` is bounded by what is left, but
+                    // a zero-length chunk would spin this loop forever, and a
+                    // hang is a denial of service too.
+                    return Err(Error::internal("doq query send made no progress"));
+                }
+                let fin = sent + take as u64 >= remaining;
+                chunks.push((q.offset + sent, capped(rest, MAX_CHUNK).to_vec(), fin));
+                sent += take as u64;
                 if fin {
                     break;
                 }
@@ -1470,6 +1583,21 @@ fn random_cid() -> Vec<u8> {
     cid.to_vec()
 }
 
+/// The reassembly-buffer length a `STREAM` frame with this `offset` and payload
+/// length demands, or `None` if that would exceed `cap`.
+///
+/// This is a separate function because it is the piece that has to be right.
+/// `offset` is a `u64` chosen by the peer, and the difference between checking
+/// the bound before allocating and checking it after is a remote
+/// out-of-memory: a server that opens a stream, writes one byte at offset 2^40,
+/// and closes it must cost nothing.
+fn reassembly_end(offset: u64, data_len: usize, cap: usize) -> Option<usize> {
+    let end = usize::try_from(offset)
+        .ok()?
+        .checked_add(data_len)?;
+    (end <= cap).then_some(end)
+}
+
 /// Build an ACK frame covering the given (ascending) packet numbers.
 ///
 /// RFC 9000 §19.3.1: a range `(gap, range_len)` acknowledges packets
@@ -1480,33 +1608,44 @@ fn random_cid() -> Vec<u8> {
 fn build_ack_frame(pns: &[u64]) -> Frame {
     let mut sorted: Vec<u64> = pns.to_vec();
     sorted.sort_unstable();
-    // Descending runs of consecutive packet numbers: (low, len).
+    // Descending runs of consecutive packet numbers, as `(low, len)`.
+    //
+    // The walk is an iterator rather than an index: `sorted` is a `Vec` whose
+    // length is a property of the input, so an index expression into it is a
+    // panic waiting for a caller whose packet numbers are not what this
+    // function assumed.
     let mut runs: Vec<(u64, u64)> = Vec::new();
-    let mut i = sorted.len();
-    while i > 0 {
-        let largest = sorted[i - 1];
+    let mut descending = sorted.iter().rev().peekable();
+    while let Some(&largest) = descending.next() {
+        // The run is `[largest - (len - 1), largest]`; extend it while the next
+        // number down is exactly one below the run's low end.
         let mut len = 1u64;
-        i -= 1;
-        while i > 0 && largest.checked_sub(len) == Some(sorted[i - 1]) {
+        while let Some(&&next) = descending.peek() {
+            if largest.checked_sub(len) != Some(next) {
+                break;
+            }
             len += 1;
-            i -= 1;
+            let _ = descending.next();
         }
-        runs.push((largest + 1 - len, len));
+        runs.push((largest - (len - 1), len));
     }
-    if runs.is_empty() {
+    let Some((top_low, top_len)) = runs.first().copied() else {
+        // Nothing to acknowledge. An ACK that acknowledges nothing is the only
+        // honest answer (RFC 9000 §19.3.1). `flush_acks` never asks for one,
+        // but a frame builder that can only be called correctly is a frame
+        // builder that panics the first time it is not.
         return Frame::Ack {
             largest_acked: 0,
             ack_delay: 0,
             ranges: vec![(0, 0)],
             ecn: None,
         };
-    }
-    let (top_low, top_len) = runs[0];
-    let largest_acked = top_low + top_len - 1;
+    };
+    let largest_acked = top_low + (top_len - 1);
     let mut ranges = vec![(0u64, top_len - 1)];
     let mut prev_low = top_low;
     for &(low, len) in runs.iter().skip(1) {
-        let run_largest = low + len - 1;
+        let run_largest = low + (len - 1);
         let gap = prev_low.saturating_sub(run_largest + 2);
         ranges.push((gap, len - 1));
         prev_low = low;
@@ -1541,6 +1680,23 @@ mod tests {
         let (decoded, used) = Frame::decode(&wire).unwrap();
         assert_eq!(used, wire.len());
         assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn a_reassembly_offset_cannot_ask_for_an_arbitrary_allocation() {
+        let cap = 1 << 20;
+        // Ordinary in-order and out-of-order frames.
+        assert_eq!(reassembly_end(0, 5, cap), Some(5));
+        assert_eq!(reassembly_end(5, 5, cap), Some(10));
+        assert_eq!(reassembly_end(cap as u64 - 1, 1, cap), Some(cap));
+        // One byte past the cap is refused, not clamped.
+        assert_eq!(reassembly_end(cap as u64, 1, cap), None);
+        assert_eq!(reassembly_end(cap as u64, 0, cap), Some(cap));
+        // The interesting cases: offsets that used to be turned into a
+        // `Vec::resize` before anything looked at the length.
+        assert_eq!(reassembly_end(1 << 40, 1, cap), None, "terabyte offset");
+        assert_eq!(reassembly_end(u64::MAX, 1, cap), None, "offset + len wraps");
+        assert_eq!(reassembly_end(u64::MAX, 0, cap), None, "offset alone");
     }
 
     #[test]

@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 use core::fmt;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar};
+use std::time::{Duration, Instant};
+
+use crate::sync::Mutex;
 
 use crate::alias::{AliasConfig, AliasGraph};
 use crate::cache::{CacheConfig, CacheKey, EntryKind, LookupOutcome, SemanticCache};
@@ -38,6 +41,30 @@ pub struct EngineConfig {
     pub root_servers: Vec<std::net::SocketAddr>,
     /// Per-attempt exchange timeout in ms.
     pub timeout_ms: u64,
+    /// Wall-clock budget for one client query, in ms, covering the whole
+    /// delegated tree it spawns: referrals, out-of-bailiwick NS address
+    /// lookups, and CNAME/DNAME chains.
+    ///
+    /// This is a *different* bound from [`Self::timeout_ms`], and it is the one
+    /// that makes the worst case finite. A resolution is a tree — the top-level
+    /// question is delegated to a zone, that zone's name servers may live in
+    /// another zone, and resolving their addresses starts another walk from the
+    /// root. Without a shared budget each level owns a fresh
+    /// `timeout × attempts × servers` allowance, so the wall clock multiplies
+    /// with the nesting. With it, nested work spends the same budget.
+    pub query_budget_ms: u64,
+    /// The port used for authoritative servers discovered *during* a
+    /// resolution: the address in a referral's glue, or the address an NS name
+    /// resolves to. Root servers are unaffected — their addresses, ports
+    /// included, come from [`Self::root_servers`].
+    ///
+    /// Every real deployment wants 53. The knob exists because without it the
+    /// iterative walk cannot be tested: the next hop of a referral would always
+    /// be `ip:53`, so a hermetic test would have to bind a privileged port to
+    /// stand up a fake delegation, which CI cannot do. Making it configurable
+    /// turns "can a referral chain be driven end to end with no network?" from
+    /// a manual check into a test that runs everywhere.
+    pub auth_port: u16,
     /// Attempts per server before moving on.
     pub max_attempts_per_server: u32,
     /// RFC 9156 QNAME minimization.
@@ -73,6 +100,8 @@ impl Default for EngineConfig {
         Self {
             root_servers: Vec::new(),
             timeout_ms: 1500,
+            query_budget_ms: 20_000,
+            auth_port: 53,
             max_attempts_per_server: 2,
             qname_minimization: true,
             use_0x20: true,
@@ -88,6 +117,57 @@ impl Default for EngineConfig {
             #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
             forwarders: Vec::new(),
         }
+    }
+}
+
+/// The wall-clock budget of one client query and everything it spawns.
+///
+/// A resolution is a tree, not a loop: the top-level question is delegated to a
+/// zone, that zone's name servers may live in another zone (out-of-bailiwick
+/// NS), and resolving *their* addresses starts another walk from the root. Each
+/// level used to own a fresh `timeout × attempts × servers` allowance, so the
+/// wall clock grew with the nesting — `ietf.org`, whose `org` delegation is
+/// served by off-zone name servers, would sit for minutes while every level
+/// spent its own allowance.
+///
+/// The deadline is created once per client query and passed down, so nested work
+/// spends the same budget instead of a new one. It is deliberately *only* a time
+/// bound: depth stays bounded by `max_ns_depth`, `max_cname_depth` and
+/// `max_referrals`, so a pathological tree is still cut off by structure as well
+/// as by the clock.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    at: Instant,
+}
+
+impl Deadline {
+    /// A budget of `ms` milliseconds from now.
+    fn after(ms: u64) -> Self {
+        let at = Instant::now()
+            .checked_add(Duration::from_millis(ms))
+            // Only a misconfiguration gets here; a deadline so far out it
+            // overflows is better read as "no practical deadline".
+            .unwrap_or_else(Instant::now);
+        Self { at }
+    }
+
+    /// Whether the budget is spent.
+    fn expired(&self) -> bool {
+        Instant::now() >= self.at
+    }
+
+    /// The timeout for one exchange: `configured`, clipped to what is left of
+    /// the budget. `None` once the budget is spent.
+    fn attempt_timeout_ms(&self, configured: u64) -> Option<u64> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+        // Never hand out a zero timeout: a sub-millisecond remainder should
+        // still let one last exchange complete rather than fail the query
+        // because the clock was mid-tick.
+        Some(ms.min(configured).max(1))
     }
 }
 
@@ -340,19 +420,57 @@ fn parse_in_addr_arpa(name: &Name) -> Option<Ipv4Addr> {
     if labels.len() != 6 {
         return None;
     }
-    if !labels[4].eq_ignore_ascii_case(b"in-addr") || !labels[5].eq_ignore_ascii_case(b"arpa") {
+    if !labels.get(4)?.eq_ignore_ascii_case(b"in-addr")
+        || !labels.get(5)?.eq_ignore_ascii_case(b"arpa")
+    {
         return None;
     }
     let mut octets = [0u8; 4];
-    for (i, label) in labels[..4].iter().enumerate() {
+    // Labels run least significant first, so the label sequence fills the
+    // octet array from its end backwards — which is also what says the
+    // offsets are right without computing them.
+    for (slot, label) in octets.iter_mut().rev().zip(labels.iter().take(4)) {
         let s = core::str::from_utf8(label).ok()?;
         if s.is_empty() || s.len() > 3 || (s.len() > 1 && s.starts_with('0')) {
             return None;
         }
-        // Labels run least-significant first.
-        octets[3 - i] = s.parse().ok()?;
+        *slot = s.parse().ok()?;
     }
     Some(Ipv4Addr::from(octets))
+}
+
+/// Parse an `ip6.arpa` reverse name into the address it stands for.
+///
+/// `1.0.0.0.….ip6.arpa` is `::1`: 32 nibble labels, least significant first.
+/// Returns `None` for anything else, including the v4 form, which
+/// [`parse_in_addr_arpa`] handles.
+///
+/// Each label must be exactly one hex digit. A label like `00` or `0x1` is not
+/// something a resolver ever emits, so accepting it would be inventing an
+/// equivalence rather than reading one.
+fn parse_ip6_arpa(name: &Name) -> Option<Ipv6Addr> {
+    let labels = name.labels();
+    // 32 nibbles, then `ip6`, then `arpa`.
+    if labels.len() != 34 {
+        return None;
+    }
+    if !labels.get(32)?.eq_ignore_ascii_case(b"ip6") || !labels.get(33)?.eq_ignore_ascii_case(b"arpa")
+    {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    for (i, label) in labels.iter().take(32).enumerate() {
+        // Exactly one hex digit per label, checked just above.
+        if label.len() != 1 {
+            return None;
+        }
+        let digit = (*label.first()? as char).to_digit(16)? as u8;
+        // Labels run least significant first, and each label is half a byte.
+        let nibble = 31 - i;
+        let slot = octets.get_mut(nibble / 2)?;
+        *slot |= digit << (4 * (1 - nibble % 2));
+    }
+    Some(Ipv6Addr::from(octets))
 }
 
 /// Shared resolver state (everything behind locks).
@@ -394,8 +512,8 @@ impl fmt::Debug for SharedState {
 /// Format one table's length without ever blocking on its lock.
 fn gauge<T>(lock: &Mutex<T>, len: impl Fn(&T) -> usize) -> alloc::string::String {
     match lock.try_lock() {
-        Ok(guard) => alloc::format!("{}", len(&guard)),
-        Err(_) => "<busy>".to_string(),
+        Some(guard) => alloc::format!("{}", len(&guard)),
+        None => "<busy>".to_string(),
     }
 }
 
@@ -453,7 +571,7 @@ impl Slot {
     /// Publish the outcome and wake every waiter. Idempotent: the first
     /// result wins, so a late publish cannot overwrite an earlier one.
     fn publish(&self, r: Result<Resolution>) {
-        let mut guard = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.result.lock();
         if guard.is_none() {
             *guard = Some(r);
             self.done.store(true, Ordering::Release);
@@ -464,7 +582,7 @@ impl Slot {
 
     /// Block until the owner publishes.
     fn read(&self) -> Result<Resolution> {
-        let mut guard = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.result.lock();
         loop {
             if let Some(r) = guard.as_ref() {
                 return r.clone();
@@ -505,7 +623,7 @@ impl Owner {
     /// the entry is reaped later by [`Inflight::claim`], which notices the
     /// slot is done; the table is bounded either way.
     fn release(&self) {
-        if let Ok(mut inflight) = self.inner.inflight.try_lock() {
+        if let Some(mut inflight) = self.inner.inflight.try_lock() {
             inflight.slots.remove(&self.key);
         }
     }
@@ -655,7 +773,7 @@ impl Resolver {
         if let Some(p) = &config.persist {
             let now = clock.now();
             let _ = crate::cache::persist::load_from_limit(
-                &mut shared.cache.lock().unwrap(),
+                &mut shared.cache.lock(),
                 &p.path,
                 now,
                 p.frame_limit,
@@ -707,7 +825,7 @@ impl Resolver {
     /// periodic reseeding additionally bounds what an *on-path* observer
     /// (e.g. a server we query) can learn about the stream and predict.
     fn with_rng<T>(&self, f: impl FnOnce(&mut SplitMix64) -> T) -> T {
-        let mut rng = self.inner.rng.lock().unwrap();
+        let mut rng = self.inner.rng.lock();
         let draws = self.inner.rng_draws.fetch_add(1, Ordering::Relaxed);
         if draws % RNG_RESEED_EVERY == 0 {
             rng.reseed(crate::entropy::seed_u64());
@@ -734,7 +852,7 @@ impl Resolver {
         for f in &self.inner.config.engine.forwarders {
             fs.add(f.clone());
         }
-        *self.inner.forwarder_set.lock().unwrap() = fs;
+        *self.inner.forwarder_set.lock() = fs;
     }
 
     /// The wall clock this resolver uses.
@@ -818,14 +936,12 @@ impl Resolver {
             .shared
             .estimator
             .lock()
-            .unwrap()
             .observe_query(&key.name, now);
 
         let claim = self
             .inner
             .inflight
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .claim(key, &self.inner);
         let owner = match claim {
             Claim::Waiter(slot) => {
@@ -835,7 +951,9 @@ impl Resolver {
             Claim::Owner(owner) => owner,
         };
 
-        let result = self.resolve_inner(key, 0);
+        // One budget for this client query and everything it spawns.
+        let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
+        let result = self.resolve_inner(key, 0, deadline);
         owner.publish(result.clone());
 
         let elapsed = started.elapsed().as_micros() as u64;
@@ -865,9 +983,12 @@ impl Resolver {
     ///   reverse-resolves a synthetic address hits the public DNS and gets
     ///   either NXDOMAIN or an unrelated real name, which is a bad thing to
     ///   hand to a proxy that is about to route on it.
-    /// * **`fake_ip` forward** — `A` is synthesized; `AAAA` is answered
-    ///   NODATA, because in fake-IP mode a real IPv6 address would let the
-    ///   client dial the host directly and escape the proxy.
+    /// * **`fake_ip` forward** — `A` is synthesized from the v4 space.
+    ///   `AAAA` is synthesized from the v6 space **when `fake-ip-range6` is
+    ///   configured**, and answered NODATA when it is not: a real IPv6
+    ///   address would let the client dial the host directly and escape the
+    ///   proxy, and so would a synthetic one with no pool behind it to
+    ///   reverse.
     ///
     /// Returns `None` when the layer has nothing to say — which includes a
     /// name excluded by `fake-ip-filter`, and every name when fake-IP mode is
@@ -890,9 +1011,16 @@ impl Resolver {
         }
 
         let settings = self.inner.config.dns.fake_ip.as_ref()?;
+
+        // Reverse first, and keyed on the address rather than the name. An
+        // address the pool handed out earlier is still the pool's to explain
+        // even if the name has since been filtered out of fake-IP.
         if key.rr_type == RrType::PTR {
-            let ip = parse_in_addr_arpa(&key.name)?;
-            let mut guard = self.inner.shared.fake_ip.lock().unwrap();
+            let ip = match parse_in_addr_arpa(&key.name) {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(parse_ip6_arpa(&key.name)?),
+            };
+            let mut guard = self.inner.shared.fake_ip.lock();
             let pool = guard.as_mut()?;
             let owner = pool.lookup(ip, now)?;
             self.inner.stats.fake_ip_ptr.fetch_add(1, Ordering::Relaxed);
@@ -910,17 +1038,26 @@ impl Resolver {
             });
         }
 
-        match key.rr_type {
-            RrType::A => {}
-            // A real `AAAA` would escape the proxy; see the doc comment.
-            RrType::AAAA => return Some(empty_answer(key, settings.answer_ttl(), now)),
+        // Which families get a synthetic answer is configuration, not a
+        // property of the query: a v6 range turns `AAAA` into a synthesized
+        // answer, and its absence keeps the NODATA answer that pushes a
+        // dual-stack client onto the v4 address it was already given.
+        let family = match key.rr_type {
+            RrType::A => crate::fakeip::Family::V4,
+            RrType::AAAA => crate::fakeip::Family::V6,
             _ => return None,
+        };
+        if !settings.synthesizes(family) {
+            // A *decided* NODATA, not a miss: falling through to the network
+            // here is exactly how a client escapes the proxy over IPv6.
+            return Some(empty_answer(key, settings.answer_ttl(), now));
         }
 
-        let mut guard = self.inner.shared.fake_ip.lock().unwrap();
+        let mut guard = self.inner.shared.fake_ip.lock();
         let pool = guard.as_mut()?;
-        let ip = match pool.allocate(&key.name, now) {
+        let ip = match pool.allocate(&key.name, family, now) {
             Ok(crate::fakeip::Allocation::Address(ip)) => ip,
+            // Excluded by `fake-ip-filter`: resolve it for real.
             Ok(crate::fakeip::Allocation::Filtered) => {
                 self.inner
                     .stats
@@ -928,6 +1065,8 @@ impl Resolver {
                     .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
+            // The pool could not allocate. A real answer beats no answer, so
+            // this degrades to normal resolution rather than failing.
             Err(_) => return None,
         };
         self.inner
@@ -935,14 +1074,20 @@ impl Resolver {
             .fake_ip_answered
             .fetch_add(1, Ordering::Relaxed);
         let ttl = settings.answer_ttl();
+        // The record type follows the family, so an address from the v6 space
+        // can never be serialized into an `A` record.
+        let rdata = match ip {
+            IpAddr::V4(v4) => RData::A(v4),
+            IpAddr::V6(v6) => RData::Aaaa(v6),
+        };
         Some(Resolution {
             ttl,
             answers: vec![Record {
                 name: key.name.clone(),
-                rr_type: RrType::A,
+                rr_type: key.rr_type,
                 class: RrClass::IN,
                 ttl,
-                rdata: RData::A(ip),
+                rdata,
             }],
             ..empty_answer(key, ttl, now)
         })
@@ -961,7 +1106,7 @@ impl Resolver {
         }
         if let Some(ip) = client_ip {
             let allowed = {
-                let mut lim = self.inner.shared.client_limiter.lock().unwrap();
+                let mut lim = self.inner.shared.client_limiter.lock();
                 self.inner.policy.client_allowed(&mut lim, &ip, now)
             };
             if !allowed {
@@ -1053,7 +1198,12 @@ impl Resolver {
     // Internal resolution
     // -----------------------------------------------------------------
 
-    fn resolve_inner(&self, key: &QueryKey, ns_depth: usize) -> Result<Resolution> {
+    fn resolve_inner(
+        &self,
+        key: &QueryKey,
+        ns_depth: usize,
+        deadline: Deadline,
+    ) -> Result<Resolution> {
         let now = self.inner.clock.now();
 
         // Cache-first path.
@@ -1070,10 +1220,10 @@ impl Resolver {
         let mut res = if self.forward_route(key).is_some() {
             self.forward_resolve(key)?
         } else {
-            self.iterative_resolve(key, ns_depth)?
+            self.iterative_resolve(key, ns_depth, deadline)?
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
-        let mut res = self.iterative_resolve(key, ns_depth)?;
+        let mut res = self.iterative_resolve(key, ns_depth, deadline)?;
         res.served_at = now;
 
         #[cfg(feature = "dnssec")]
@@ -1161,7 +1311,7 @@ impl Resolver {
             )
         });
         let bytes = query.to_bytes()?;
-        let resp = self.inner.forwarder_set.lock().unwrap().exchange_with(
+        let resp = self.inner.forwarder_set.lock().exchange_with(
             group,
             &query,
             &bytes,
@@ -1202,7 +1352,6 @@ impl Resolver {
                 .shared
                 .cache
                 .lock()
-                .unwrap()
                 .lookup(&cache_key, now);
             match outcome {
                 LookupOutcome::Fresh(entry) => {
@@ -1243,7 +1392,7 @@ impl Resolver {
                     let plan = planner.plan(
                         &LookupOutcome::Stale(entry.clone()),
                         now,
-                        &self.inner.shared.estimator.lock().unwrap(),
+                        &self.inner.shared.estimator.lock(),
                     );
                     if plan == crate::planner::Plan::Resolve {
                         return None;
@@ -1286,7 +1435,7 @@ impl Resolver {
                     target, ttl_secs, ..
                 } => {
                     let ck = CacheKey::plain(current.name.clone(), RrType::CNAME, current.class);
-                    match self.inner.shared.cache.lock().unwrap().lookup(&ck, now) {
+                    match self.inner.shared.cache.lock().lookup(&ck, now) {
                         LookupOutcome::Fresh(e) => {
                             validated &= e.validated;
                             if let EntryKind::Positive(rrset) = e.kind {
@@ -1346,7 +1495,12 @@ impl Resolver {
     }
 
     /// The iterative resolution loop (root → TLD → authoritative).
-    fn iterative_resolve(&self, key: &QueryKey, ns_depth: usize) -> Result<Resolution> {
+    fn iterative_resolve(
+        &self,
+        key: &QueryKey,
+        ns_depth: usize,
+        deadline: Deadline,
+    ) -> Result<Resolution> {
         let now = self.inner.clock.now();
         let mut current_name = key.name.clone();
         let current_type = key.rr_type;
@@ -1363,6 +1517,17 @@ impl Resolver {
         let mut minimized: Option<Name> = None;
 
         loop {
+            // The budget covers the whole tree, so a nested walk that has spent
+            // it stops here instead of starting another round of referrals.
+            if deadline.expired() {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "query budget of {} ms exhausted during resolution",
+                        self.inner.config.engine.query_budget_ms
+                    ),
+                ));
+            }
             if depth > self.inner.config.engine.max_cname_depth {
                 return Err(Error::internal("CNAME/DNAME loop during resolution"));
             }
@@ -1373,7 +1538,7 @@ impl Resolver {
             // Cache check during CNAME chasing.
             if depth > 0 {
                 let ck = CacheKey::plain(current_name.clone(), current_type, key.class);
-                match self.inner.shared.cache.lock().unwrap().lookup(&ck, now) {
+                match self.inner.shared.cache.lock().lookup(&ck, now) {
                     LookupOutcome::Fresh(entry) => {
                         if let EntryKind::Positive(rrset) = entry.kind {
                             ttl = ttl.min(rrset.ttl);
@@ -1398,10 +1563,19 @@ impl Resolver {
                 }
             };
 
-            let (resp, rtt_ms) = self.query_servers(&servers, &query_name, current_type, key)?;
+            let (resp, rtt_ms) = self.query_servers(
+                &servers,
+                &query_name,
+                current_type,
+                key,
+                deadline,
+                // A minimized prefix may legitimately come back bare; the
+                // full name may not.
+                query_name == current_name,
+            )?;
 
             {
-                let mut est = self.inner.shared.estimator.lock().unwrap();
+                let mut est = self.inner.shared.estimator.lock();
                 est.observe_upstream(&zone, rtt_ms as f64);
             }
 
@@ -1444,13 +1618,11 @@ impl Resolver {
                         .shared
                         .estimator
                         .lock()
-                        .unwrap()
                         .score_inputs(&current_name, now);
                     self.inner
                         .shared
                         .cache
                         .lock()
-                        .unwrap()
                         .insert_positive(&ck, set, now, inputs, false);
                     self.link_alias(&current_name, &target, current_type, key.class, now);
                     if !target.is_subdomain_of(&zone) || zone == Name::root() {
@@ -1489,7 +1661,7 @@ impl Resolver {
                             ttl = ttl.min(negative_ttl(s));
                         }
                         let soa_ttl = soa.as_ref().map(negative_ttl).unwrap_or(0);
-                        let mut cache = self.inner.shared.cache.lock().unwrap();
+                        let mut cache = self.inner.shared.cache.lock();
                         cache.insert_nxdomain(&query_name, r, soa.clone(), soa_ttl, now);
                         break;
                     }
@@ -1500,10 +1672,9 @@ impl Resolver {
                         .shared
                         .estimator
                         .lock()
-                        .unwrap()
                         .score_inputs(&query_name, now);
                     {
-                        let mut cache = self.inner.shared.cache.lock().unwrap();
+                        let mut cache = self.inner.shared.cache.lock();
                         let ck = CacheKey::plain(query_name.clone(), current_type, key.class);
                         cache.insert_negative(&ck, r, soa.clone(), soa_ttl, now, inputs);
                     }
@@ -1540,7 +1711,7 @@ impl Resolver {
                         .collect();
                     // Cache the NS RRset and in-bailiwick glue.
                     {
-                        let mut cache = self.inner.shared.cache.lock().unwrap();
+                        let mut cache = self.inner.shared.cache.lock();
                         let ns_set =
                             RrSet::from_records(ns.clone(), self.inner.config.cache.max_ttl_cap)
                                 .map_err(|e| Error::internal(e.msg))?;
@@ -1550,7 +1721,6 @@ impl Resolver {
                             .shared
                             .estimator
                             .lock()
-                            .unwrap()
                             .score_inputs(&new_zone, now);
                         cache.insert_positive(&nsk, ns_set, now, inputs, false);
                         for g in &glue {
@@ -1576,17 +1746,21 @@ impl Resolver {
                             continue;
                         }
                         match g.rdata {
-                            RData::A(ip) => {
-                                endpoints.push(Endpoint::new(ip.into(), 53, Proto::Udp))
-                            }
-                            RData::Aaaa(ip) => {
-                                endpoints.push(Endpoint::new(ip.into(), 53, Proto::Udp))
-                            }
+                            RData::A(ip) => endpoints.push(Endpoint::new(
+                                ip.into(),
+                                self.inner.config.engine.auth_port,
+                                Proto::Udp,
+                            )),
+                            RData::Aaaa(ip) => endpoints.push(Endpoint::new(
+                                ip.into(),
+                                self.inner.config.engine.auth_port,
+                                Proto::Udp,
+                            )),
                             _ => {}
                         }
                     }
                     if endpoints.is_empty() {
-                        endpoints = self.resolve_ns_addresses(&ns_names, ns_depth)?;
+                        endpoints = self.resolve_ns_addresses(&ns_names, ns_depth, deadline)?;
                     }
                     dedup_endpoints(&mut endpoints);
                     if endpoints.is_empty() {
@@ -1628,15 +1802,30 @@ impl Resolver {
     }
 
     /// Resolve the addresses of NS names for the next delegation level.
-    fn resolve_ns_addresses(&self, ns_names: &[Name], ns_depth: usize) -> Result<Vec<Endpoint>> {
+    fn resolve_ns_addresses(
+        &self,
+        ns_names: &[Name],
+        ns_depth: usize,
+        deadline: Deadline,
+    ) -> Result<Vec<Endpoint>> {
         if ns_depth >= self.inner.config.engine.max_ns_depth {
             return Ok(Vec::new());
         }
         let mut endpoints = Vec::new();
         for ns in ns_names {
-            if let Some(ips) = self.resolve_host_addresses(ns, ns_depth + 1) {
+            // Checking per name is what makes the wall clock finite: an
+            // out-of-bailiwick delegation costs a full walk per name server,
+            // and a zone may list several.
+            if deadline.expired() {
+                break;
+            }
+            if let Some(ips) = self.resolve_host_addresses(ns, ns_depth + 1, deadline) {
                 for ip in ips {
-                    endpoints.push(Endpoint::new(ip, 53, Proto::Udp));
+                    endpoints.push(Endpoint::new(
+                        ip,
+                        self.inner.config.engine.auth_port,
+                        Proto::Udp,
+                    ));
                 }
             }
             if endpoints.len() >= 16 {
@@ -1664,7 +1853,12 @@ impl Resolver {
     ///   make the resolver send its own queries to an address that is not a
     ///   server — the resolver would be querying itself. So fake-IP is
     ///   deliberately *not* consulted on this path, in either mode.
-    fn resolve_host_addresses(&self, name: &Name, ns_depth: usize) -> Option<Vec<IpAddr>> {
+    fn resolve_host_addresses(
+        &self,
+        name: &Name,
+        ns_depth: usize,
+        deadline: Deadline,
+    ) -> Option<Vec<IpAddr>> {
         let hosts = &self.inner.config.dns.hosts;
         if hosts.contains(name) {
             let mut out = Vec::new();
@@ -1683,7 +1877,6 @@ impl Resolver {
             return if out.is_empty() { None } else { Some(out) };
         }
 
-        let now = self.inner.clock.now();
         let mut out = Vec::new();
         for t in [RrType::A, RrType::AAAA] {
             let key = QueryKey {
@@ -1694,7 +1887,7 @@ impl Resolver {
                 want_dnssec: false,
                 cd: false,
             };
-            if let Ok(res) = self.resolve_inner(&key, ns_depth) {
+            if let Ok(res) = self.resolve_inner(&key, ns_depth, deadline) {
                 for r in res.answers {
                     match r.rdata {
                         RData::A(ip) => out.push(IpAddr::V4(ip)),
@@ -1707,7 +1900,6 @@ impl Resolver {
                 break;
             }
         }
-        let _ = now;
         if out.is_empty() {
             None
         } else {
@@ -1723,13 +1915,20 @@ impl Resolver {
         qname: &Name,
         qtype: RrType,
         key: &QueryKey,
+        deadline: Deadline,
+        // Whether a response that carries nothing at all should be treated as
+        // "this server did not answer" and the next one tried. True when the
+        // query is for the full name, where such a response is useless; false
+        // for a QNAME-minimization prefix, where a bare response is the signal
+        // to query one label deeper and must reach the caller.
+        skip_empty: bool,
     ) -> Result<(Message, u64)> {
         if servers.is_empty() {
             return Err(Error::new(ErrorKind::NoUpstream, "no servers to query"));
         }
         let now = self.inner.clock.now();
         let ranked = {
-            let sel = self.inner.shared.selector.lock().unwrap();
+            let sel = self.inner.shared.selector.lock();
             sel.sort_by_cost(servers, now, self.inner.config.engine.retransmit_budget)
         };
 
@@ -1739,6 +1938,9 @@ impl Resolver {
             .len()
             .min(self.inner.config.engine.max_servers_tried.max(1));
         for (endpoint, _) in ranked.into_iter().take(max_servers) {
+            if deadline.expired() {
+                break;
+            }
             let mut attempts = 0u32;
             while attempts < self.inner.config.engine.max_attempts_per_server {
                 if total_attempts >= self.inner.config.engine.max_total_attempts {
@@ -1769,11 +1971,21 @@ impl Resolver {
                     )
                 });
 
+                // The attempt timeout is `timeout_ms` clipped to what is left
+                // of the shared budget, so the last exchange cannot run past
+                // the deadline. `None` means the budget is already gone, and
+                // the outer loop's own check then ends the search.
+                let Some(attempt_ms) =
+                    deadline.attempt_timeout_ms(self.inner.config.engine.timeout_ms)
+                else {
+                    break;
+                };
+
                 let t0 = Instant::now();
                 let resp_bytes = match self.inner.transports.exchange(
                     &endpoint,
                     &q.bytes,
-                    self.inner.config.engine.timeout_ms,
+                    attempt_ms,
                 ) {
                     Ok(b) => b,
                     Err(e) => {
@@ -1786,7 +1998,6 @@ impl Resolver {
                             .shared
                             .selector
                             .lock()
-                            .unwrap()
                             .record_timeout(endpoint, now);
                         continue;
                     }
@@ -1815,11 +2026,11 @@ impl Resolver {
                     if let Ok(b) = self.inner.transports.exchange(
                         &tcp_ep,
                         &q.bytes,
-                        self.inner.config.engine.timeout_ms,
+                        attempt_ms,
                     ) {
                         if let Ok(m) = Message::parse(&b) {
                             if response_matches_query(&query_msg, &m) {
-                                self.inner.shared.selector.lock().unwrap().record_success(
+                                self.inner.shared.selector.lock().record_success(
                                     tcp_ep,
                                     rtt_ms as f64,
                                     now,
@@ -1830,25 +2041,68 @@ impl Resolver {
                     }
                 }
 
-                if msg.flags.rcode == Rcode::SERVFAIL {
+                // A NOERROR response with no records in any section is not an
+                // answer, a referral, or a negative answer — RFC 2308 §2.2
+                // requires the SOA for the latter — so there is nothing in it
+                // to give the client. Delivering it would end the walk at
+                // whatever the first-ranked server happened to say, which is how
+                // one broken or intercepting resolver stops a whole resolution.
+                //
+                // The `NOERROR` test is load-bearing: a non-zero rcode *is* the
+                // answer's content. NXDOMAIN in particular routinely arrives
+                // with every section empty, and discarding it here would turn
+                // "this name does not exist" into "no server answered".
+                if skip_empty
+                    && msg.flags.rcode == Rcode::NOERROR
+                    && msg.answers.is_empty()
+                    && msg.authorities.is_empty()
+                    && msg.additionals.is_empty()
+                {
                     self.inner.stats.servfails.fetch_add(1, Ordering::Relaxed);
                     self.inner
                         .shared
                         .selector
                         .lock()
-                        .unwrap()
+                        .record_servfail(endpoint, now);
+                    last_err = Some(Error::new(
+                        ErrorKind::Servfail,
+                        "upstream answered with an empty message",
+                    ));
+                    continue;
+                }
+
+                // SERVFAIL, REFUSED, NOTIMP and FORMERR all mean "this server
+                // did not answer the query". Treating only SERVFAIL that way is
+                // a logic hole, not a style point: REFUSED carries no answer
+                // section, so `classify_response` reads it as `Empty`, and an
+                // `Empty` response at the full query name is a hard error — so
+                // one uncooperative server out of a zone's thirteen would end
+                // the whole resolution instead of the next server being tried.
+                // A recursive query has no legitimate REFUSED/NOTIMP/FORMERR
+                // answer to pass on either way.
+                if matches!(
+                    msg.flags.rcode,
+                    Rcode::SERVFAIL | Rcode::REFUSED | Rcode::NOTIMP | Rcode::FORMERR
+                ) {
+                    self.inner.stats.servfails.fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .shared
+                        .selector
+                        .lock()
                         .record_servfail(endpoint, now);
                     self.inner
                         .shared
                         .estimator
                         .lock()
-                        .unwrap()
                         .observe_failure(qname);
-                    last_err = Some(Error::new(ErrorKind::Servfail, "upstream SERVFAIL"));
+                    last_err = Some(Error::new(
+                        ErrorKind::Servfail,
+                        format!("upstream answered {}", msg.flags.rcode),
+                    ));
                     continue;
                 }
 
-                self.inner.shared.selector.lock().unwrap().record_success(
+                self.inner.shared.selector.lock().record_success(
                     endpoint,
                     rtt_ms as f64,
                     now,
@@ -1874,9 +2128,8 @@ impl Resolver {
             .shared
             .estimator
             .lock()
-            .unwrap()
             .score_inputs(&res.name, now);
-        let mut cache = self.inner.shared.cache.lock().unwrap();
+        let mut cache = self.inner.shared.cache.lock();
         for ((name, rr_type), recs) in groups {
             if rr_type == RrType::RRSIG {
                 continue;
@@ -1955,8 +2208,7 @@ impl Resolver {
                 .inner
                 .shared
                 .cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock();
             if !cache.mark_refreshing(key) {
                 return false;
             }
@@ -1966,7 +2218,6 @@ impl Resolver {
                 .shared
                 .cache
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .clear_refreshing(key);
             return false;
         }
@@ -1985,7 +2236,6 @@ impl Resolver {
                             .shared
                             .cache
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
                             .record_refresh_failure(&key, now);
                     }
                 }
@@ -2027,7 +2277,6 @@ impl Resolver {
             .shared
             .aliases
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .link(&alias, &data, now);
     }
 
@@ -2047,7 +2296,6 @@ impl Resolver {
             .shared
             .aliases
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .dependents(key);
         let mut queued = 0usize;
         for dep_key in dependents {
@@ -2075,7 +2323,13 @@ impl Resolver {
             want_dnssec: self.inner.config.engine.dnssec,
             cd: false,
         };
-        let res = self.resolve_inner(&qk, 0)?;
+        let res = self.resolve_inner(
+            &qk,
+            0,
+            // A background refresh is its own query and gets its own budget;
+            // it is not a client waiting on a reply.
+            Deadline::after(self.inner.config.engine.query_budget_ms),
+        )?;
         let now = self.inner.clock.now();
         self.cache_resolution(&qk, &res, now);
         Ok(())
@@ -2131,15 +2385,13 @@ impl Resolver {
                     .shared
                     .cache
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
                     .sweep(now);
                 {
                     let mut aliases = r
                         .inner
                         .shared
                         .aliases
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .lock();
                     aliases.prune(now, 0);
                     r.inner
                         .stats
@@ -2158,8 +2410,7 @@ impl Resolver {
                         .inner
                         .shared
                         .fake_ip
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .lock();
                     if let Some(pool) = guard.as_mut() {
                         pool.cleanup_expired(now);
                         r.inner
@@ -2177,14 +2428,12 @@ impl Resolver {
                         .inner
                         .shared
                         .cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .lock();
                     let est = r
                         .inner
                         .shared
                         .estimator
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .lock();
                     cache.prefetch_candidates(now, |apex, horizon| {
                         est.probability(apex, now, horizon)
                     })
@@ -2242,7 +2491,7 @@ impl Resolver {
         };
         let now = self.inner.clock.now();
         let unix = (now / 1_000_000_000) as i64;
-        let cache = self.inner.shared.cache.lock().unwrap();
+        let cache = self.inner.shared.cache.lock();
         crate::cache::persist::save_to(&cache, &p.path, unix)?;
         Ok(cache.len())
     }
@@ -2251,7 +2500,9 @@ impl Resolver {
 impl Resolver {
     /// Resolve the addresses of a name directly (used by tests).
     pub fn resolve_addresses(&self, name: &Name) -> Vec<IpAddr> {
-        self.resolve_host_addresses(name, 0).unwrap_or_default()
+        let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
+        self.resolve_host_addresses(name, 0, deadline)
+            .unwrap_or_default()
     }
 }
 
@@ -2269,7 +2520,7 @@ fn minimized_name(qname: &Name, zone: &Name) -> Name {
     let skip = nlabels - keep;
     let labels = qname.labels();
     let mut out: Vec<u8> = Vec::with_capacity(64);
-    for l in &labels[skip..] {
+    for l in labels.iter().skip(skip) {
         out.push(l.len() as u8);
         out.extend_from_slice(l);
     }
@@ -2292,7 +2543,7 @@ fn deepen_minimized(qname: &Name, current: &Name) -> Name {
     let skip = qlabels - keep;
     let labels = qname.labels();
     let mut out: Vec<u8> = Vec::with_capacity(64);
-    for l in &labels[skip..] {
+    for l in labels.iter().skip(skip) {
         out.push(l.len() as u8);
         out.extend_from_slice(l);
     }
@@ -2323,6 +2574,56 @@ mod tests {
 
     fn now() -> Ts {
         1_700_000_000_000_000_000
+    }
+
+    /// The deadline is the bound that makes the worst case finite, so it has to
+    /// shorten an exchange and it has to expire — not just exist.
+    #[test]
+    fn a_deadline_clips_the_attempt_timeout_and_then_expires() {
+        let roomy = Deadline::after(60_000);
+        assert!(!roomy.expired());
+        // The configured timeout is the smaller of the two, so it wins.
+        assert_eq!(roomy.attempt_timeout_ms(1500), Some(1500));
+
+        let tight = Deadline::after(5);
+        match tight.attempt_timeout_ms(1500) {
+            Some(ms) => assert!(ms <= 5, "the budget must be the smaller bound, got {ms}"),
+            None => panic!("a live budget must still hand out a timeout"),
+        }
+
+        // A budget that is already spent hands out nothing — and never a zero
+        // timeout, which would fail every exchange by construction.
+        let spent = Deadline::after(0);
+        assert!(spent.expired());
+        assert_eq!(spent.attempt_timeout_ms(1500), None);
+        assert_eq!(spent.attempt_timeout_ms(0), None);
+    }
+
+    /// The walk must consult the budget *before* it consults the network. That
+    /// ordering is the whole point: a nested walk (an out-of-bailiwick NS
+    /// address lookup) shares the caller's deadline, so a spent budget stops it
+    /// instead of starting a fresh round of referrals. This test is hermetic —
+    /// if it ever takes a real round trip, the ordering has regressed.
+    #[test]
+    fn a_spent_budget_stops_the_walk_without_touching_the_network() {
+        let r = Resolver::new(ResolverConfig::default());
+        let key = QueryKey {
+            name: Name::from_ascii("example.com").unwrap(),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ecs: None,
+            want_dnssec: false,
+            cd: false,
+        };
+        let err = r
+            .iterative_resolve(&key, 0, Deadline::after(0))
+            .expect_err("a spent budget must fail the walk");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(
+            err.msg.contains("budget"),
+            "the error must name the budget, got {}",
+            err.msg
+        );
     }
 
     #[test]
@@ -2466,13 +2767,13 @@ mod tests {
         );
         let shared = r.shared();
         {
-            let aliases = shared.aliases.lock().unwrap();
+            let aliases = shared.aliases.lock();
             assert_eq!(aliases.edge_count(), 1);
             assert_eq!(aliases.dependents(&data), vec![alias.clone()]);
             assert_eq!(aliases.depends_on(&alias), vec![data.clone()]);
         }
         {
-            let cache = shared.cache.lock().unwrap();
+            let cache = shared.cache.lock();
             assert!(cache.len() >= 2, "the chain must be cached");
         }
 
@@ -2550,7 +2851,7 @@ mod tests {
     #[test]
     fn resolver_constructs() {
         let r = Resolver::new(ResolverConfig::default());
-        assert!(r.shared().cache.lock().unwrap().is_empty());
+        assert!(r.shared().cache.lock().is_empty());
         let _ = now();
     }
 
@@ -2569,7 +2870,7 @@ mod tests {
         let k3 = key("c.example.com");
         let mut owners = Vec::new();
         {
-            let mut inf = r.inner.inflight.lock().unwrap();
+            let mut inf = r.inner.inflight.lock();
             // Abandon an owner without publishing: its entry goes stale.
             match inf.claim(&k1, &r.inner) {
                 Claim::Owner(o) => drop(o),
@@ -2591,7 +2892,7 @@ mod tests {
             assert!(inf.len() <= 2, "in-flight table must stay bounded");
         }
         drop(owners);
-        assert_eq!(r.inner.inflight.lock().unwrap().len(), 0);
+        assert_eq!(r.inner.inflight.lock().len(), 0);
     }
 
     /// An owner that never publishes (an unwinding resolution, a poisoned
@@ -2602,7 +2903,7 @@ mod tests {
     fn abandoned_owner_releases_waiters() {
         let r = offline_resolver();
         let k = key("abandoned.example.com");
-        let mut inf = r.inner.inflight.lock().unwrap();
+        let mut inf = r.inner.inflight.lock();
         let owner = match inf.claim(&k, &r.inner) {
             Claim::Owner(o) => o,
             Claim::Waiter(_) => panic!("first claim must own the key"),
@@ -2715,7 +3016,7 @@ mod tests {
         );
         assert!(!res.from_cache);
         assert_eq!(
-            r.shared().cache.lock().unwrap().len(),
+            r.shared().cache.lock().len(),
             0,
             "a pin must not be cached"
         );
@@ -2770,9 +3071,9 @@ mod tests {
         let again = r.resolve(&name, RrType::A).unwrap();
         assert_eq!(again.answers[0].rdata, res.answers[0].rdata);
         let shared = r.shared();
-        let guard = shared.fake_ip.lock().unwrap();
+        let guard = shared.fake_ip.lock();
         let pool = guard.as_ref().expect("fake-ip mode must build a pool");
-        assert_eq!(pool.peek(ip), Some(&name));
+        assert_eq!(pool.peek(ip.into()), Some(&name));
     }
 
     /// In fake-IP mode `AAAA` is NODATA. A real IPv6 address would let the
@@ -2858,9 +3159,31 @@ mod tests {
         assert_eq!(p("1.0.18.in-addr.arpa.x"), None);
     }
 
-    /// A fake-IP address resolves back to the name it was issued for.
-    /// Without this a client reverse-resolving a synthetic address would get
-    /// NXDOMAIN or an unrelated real name from the public DNS.
+    /// The `ip6.arpa` form is 32 nibble labels, least significant first.
+    #[test]
+    fn ip6_reverse_names_parse_conservatively() {
+        let p = |s: &str| parse_ip6_arpa(&Name::from_ascii(s).unwrap());
+
+        let one: Ipv6Addr = "::1".parse().unwrap();
+        assert_eq!(parse_ip6_arpa(&reverse6(one)), Some(one));
+
+        // An address with every nibble distinct, so a byte-order mistake
+        // cannot pass.
+        let mixed: Ipv6Addr = "fdfe:dcba:9876:5432:10fe:dcba:9876:5432".parse().unwrap();
+        assert_eq!(parse_ip6_arpa(&reverse6(mixed)), Some(mixed));
+
+        // The v4 form is a different hierarchy and must not be accepted.
+        assert_eq!(p("1.0.18.198.in-addr.arpa"), None);
+        assert_eq!(p("1.0.0.0.ip6.arpa"), None, "too few nibbles");
+        // A label that is not exactly one hex digit is not a nibble.
+        let bad = reverse6(one).to_ascii().replace("1.0.", "1.00.");
+        assert_eq!(p(&bad), None);
+        assert_eq!(p("example.com"), None);
+    }
+
+    /// In fake-IP mode a synthetic address resolves back to the name it was
+    /// issued for. Without this a client reverse-resolving an address would
+    /// get NXDOMAIN or an unrelated real name from the public DNS.
     #[test]
     fn fake_ip_reverse_lookup_returns_the_domain() {
         let r = policy_resolver(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#);
@@ -2890,6 +3213,84 @@ mod tests {
         // must not be invented.
         let unknown = Name::from_ascii("9.9.9.198.in-addr.arpa").unwrap();
         assert!(r.resolve(&unknown, RrType::PTR).is_err());
+    }
+
+    /// A pure-IPv6 deployment: with `fake-ip-range6` configured, `AAAA` is
+    /// synthesized from the v6 range instead of answered NODATA, and the
+    /// synthetic address reverses back to the domain.
+    #[test]
+    fn fake_ip_range6_synthesizes_aaaa_and_reverses() {
+        let r = policy_resolver(
+            r#"{"dns": {
+                "enhanced-mode": "fake-ip",
+                "fake-ip-range": "198.18.0.0/16",
+                "fake-ip-range6": "fdfe:dcba:9876::/48"
+            }}"#,
+        );
+        let name = Name::from_ascii("v6-only.example").unwrap();
+        let res = r.resolve(&name, RrType::AAAA).unwrap();
+        assert_eq!(res.answers.len(), 1, "AAAA must be synthesized");
+        let RData::Aaaa(ip) = res.answers[0].rdata else {
+            panic!("expected an AAAA record, got {:?}", res.answers[0].rdata);
+        };
+        assert!(ip.to_string().starts_with("fdfe:dcba:9876:"), "got {ip}");
+        assert_eq!(res.answers[0].rr_type, RrType::AAAA);
+
+        // Stable, and reversible through the ip6.arpa form.
+        let again = r.resolve(&name, RrType::AAAA).unwrap();
+        assert_eq!(again.answers[0].rdata, res.answers[0].rdata);
+        let ptr = r.resolve(&reverse6(ip), RrType::PTR).unwrap();
+        assert!(
+            matches!(&ptr.answers[0].rdata, RData::Ptr(target) if *target == name),
+            "got {:?}",
+            ptr.answers[0].rdata
+        );
+
+        // And a dual-stack client still gets a v4 address too, from its own
+        // range, with each family reversing independently.
+        let v4 = r.resolve(&name, RrType::A).unwrap();
+        assert_eq!(v4.answers.len(), 1);
+        assert!(
+            matches!(&v4.answers[0].rdata, RData::A(v) if v.to_string().starts_with("198.18.")),
+            "got {:?}",
+            v4.answers[0].rdata
+        );
+    }
+
+    /// `AAAA` synthesis is opt-in: the same query is NODATA until a v6 range
+    /// exists. That switch is the difference between "IPv6 goes through the
+    /// proxy" and "IPv6 bypasses it".
+    #[test]
+    fn aaaa_synthesis_is_opt_in() {
+        let aaaa_len = |json: &str| {
+            let r = policy_resolver(json);
+            r.resolve(&Name::from_ascii("dual.example").unwrap(), RrType::AAAA)
+                .unwrap()
+                .answers
+                .len()
+        };
+
+        assert_eq!(aaaa_len(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#), 0);
+        assert_eq!(
+            aaaa_len(r#"{"dns": {"enhanced-mode": "fake-ip", "fake-ip-range6": "fdfe::/48"}}"#),
+            1
+        );
+        // Outside fake-IP mode a v6 range means nothing at all.
+        let r = policy_resolver(r#"{"dns": {"fake-ip-range6": "fdfe::/48"}}"#);
+        assert!(!r.config().dns.fake_ip_enabled());
+    }
+
+    /// The `ip6.arpa` name for an address: 32 nibble labels, least
+    /// significant first, then `ip6.arpa`.
+    fn reverse6(ip: Ipv6Addr) -> Name {
+        let mut labels: Vec<String> = Vec::with_capacity(34);
+        for octet in ip.octets().iter().rev() {
+            labels.push(format!("{:x}", octet & 0x0f));
+            labels.push(format!("{:x}", octet >> 4));
+        }
+        labels.push("ip6".into());
+        labels.push("arpa".into());
+        Name::from_ascii(&labels.join(".")).unwrap()
     }
 
     /// A `hosts` pin is a real address, so it must serve the resolver's own
@@ -2922,12 +3323,12 @@ mod tests {
     fn estimator_ignores_locally_answered_names() {
         let r = policy_resolver(r#"{"dns": {"hosts": {"pinned.example": "10.9.8.7"}}}"#);
         let shared = r.shared();
-        let before = shared.estimator.lock().unwrap().len();
+        let before = shared.estimator.lock().len();
 
         r.resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::A)
             .unwrap();
         assert_eq!(
-            shared.estimator.lock().unwrap().len(),
+            shared.estimator.lock().len(),
             before,
             "a pinned name must not reach the estimator"
         );
@@ -2938,7 +3339,7 @@ mod tests {
             RrType::A,
         );
         assert!(
-            shared.estimator.lock().unwrap().len() > before,
+            shared.estimator.lock().len() > before,
             "a name that must be resolved is still observed"
         );
     }

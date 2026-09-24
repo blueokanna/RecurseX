@@ -8,7 +8,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::sync::Mutex;
+use crate::sync::Mutex;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::message::Message;
@@ -220,7 +220,7 @@ impl ForwarderSet {
             Proto::Udp | Proto::Tcp => self.plain.exchange(&f.endpoint, query, timeout_ms),
             #[cfg(feature = "dot")]
             Proto::Tls => {
-                let mut cache = self.dot.lock().unwrap();
+                let mut cache = self.dot.lock();
                 let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::dot::DotTransport::for_host(
@@ -234,7 +234,7 @@ impl ForwarderSet {
             }
             #[cfg(feature = "doh")]
             Proto::DoH => {
-                let mut cache = self.doh.lock().unwrap();
+                let mut cache = self.doh.lock();
                 let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     let mut t = crate::transports::doh::DohTransport::for_host(
@@ -250,7 +250,7 @@ impl ForwarderSet {
             }
             #[cfg(feature = "doh3")]
             Proto::DoH3 => {
-                let mut cache = self.doh3.lock().unwrap();
+                let mut cache = self.doh3.lock();
                 let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::doh3::Doh3Transport::for_host(
@@ -264,7 +264,7 @@ impl ForwarderSet {
             }
             #[cfg(feature = "doq")]
             Proto::DoQ => {
-                let mut cache = self.doq.lock().unwrap();
+                let mut cache = self.doq.lock();
                 let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::doq::DoqTransport::for_host(

@@ -396,10 +396,11 @@ cargo run --example server_demo      # blocks; query it with dig -p 5353
 
 ## Tests and CI
 
-There are 159 unit tests, 7 integration tests in `tests/`, and 4 doctests, and
-the suite does not need the public Internet: upstreams in the tests are local
-stub servers, so `cargo test` is hermetic. What is covered includes the wire
-codec (including rejection cases), cache admission/eviction/serve-stale/
+There are 291 unit tests, 22 integration tests in `tests/`, and 4 doctests, and
+the suite does not assert on any reply from the public Internet: upstreams in the
+tests are local stub servers, so `cargo test` is hermetic in the sense that its
+result is about the resolver and not about the network. What is covered includes
+the wire codec (including rejection cases), cache admission/eviction/serve-stale/
 persistence, the estimator's `exp` implementation against reference values,
 planner decisions, the alias graph's both directions and pruning, upstream cost
 selection, the coalescer (including an owner that vanishes without publishing),
@@ -411,6 +412,9 @@ The integration tests are the ones an embedder cares about: they build a
 resolver from a JSON document, serve it over UDP *and* TCP, assert the second
 query is answered from cache without touching upstream, restart a process from
 its `persist` snapshot, and stop everything through the public shutdown API.
+`tests/iterative_path.rs` walks a stub root and a stub `test` zone through
+delegation, NXDOMAIN, a refusal and a black hole, which is where the
+*resolution* rules are pinned down rather than the codec.
 `tests/wire_robustness.rs` feeds the decoder 20,000 deterministic pseudo-random
 buffers plus hostile count fields, compression-pointer cycles and every
 truncation boundary, and asserts the parser never panics and that anything it

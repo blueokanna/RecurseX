@@ -117,6 +117,32 @@ effect on the next query, not after a TTL.
   never syncs (which then breaks TLS), and WebRTC and games never find a path.
   An explicit `"fake-ip-filter": []` means "no exclusions", which is a
   different statement — the two must not be conflated.
+
+### IPv6: `fake-ip-range6`
+
+By default only IPv4 is synthesized and `AAAA` is answered NODATA. Configure
+`fake-ip-range6` and `AAAA` is synthesized from that block instead (see
+`DEFAULT_FAKE_IP_RANGE6`, i.e. `fdfe:dcba:9876::/48`):
+
+```json
+{ "enhanced-mode": "fake-ip", "fake-ip-range6": "fdfe:dcba:9876::/48" }
+```
+
+Why the switch has to be explicit:
+
+* A dual-stack client that receives a synthetic `AAAA` will connect over IPv6
+  to it. With a v6 pool behind it that is correct; without one, that address
+  is one **nothing can reverse** — a silent bypass rather than a mapping.
+* Conversely, with no v6 range the NODATA answer pushes the client back onto
+  the v4 address it was already given.
+
+The two families are **independent**: one name may hold a v4 and a v6 mapping
+at once without either affecting the other, each family has its own
+`maxEntries`, its own allocation cursor and its own recycle count, and
+pressure in one family cannot evict the other's mappings. Reverse resolution
+works for both: `in-addr.arpa` and `ip6.arpa` (32 nibble labels, least
+significant first, with non-canonical labels refused rather than read as an
+address).
 * A name keeps the same address until the mapping expires, and the address maps
   back to the name. Reversibility is what makes the mode usable at all.
 * When the pool is full it **recycles the least-recently-used mapping** and

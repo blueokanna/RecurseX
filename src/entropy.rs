@@ -51,7 +51,9 @@ pub fn fill(buf: &mut [u8]) -> bool {
         h.write_u64(COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed));
         let v = h.finish().to_le_bytes();
         let n = c.len().min(8);
-        c[..n].copy_from_slice(&v[..n]);
+        if let Some(dst) = c.get_mut(..n) {
+            dst.copy_from_slice(crate::wire::capped(&v, n));
+        }
     }
     true
 }

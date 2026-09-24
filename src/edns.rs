@@ -7,6 +7,7 @@ use core::fmt;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::{Error, Result};
+use crate::wire::WireBytes;
 
 /// EDNS option codes (RFC 6891 §6.1.2 and successors).
 pub mod opt {
@@ -190,8 +191,11 @@ impl Ecs {
             return self.address.clone();
         }
         let mut v = vec![0u8; full];
-        let n = (self.address.len()).min(full);
-        v[..n].copy_from_slice(&self.address[..n]);
+        // `zip` stops at whichever side is shorter, which is exactly the
+        // padding rule: the address is copied in full and the rest stays zero.
+        for (dst, src) in v.iter_mut().zip(self.address.iter()) {
+            *dst = *src;
+        }
         v
     }
 
@@ -199,22 +203,23 @@ impl Ecs {
     pub fn address_string(&self) -> alloc::string::String {
         use alloc::string::ToString;
         let fa = self.full_address();
-        match self.family {
-            1 if fa.len() >= 4 => Ipv4Addr::new(fa[0], fa[1], fa[2], fa[3]).to_string(),
-            2 if fa.len() >= 16 => {
-                let mut oct = [0u8; 16];
-                oct.copy_from_slice(&fa[..16]);
-                Ipv6Addr::from(oct).to_string()
+        if self.family == 1 {
+            if let Ok(oct) = fa.array_at::<4>(0) {
+                return Ipv4Addr::from(oct).to_string();
             }
-            _ => {
-                let mut s = alloc::string::String::new();
-                for b in &self.address {
-                    use alloc::fmt::Write as _;
-                    let _ = write!(s, "{:02x}", b);
-                }
-                s
+        } else if self.family == 2 {
+            if let Ok(oct) = fa.array_at::<16>(0) {
+                return Ipv6Addr::from(oct).to_string();
             }
         }
+        // An unknown family, or an address too short for the family it claims:
+        // the hex rendering, which is all that can honestly be shown.
+        let mut s = alloc::string::String::new();
+        for b in &self.address {
+            use alloc::fmt::Write as _;
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
     }
 
     /// Whether this ECS is the "no ECS" convention (family 0).
@@ -227,9 +232,9 @@ impl Ecs {
         if data.len() < 4 {
             return Err(Error::wire("ECS option too short"));
         }
-        let family = u16::from_be_bytes([data[0], data[1]]);
-        let source_prefix = data[2];
-        let scope_prefix = data[3];
+        let family = data.u16_at(0)?;
+        let source_prefix = data.byte_at(2)?;
+        let scope_prefix = data.byte_at(3)?;
         let max_prefix = match family {
             1 => 32,
             2 => 128,
@@ -243,7 +248,7 @@ impl Ecs {
             return Err(Error::wire("ECS address length mismatch"));
         }
         // The trailing bits beyond the prefix must be zero (canonical).
-        let addr = &data[4..];
+        let addr = data.rest_at(4)?;
         if let Some(&last) = addr.last() {
             let valid_bits = source_prefix % 8;
             if valid_bits != 0 {
@@ -276,11 +281,16 @@ impl Ecs {
 fn mask(addr: &[u8], prefix: u8) -> Vec<u8> {
     let n = (usize::from(prefix)).div_ceil(8);
     let mut out = vec![0u8; n];
-    out.copy_from_slice(&addr[..n]);
-    if prefix % 8 != 0 && n > 0 {
+    // `zip` copies at most `n` bytes and never reads past `addr`.
+    for (dst, src) in out.iter_mut().zip(addr.iter()) {
+        *dst = *src;
+    }
+    if prefix % 8 != 0 {
         let valid = prefix % 8;
         let mask_byte = 0xffu8 << (8 - valid);
-        out[n - 1] &= mask_byte;
+        if let Some(last) = out.last_mut() {
+            *last &= mask_byte;
+        }
     }
     out
 }
@@ -411,57 +421,56 @@ pub fn parse_options(rdata: &[u8]) -> Result<Vec<EdnsOption>> {
     let mut options = Vec::new();
     let mut pos = 0;
     while pos < rdata.len() {
-        if pos + 4 > rdata.len() {
-            return Err(Error::wire("EDNS option header truncated"));
-        }
-        let code = u16::from_be_bytes([rdata[pos], rdata[pos + 1]]);
-        let len = u16::from_be_bytes([rdata[pos + 2], rdata[pos + 3]]) as usize;
+        let code = rdata
+            .u16_at(pos)
+            .map_err(|_| Error::wire("EDNS option header truncated"))?;
+        let len = usize::from(
+            rdata
+                .u16_at(pos + 2)
+                .map_err(|_| Error::wire("EDNS option header truncated"))?,
+        );
         pos += 4;
-        if pos + len > rdata.len() {
-            return Err(Error::wire("EDNS option data truncated"));
-        }
-        let data = &rdata[pos..pos + len];
+        let data = rdata
+            .slice_at(pos, len)
+            .map_err(|_| Error::wire("EDNS option data truncated"))?;
         let option = match code {
             opt::ECS => EdnsOption::Ecs(Ecs::parse(data)?),
             opt::COOKIE => {
-                if data.len() < 8 {
-                    return Err(Error::wire("cookie option too short"));
-                }
-                let mut client = [0u8; 8];
-                client.copy_from_slice(&data[..8]);
+                let client = data
+                    .array_at::<8>(0)
+                    .map_err(|_| Error::wire("cookie option too short"))?;
                 EdnsOption::Cookie {
                     client,
-                    server: data[8..].to_vec(),
+                    server: data.rest_at(8)?.to_vec(),
                 }
             }
-            opt::KEEPALIVE => {
-                if data.is_empty() {
-                    EdnsOption::TcpKeepalive(None)
-                } else if data.len() == 2 {
-                    EdnsOption::TcpKeepalive(Some(u16::from_be_bytes([data[0], data[1]])))
-                } else {
-                    return Err(Error::wire("keepalive option malformed"));
-                }
-            }
+            opt::KEEPALIVE => match data.len() {
+                0 => EdnsOption::TcpKeepalive(None),
+                2 => EdnsOption::TcpKeepalive(Some(data.u16_at(0)?)),
+                _ => return Err(Error::wire("keepalive option malformed")),
+            },
             opt::PADDING => EdnsOption::Padding(data.len() as u16),
             opt::KEY_TAG => {
                 if data.len() % 2 != 0 {
                     return Err(Error::wire("key-tag option malformed"));
                 }
-                let tags = data
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
+                // `chunks_exact(2)` yields two-byte slices, so the checked
+                // array conversion cannot fail — but it is still the compiler
+                // proving that, not a comment claiming it.
+                let mut tags = Vec::with_capacity(data.len() / 2);
+                for chunk in data.chunks_exact(2) {
+                    tags.push(u16::from_be_bytes(chunk.array_at::<2>(0)?));
+                }
                 EdnsOption::KeyTag(tags)
             }
             opt::NSID => EdnsOption::Nsid(data.to_vec()),
             opt::EDE => {
-                if data.len() < 2 {
-                    return Err(Error::wire("EDE option too short"));
-                }
+                let info_code = data
+                    .u16_at(0)
+                    .map_err(|_| Error::wire("EDE option too short"))?;
                 EdnsOption::Ede {
-                    info_code: u16::from_be_bytes([data[0], data[1]]),
-                    extra: data[2..].to_vec(),
+                    info_code,
+                    extra: data.rest_at(2)?.to_vec(),
                 }
             }
             _ => EdnsOption::Unknown {

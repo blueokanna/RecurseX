@@ -5,6 +5,7 @@
 //! CNAME RRset serve every query that aliases through it, and what lets
 //! negative answers be shared across questions.
 
+use alloc::format;
 use alloc::vec::Vec;
 
 use crate::error::Result;
@@ -88,6 +89,13 @@ impl RrSet {
     /// Whether two sets have identical data records (used by the stability
     /// model to detect authoritative changes). TTL differences are not
     /// content changes.
+    ///
+    /// RRSIGs are deliberately outside the comparison: a signature rotation is
+    /// not a data change, and letting it count as one would reset the stability
+    /// score of a zone that is behaving correctly. The consequence is that
+    /// adding or removing a signature is not visible here — that is the DNSSEC
+    /// layer's business, not the change detector's, and the comparison is not
+    /// used to decide whether an answer is trustworthy.
     pub fn same_data(&self, other: &RrSet) -> bool {
         if self.records.len() != other.records.len() {
             return false;
@@ -106,6 +114,12 @@ impl RrSet {
     }
 
     /// An iterator over the CNAME target, if this is a CNAME set.
+    ///
+    /// A set built through [`RrSet::from_records`] holds at most one CNAME
+    /// (RFC 2181 §10.1), so "the" target is well defined. The unchecked
+    /// builders ([`RrSet::new`] plus [`RrSet::add_record`]) do not enforce
+    /// that, so this reports the first record rather than assuming there is
+    /// exactly one.
     pub fn cname_target(&self) -> Option<&Name> {
         self.records.iter().find_map(|r| match &r.rdata {
             RData::Cname(n) => Some(n),
@@ -134,6 +148,17 @@ impl RrSet {
 
     /// Parse a set from a list of records already filtered to a single
     /// (name, type, class). `max_ttl_cap` clamps absurd TTLs.
+    ///
+    /// Refuses a CNAME or DNAME set with more than one record. RFC 2181 §10.1
+    /// gives those types a cardinality of exactly one, and the reason is not
+    /// pedantry: with two targets the answer is genuinely ambiguous, and every
+    /// consumer picks a different one — which resolver you ask changes the
+    /// address you get. Refusing the set keeps that ambiguity out of the cache
+    /// and out of the alias graph, where it would otherwise persist and be
+    /// served long after the offending response is forgotten. Callers that
+    /// cannot act on the refusal skip the set, which is the intended outcome:
+    /// the wire answer still reaches the client unchanged, it just is not
+    /// remembered.
     pub fn from_records(records: Vec<Record>, max_ttl_cap: u32) -> Result<RrSet> {
         let first = records
             .first()
@@ -154,6 +179,13 @@ impl RrSet {
         }
         if ttl == u32::MAX {
             ttl = 0;
+        }
+        // RFC 2181 §10.1: CNAME and DNAME have a cardinality of exactly one.
+        if matches!(rr_type, RrType::CNAME | RrType::DNAME) && data.len() > 1 {
+            return Err(crate::error::Error::wire(format!(
+                "{rr_type} RRset has {} records; RFC 2181 §10.1 allows exactly one",
+                data.len()
+            )));
         }
         ttl = ttl.min(max_ttl_cap);
         Ok(Self {
@@ -231,12 +263,69 @@ mod tests {
         let a = RrSet::a("example.com", "192.0.2.1", 300);
         let mut b = RrSet::a("example.com", "192.0.2.1", 600);
         b.ttl = 300;
-        // Different TTL-only: from_records normalizes ttl to min, and
-        // fingerprint excludes TTL. The records differ in TTL bytes though;
-        // fingerprints use the record wire form including TTL. So build via
-        // from_records to compare like the resolver would.
-        let _ = a;
+        // A TTL-only change is not a content change: `fingerprint` hashes
+        // `record_wire_without_ttl`, so the TTL bytes never reach the hash.
         assert_eq!(b.fingerprint(), a.fingerprint());
+    }
+
+    /// RFC 2181 §10.1 gives CNAME and DNAME a cardinality of exactly one, and
+    /// the reason is not pedantry: with two targets every consumer picks a
+    /// different one, so "which address does this name have" would depend on
+    /// which resolver you asked. The set must be refused rather than truncated
+    /// to its first record, or that ambiguity gets cached and served long after
+    /// the offending response is forgotten.
+    #[test]
+    fn a_multi_record_cname_is_refused() {
+        let owner = Name::from_ascii("www.example.com").unwrap();
+        let cname = |target: &str| Record {
+            name: owner.clone(),
+            rr_type: RrType::CNAME,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::Cname(Name::from_ascii(target).unwrap()),
+        };
+        let one = RrSet::from_records(vec![cname("a.example.net")], 86_400).unwrap();
+        assert_eq!(
+            one.cname_target().map(Name::to_ascii).as_deref(),
+            Some("a.example.net")
+        );
+        assert_eq!(one.records.len(), 1);
+
+        let two = RrSet::from_records(
+            vec![cname("a.example.net"), cname("b.example.net")],
+            86_400,
+        );
+        assert!(two.is_err(), "a two-record CNAME set must be refused");
+
+        let dname = |target: &str| Record {
+            name: owner.clone(),
+            rr_type: RrType::DNAME,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::Dname(Name::from_ascii(target).unwrap()),
+        };
+        assert!(RrSet::from_records(
+            vec![dname("a.example.net"), dname("b.example.net")],
+            86_400
+        )
+        .is_err());
+
+        // The rule is specific to those two types: an NS set with two servers
+        // is the normal case, not an error.
+        let apex = Name::from_ascii("example.com").unwrap();
+        let ns = |target: &str| Record {
+            name: apex.clone(),
+            rr_type: RrType::NS,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::Ns(Name::from_ascii(target).unwrap()),
+        };
+        let set = RrSet::from_records(
+            vec![ns("ns1.example.net"), ns("ns2.example.net")],
+            86_400,
+        )
+        .unwrap();
+        assert_eq!(set.ns_names().len(), 2);
     }
 
     #[test]

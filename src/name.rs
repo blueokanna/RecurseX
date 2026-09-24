@@ -15,6 +15,7 @@ use core::fmt;
 
 use crate::error::{Error, Result};
 use crate::prng::SplitMix64;
+use crate::wire::WireBytes;
 
 /// Maximum wire size of a domain name (RFC 1035 §2.3.4).
 pub const MAX_NAME_LEN: usize = 255;
@@ -49,7 +50,7 @@ impl Name {
     /// Whether this is the root name.
     #[inline]
     pub fn is_root(&self) -> bool {
-        self.0.len() == 1 && self.0[0] == 0
+        self.0.len() == 1 && self.0.first() == Some(&0)
     }
 
     /// The canonical wire bytes (uncompressed).
@@ -64,19 +65,33 @@ impl Name {
         self.0.len()
     }
 
+    /// The labels, left to right, excluding the terminal root.
+    ///
+    /// [`Name`] is canonical by construction — every constructor validates the
+    /// length chain and appends the root label — so this walk cannot run past
+    /// the end. `split_first`/`split_at` are what express that without an
+    /// index expression the compiler would have to bounds-check, and could
+    /// therefore panic on.
+    fn label_iter(&self) -> impl Iterator<Item = &[u8]> {
+        let mut rest: &[u8] = &self.0;
+        core::iter::from_fn(move || {
+            let (len, tail) = rest.split_first()?;
+            let len = usize::from(*len);
+            // A zero length is the root; a length that does not fit is not a
+            // canonical name, and stopping is the only safe reading of it.
+            if len == 0 || tail.len() < len {
+                rest = &[];
+                return None;
+            }
+            let (label, tail) = tail.split_at(len);
+            rest = tail;
+            Some(label)
+        })
+    }
+
     /// The number of labels (the root counts as zero labels).
     pub fn label_count(&self) -> usize {
-        let mut n = 0;
-        let mut i = 0;
-        while i < self.0.len() {
-            let l = self.0[i] as usize;
-            if l == 0 {
-                break;
-            }
-            n += 1;
-            i += 1 + l;
-        }
-        n
+        self.label_iter().count()
     }
 
     /// The left-most label of this name, as an ASCII string slice without
@@ -86,8 +101,7 @@ impl Name {
         if self.is_root() {
             return None;
         }
-        let l = self.0[0] as usize;
-        Some(&self.0[1..1 + l])
+        self.label_iter().next()
     }
 
     /// The right-most label (the TLD, e.g. `com`).
@@ -95,30 +109,20 @@ impl Name {
         if self.is_root() {
             return None;
         }
-        // Walk to the last non-root label.
-        let mut i = 0;
-        let mut last_start = 0;
-        while i < self.0.len() {
-            let l = self.0[i] as usize;
-            if l == 0 {
-                break;
-            }
-            last_start = i;
-            i += 1 + l;
-        }
-        let l = self.0[last_start] as usize;
-        Some(&self.0[last_start + 1..last_start + 1 + l])
+        self.label_iter().last()
     }
 
     /// The parent name: drop the left-most label. `com.`'s parent is the
     /// root; the root has no parent.
     pub fn parent(&self) -> Option<Name> {
-        let bytes = &self.0;
+        let bytes: &[u8] = &self.0;
         if bytes.len() == 1 {
             return None;
         }
-        let first = bytes[0] as usize;
-        Some(Name(bytes[1 + first..].to_vec().into_boxed_slice()))
+        let first = usize::from(bytes.first().copied()?);
+        bytes
+            .get(1 + first..)
+            .map(|rest| Name(rest.to_vec().into_boxed_slice()))
     }
 
     /// The apex of this name: the right-most two labels (`example.com`) or
@@ -129,24 +133,23 @@ impl Name {
         if total <= 2 {
             return self.clone();
         }
-        // Skip all but the last two labels.
-        let skip = total - 2;
-        let mut i = 0;
-        for _ in 0..skip {
-            let l = self.0[i] as usize;
-            i += 1 + l;
+        // Rebuild from the last two labels rather than slicing the buffer at a
+        // computed offset.
+        let mut out: Vec<u8> = Vec::with_capacity(self.0.len());
+        for label in self.label_iter().skip(total - 2) {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label);
         }
-        Name(self.0[i..].to_vec().into_boxed_slice())
+        out.push(0);
+        Name(out.into_boxed_slice())
     }
 
     /// Whether `self` is a subdomain of (or equal to) `other`.
     pub fn is_subdomain_of(&self, other: &Name) -> bool {
-        let a: &[u8] = &self.0;
-        let b: &[u8] = &other.0;
-        if a.len() < b.len() {
-            return false;
-        }
-        a[a.len() - b.len()..] == *b
+        // Both canonical forms end with the root label and both are label
+        // aligned, so "one byte form ends with the other" is exactly "one
+        // label chain nests inside the other".
+        self.0.ends_with(&other.0)
     }
 
     /// Whether `self` is a strict subdomain of `other`.
@@ -158,24 +161,24 @@ impl Name {
     /// (i.e. the common suffix, label-aligned). Returns the root when there
     /// is no common non-root suffix.
     pub fn common_suffix(&self, other: &Name) -> Name {
-        // Compare label by label from the right.
+        // Compare label by label from the right, walking both chains
+        // backwards and stopping at the first disagreement.
         let a_labels = self.labels();
         let b_labels = other.labels();
         let mut suffix: Vec<u8> = Vec::new();
-        let mut i = a_labels.len();
-        let mut j = b_labels.len();
-        while i > 0 && j > 0 {
-            if a_labels[i - 1] != b_labels[j - 1] {
-                break;
+        let mut a_rev = a_labels.iter().rev();
+        let mut b_rev = b_labels.iter().rev();
+        loop {
+            match (a_rev.next(), b_rev.next()) {
+                (Some(a), Some(b)) if a == b => {
+                    let mut prefix = Vec::with_capacity(1 + a.len());
+                    prefix.push(a.len() as u8);
+                    prefix.extend_from_slice(a);
+                    prefix.extend_from_slice(&suffix);
+                    suffix = prefix;
+                }
+                _ => break,
             }
-            let label = &a_labels[i - 1];
-            let mut prefix = Vec::with_capacity(1 + label.len());
-            prefix.push(label.len() as u8);
-            prefix.extend_from_slice(label);
-            prefix.extend_from_slice(&suffix);
-            suffix = prefix;
-            i -= 1;
-            j -= 1;
         }
         suffix.push(0);
         Name(suffix.into_boxed_slice())
@@ -183,17 +186,7 @@ impl Name {
 
     /// The individual labels (without length prefixes), left to right.
     pub fn labels(&self) -> Vec<&[u8]> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < self.0.len() {
-            let l = self.0[i] as usize;
-            if l == 0 {
-                break;
-            }
-            out.push(&self.0[i + 1..i + 1 + l]);
-            i += 1 + l;
-        }
-        out
+        self.label_iter().collect()
     }
 
     /// Parse a (possibly compressed) name from `buf` starting at `pos`.
@@ -213,10 +206,13 @@ impl Name {
         let mut hops = 0usize;
         let mut total = 1usize; // the terminal root octet
         loop {
-            if p >= buf.len() {
-                return Err(Error::wire("truncated name"));
-            }
-            let len = buf[p] as usize;
+            // `byte_at` carries the "is there a byte here" check, so the loop
+            // needs no separate guard to be safe — and there is no index
+            // expression left for the compiler to bounds-check.
+            let len = usize::from(
+                buf.byte_at(p)
+                    .map_err(|_| Error::wire("truncated name"))?,
+            );
             match len & 0xc0 {
                 0x00 => {
                     if len == 0 {
@@ -229,9 +225,9 @@ impl Name {
                     if len > 63 {
                         return Err(Error::wire("label longer than 63 octets"));
                     }
-                    if p + 1 + len > buf.len() {
-                        return Err(Error::wire("truncated label"));
-                    }
+                    let label = buf
+                        .slice_at(p + 1, len)
+                        .map_err(|_| Error::wire("truncated label"))?;
                     total += 1 + len;
                     if total > MAX_NAME_LEN {
                         return Err(Error::wire("name exceeds 255 octets"));
@@ -241,17 +237,21 @@ impl Name {
                     }
                     lens.push(len as u8);
                     let start = label_bytes.len();
-                    label_bytes.extend_from_slice(&buf[p + 1..p + 1 + len]);
-                    for b in &mut label_bytes[start..] {
-                        b.make_ascii_lowercase();
+                    label_bytes.extend_from_slice(label);
+                    // Only the bytes just appended are folded to lower case;
+                    // `get_mut` keeps a wrong `start` from panicking.
+                    if let Some(appended) = label_bytes.get_mut(start..) {
+                        for b in appended {
+                            b.make_ascii_lowercase();
+                        }
                     }
                     p += 1 + len;
                 }
                 0xc0 => {
-                    if p + 1 >= buf.len() {
-                        return Err(Error::wire("truncated compression pointer"));
-                    }
-                    let off = ((len & 0x3f) << 8) | buf[p + 1] as usize;
+                    let second = buf
+                        .byte_at(p + 1)
+                        .map_err(|_| Error::wire("truncated compression pointer"))?;
+                    let off = ((len & 0x3f) << 8) | usize::from(second);
                     if off >= buf.len() {
                         return Err(Error::wire("compression pointer out of range"));
                     }
@@ -275,12 +275,20 @@ impl Name {
         if lens.len() >= MAX_LABELS {
             return Err(Error::wire("too many labels"));
         }
+        // Reassemble `[len][label]…` from the recorded lengths. Both reads are
+        // checked, so a length list that disagreed with the byte pool would be
+        // an error rather than a panic.
+        fn lengths_disagree() -> Error {
+            Error::internal("label lengths disagree with the byte pool")
+        }
         let mut out = Vec::with_capacity(total);
-        let mut off = 0;
+        let mut rest: &[u8] = &label_bytes;
         for &l in &lens {
+            let len = usize::from(l);
+            let label = rest.get(..len).ok_or_else(lengths_disagree)?;
+            rest = rest.get(len..).ok_or_else(lengths_disagree)?;
             out.push(l);
-            out.extend_from_slice(&label_bytes[off..off + l as usize]);
-            off += l as usize;
+            out.extend_from_slice(label);
         }
         out.push(0);
         Ok((Name(out.into_boxed_slice()), end))
@@ -304,80 +312,86 @@ impl Name {
         let mut labels: Vec<u8> = Vec::with_capacity(s.len() + 1);
         let mut current: Vec<u8> = Vec::with_capacity(16);
         let mut label_count = 0usize;
-        let mut i = 0;
         let mut total = 0usize;
-        while i < bytes.len() {
-            match bytes[i] {
+
+        /// Record the label accumulated in `current` and start a new one.
+        fn finish_label(
+            labels: &mut Vec<u8>,
+            current: &mut Vec<u8>,
+            total: &mut usize,
+            label_count: &mut usize,
+        ) -> Result<()> {
+            if current.len() > 63 {
+                return Err(Error::wire("label longer than 63 octets"));
+            }
+            *total += 1 + current.len();
+            if *total > MAX_NAME_LEN {
+                return Err(Error::wire("name exceeds 255 octets"));
+            }
+            if *label_count >= MAX_LABELS {
+                return Err(Error::wire("too many labels"));
+            }
+            *label_count += 1;
+            labels.push(current.len() as u8);
+            labels.extend_from_slice(current);
+            current.clear();
+            Ok(())
+        }
+
+        // `split_first` walks the string without an index, so every character
+        // read is a `Some`/`None` decision rather than a bounds check.
+        let mut rest: &[u8] = bytes;
+        while let Some((&b, tail)) = rest.split_first() {
+            rest = tail;
+            match b {
                 b'\\' => {
-                    i += 1;
-                    if i >= bytes.len() {
-                        return Err(Error::wire("trailing backslash in name"));
-                    }
-                    if bytes[i].is_ascii_digit() {
-                        if i + 2 >= bytes.len()
-                            || !bytes[i + 1].is_ascii_digit()
-                            || !bytes[i + 2].is_ascii_digit()
-                        {
+                    let (&escaped, tail) = match rest.split_first() {
+                        Some(v) => v,
+                        None => return Err(Error::wire("trailing backslash in name")),
+                    };
+                    rest = tail;
+                    if escaped.is_ascii_digit() {
+                        let (&d2, tail) = match rest.split_first() {
+                            Some(v) => v,
+                            None => return Err(Error::wire("bad \\DDD escape in name")),
+                        };
+                        let (&d3, tail) = match tail.split_first() {
+                            Some(v) => v,
+                            None => return Err(Error::wire("bad \\DDD escape in name")),
+                        };
+                        rest = tail;
+                        if !d2.is_ascii_digit() || !d3.is_ascii_digit() {
                             return Err(Error::wire("bad \\DDD escape in name"));
                         }
-                        let v = (bytes[i] - b'0') as usize * 100
-                            + (bytes[i + 1] - b'0') as usize * 10
-                            + (bytes[i + 2] - b'0') as usize;
+                        let v = usize::from(escaped - b'0') * 100
+                            + usize::from(d2 - b'0') * 10
+                            + usize::from(d3 - b'0');
                         if v > 255 {
                             return Err(Error::wire("bad \\DDD escape in name"));
                         }
                         current.push(v as u8);
-                        i += 3;
                     } else {
-                        current.push(bytes[i]);
-                        i += 1;
+                        current.push(escaped);
                     }
                 }
                 b'.' => {
                     if current.is_empty() {
                         // A leading dot or an empty label (e.g. "a..b") is
-                        // rejected; a trailing dot is fine (it terminates
-                        // the last label, root follows).
-                        if i == bytes.len() - 1 {
+                        // rejected; a trailing dot is fine — it terminates
+                        // the last label and the root follows. "Empty" here
+                        // means nothing at all follows the dot.
+                        if rest.is_empty() {
                             break;
                         }
                         return Err(Error::wire("empty label in name"));
                     }
-                    if current.len() > 63 {
-                        return Err(Error::wire("label longer than 63 octets"));
-                    }
-                    total += 1 + current.len();
-                    if total > MAX_NAME_LEN {
-                        return Err(Error::wire("name exceeds 255 octets"));
-                    }
-                    if label_count >= MAX_LABELS {
-                        return Err(Error::wire("too many labels"));
-                    }
-                    label_count += 1;
-                    labels.push(current.len() as u8);
-                    labels.extend_from_slice(&current);
-                    current.clear();
-                    i += 1;
+                    finish_label(&mut labels, &mut current, &mut total, &mut label_count)?;
                 }
-                b => {
-                    current.push(b);
-                    i += 1;
-                }
+                b => current.push(b),
             }
         }
         if !current.is_empty() {
-            if current.len() > 63 {
-                return Err(Error::wire("label longer than 63 octets"));
-            }
-            total += 1 + current.len();
-            if total > MAX_NAME_LEN {
-                return Err(Error::wire("name exceeds 255 octets"));
-            }
-            if label_count >= MAX_LABELS {
-                return Err(Error::wire("too many labels"));
-            }
-            labels.push(current.len() as u8);
-            labels.extend_from_slice(&current);
+            finish_label(&mut labels, &mut current, &mut total, &mut label_count)?;
         }
         for b in &mut labels {
             b.make_ascii_lowercase();
@@ -388,18 +402,15 @@ impl Name {
 
     /// Presentation format (RFC 4343 escaping). The root renders as `.`.
     pub fn to_ascii(&self) -> String {
-        let bytes = &self.0;
+        let bytes: &[u8] = &self.0;
         let mut s = String::with_capacity(bytes.len() + 4);
-        let mut i = 0;
-        while i < bytes.len() {
-            let l = bytes[i] as usize;
-            if l == 0 {
-                break;
-            }
+        // The same label walk the rest of the type uses, so the body never
+        // computes an offset into the buffer.
+        for label in self.label_iter() {
             if !s.is_empty() {
                 s.push('.');
             }
-            for &b in &bytes[i + 1..i + 1 + l] {
+            for &b in label {
                 match b {
                     b'.' => s.push_str("\\."),
                     b'\\' => s.push_str("\\\\"),
@@ -416,7 +427,6 @@ impl Name {
                     _ => s.push(b as char),
                 }
             }
-            i += 1 + l;
         }
         if s.is_empty() {
             s.push('.');
@@ -522,14 +532,14 @@ impl NameCompressor {
                 None => break,
             }
         }
-        // Find the longest suffix already in the table.
-        let mut hit: Option<usize> = None;
-        for (i, (s, _)) in suffixes.iter().enumerate() {
-            if self.offsets.contains_key(s) {
-                hit = Some(i);
-                break;
-            }
-        }
+        // The longest suffix already in the table, carrying what the
+        // compression pointer needs — which suffix, and the offset it was
+        // written at — rather than a position to look up again.
+        let hit = suffixes.iter().enumerate().find_map(|(i, (suffix, _))| {
+            self.offsets
+                .get(suffix)
+                .map(|offset| (i, suffix, *offset))
+        });
         let base = out.len();
         match hit {
             None => {
@@ -538,12 +548,22 @@ impl NameCompressor {
                     self.record(base, s, *rel);
                 }
             }
-            Some(i) => {
-                let prefix_len = suffixes[i].1;
-                out.extend_from_slice(&name.as_bytes()[..prefix_len]);
-                let off = self.offsets[&suffixes[i].0];
-                out.push(0xc0 | ((off >> 8) as u8));
-                out.push((off & 0xff) as u8);
+            Some((i, suffix, offset)) => {
+                match name.as_bytes().strip_suffix(suffix.as_bytes()) {
+                    Some(prefix) => {
+                        out.extend_from_slice(prefix);
+                        out.push(0xc0 | ((offset >> 8) as u8));
+                        out.push((offset & 0xff) as u8);
+                    }
+                    // Unreachable: every entry in `suffixes` came from walking
+                    // this name's own parents. Writing the name out in full is
+                    // the correct fallback — the same name, just less
+                    // compression — and unlike a half-written name it cannot
+                    // corrupt the message.
+                    None => name.write_wire(out),
+                }
+                // Each suffix starts at `base + rel` in the bytes just
+                // written, in both branches.
                 for (s, rel) in suffixes.iter().take(i) {
                     self.record(base, s, *rel);
                 }

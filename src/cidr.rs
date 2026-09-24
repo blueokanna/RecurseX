@@ -180,6 +180,11 @@ impl Ipv6Cidr {
     pub fn network(&self) -> Ipv6Addr {
         Ipv6Addr::from(self.base)
     }
+
+    /// The last address in the block.
+    pub fn broadcast(&self) -> Ipv6Addr {
+        Ipv6Addr::from(self.base | !mask_v6(self.prefix))
+    }
 }
 
 impl fmt::Debug for Ipv6Cidr {

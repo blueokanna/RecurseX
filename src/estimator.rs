@@ -145,7 +145,9 @@ pub struct DomainStats {
 impl DomainStats {
     fn new(now: Ts) -> Self {
         let mut tod = [0u32; TOD_BUCKETS];
-        tod[tod_bucket(now)] = 1;
+        if let Some(slot) = tod.get_mut(tod_bucket(now)) {
+            *slot = 1;
+        }
         let mut recent = VecDeque::with_capacity(RECENT_MAX);
         recent.push_back(now);
         Self {
@@ -169,7 +171,9 @@ impl DomainStats {
         let gap_ns = now.saturating_sub(self.last_seen);
         self.queries += 1;
         self.last_seen = now;
-        self.tod[tod_bucket(now)] = self.tod[tod_bucket(now)].saturating_add(1);
+        if let Some(slot) = self.tod.get_mut(tod_bucket(now)) {
+            *slot = slot.saturating_add(1);
+        }
         self.recent.push_back(now);
         while self.recent.len() > RECENT_MAX {
             self.recent.pop_front();
@@ -224,7 +228,8 @@ impl DomainStats {
             let bucket_end = bucket_start + BUCKET_SECS as Ts * 1_000_000_000;
             let seg_end = end.min(bucket_end);
             let frac = (seg_end - pos) as f64 / (BUCKET_SECS as Ts * 1_000_000_000) as f64;
-            expected += self.tod[bucket] as f64 * frac;
+            let count = self.tod.get(bucket).copied().unwrap_or(0);
+            expected += count as f64 * frac;
             pos = seg_end;
             guard += 1;
         }

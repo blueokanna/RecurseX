@@ -14,6 +14,7 @@ use core::net::{Ipv4Addr, Ipv6Addr};
 use crate::error::{Error, Result};
 use crate::name::{Name, NameCompressor};
 use crate::qtype::{DnssecAlgorithm, DsDigestType, RrClass, RrType};
+use crate::wire::WireBytes;
 
 /// The payload of a resource record.
 #[derive(Clone, PartialEq, Eq)]
@@ -214,18 +215,29 @@ impl RData {
             if p + 2 > end {
                 return Err(Error::wire("RDATA truncated"));
             }
-            Ok(u16::from_be_bytes([buf[p], buf[p + 1]]))
+            buf.u16_at(p)
         };
         let u32_at = |p: usize| -> Result<u32> {
             if p + 4 > end {
                 return Err(Error::wire("RDATA truncated"));
             }
-            Ok(u32::from_be_bytes([
-                buf[p],
-                buf[p + 1],
-                buf[p + 2],
-                buf[p + 3],
-            ]))
+            buf.u32_at(p)
+        };
+        // A single octet, and the bytes from `p` to the end of this RDATA.
+        // Both are bounded by `end` — an RDATA field may not read past its own
+        // record even when the message has more bytes — and neither is an
+        // index expression, so neither can be a bounds-check panic.
+        let b_at = |p: usize| -> Result<u8> {
+            if p >= end {
+                return Err(Error::wire("RDATA truncated"));
+            }
+            buf.byte_at(p).map_err(|_| Error::wire("RDATA truncated"))
+        };
+        let tail = |p: usize| -> Result<&[u8]> {
+            if p > end {
+                return Err(Error::wire("RDATA truncated"));
+            }
+            buf.get(p..end).ok_or_else(|| Error::wire("RDATA truncated"))
         };
         let read_name = |p: &mut usize| -> Result<Name> {
             let (n, next) = Name::from_wire(buf, *p)?;
@@ -248,14 +260,18 @@ impl RData {
         let r = match rr_type {
             RrType::A => {
                 need(4)?;
-                let ip = Ipv4Addr::new(buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]);
+                let ip = Ipv4Addr::from(
+                    buf.array_at::<4>(*pos)
+                        .map_err(|_| Error::wire("RDATA truncated"))?,
+                );
                 *pos += 4;
                 RData::A(ip)
             }
             RrType::AAAA => {
                 need(16)?;
-                let mut oct = [0u8; 16];
-                oct.copy_from_slice(&buf[*pos..*pos + 16]);
+                let oct = buf
+                    .array_at::<16>(*pos)
+                    .map_err(|_| Error::wire("RDATA truncated"))?;
                 *pos += 16;
                 RData::Aaaa(Ipv6Addr::from(oct))
             }
@@ -299,12 +315,18 @@ impl RData {
             RrType::TXT => {
                 let mut strings = Vec::new();
                 while *pos < end {
-                    let l = buf[*pos] as usize;
+                    let l = usize::from(
+                        buf.byte_at(*pos)
+                            .map_err(|_| Error::wire("TXT string truncated"))?,
+                    );
                     *pos += 1;
                     if *pos + l > end {
                         return Err(Error::wire("TXT string truncated"));
                     }
-                    strings.push(buf[*pos..*pos + l].to_vec());
+                    let s = buf
+                        .get(*pos..*pos + l)
+                        .ok_or_else(|| Error::wire("TXT string truncated"))?;
+                    strings.push(s.to_vec());
                     *pos += l;
                 }
                 RData::Txt(strings)
@@ -344,13 +366,13 @@ impl RData {
             RrType::DS | RrType::CDS => {
                 need(4)?;
                 let key_tag = u16_at(*pos)?;
-                let algorithm = DnssecAlgorithm(buf[*pos + 2]);
-                let digest_type = DsDigestType(buf[*pos + 3]);
+                let algorithm = DnssecAlgorithm(b_at(*pos + 2)?);
+                let digest_type = DsDigestType(b_at(*pos + 3)?);
                 *pos += 4;
                 if *pos > end {
                     return Err(Error::wire("DS digest truncated"));
                 }
-                let digest = buf[*pos..end].to_vec();
+                let digest = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Ds {
                     key_tag,
@@ -362,13 +384,13 @@ impl RData {
             RrType::DNSKEY | RrType::CDNSKEY => {
                 need(4)?;
                 let flags = u16_at(*pos)?;
-                let protocol = buf[*pos + 2];
-                let algorithm = DnssecAlgorithm(buf[*pos + 3]);
+                let protocol = b_at(*pos + 2)?;
+                let algorithm = DnssecAlgorithm(b_at(*pos + 3)?);
                 *pos += 4;
                 if *pos > end {
                     return Err(Error::wire("DNSKEY public key truncated"));
                 }
-                let public_key = buf[*pos..end].to_vec();
+                let public_key = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Dnskey {
                     flags,
@@ -380,8 +402,8 @@ impl RData {
             RrType::RRSIG | RrType::SIG => {
                 need(18)?;
                 let type_covered = RrType(u16_at(*pos)?);
-                let algorithm = DnssecAlgorithm(buf[*pos + 2]);
-                let labels = buf[*pos + 3];
+                let algorithm = DnssecAlgorithm(b_at(*pos + 2)?);
+                let labels = b_at(*pos + 3)?;
                 let original_ttl = u32_at(*pos + 4)?;
                 let expiration = u32_at(*pos + 8)?;
                 let inception = u32_at(*pos + 12)?;
@@ -391,7 +413,7 @@ impl RData {
                 if *pos > end {
                     return Err(Error::wire("RRSIG signature truncated"));
                 }
-                let signature = buf[*pos..end].to_vec();
+                let signature = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Rrsig {
                     type_covered,
@@ -412,25 +434,31 @@ impl RData {
             }
             RrType::NSEC3 => {
                 need(5)?;
-                let hash_alg = buf[*pos];
-                let flags = buf[*pos + 1];
+                let hash_alg = b_at(*pos)?;
+                let flags = b_at(*pos + 1)?;
                 let iterations = u16_at(*pos + 2)?;
-                let salt_len = buf[*pos + 4] as usize;
+                let salt_len = usize::from(b_at(*pos + 4)?);
                 *pos += 5;
                 if *pos + salt_len > end {
                     return Err(Error::wire("NSEC3 salt truncated"));
                 }
-                let salt = buf[*pos..*pos + salt_len].to_vec();
+                let salt = buf
+                    .get(*pos..*pos + salt_len)
+                    .ok_or_else(|| Error::wire("NSEC3 salt truncated"))?
+                    .to_vec();
                 *pos += salt_len;
                 if *pos >= end {
                     return Err(Error::wire("NSEC3 next-hashed length missing"));
                 }
-                let next_len = buf[*pos] as usize;
+                let next_len = usize::from(b_at(*pos)?);
                 *pos += 1;
                 if *pos + next_len > end {
                     return Err(Error::wire("NSEC3 next-hashed truncated"));
                 }
-                let next_hashed = buf[*pos..*pos + next_len].to_vec();
+                let next_hashed = buf
+                    .get(*pos..*pos + next_len)
+                    .ok_or_else(|| Error::wire("NSEC3 next-hashed truncated"))?
+                    .to_vec();
                 *pos += next_len;
                 let types = parse_type_bitmap(buf, pos, end)?;
                 RData::Nsec3 {
@@ -444,15 +472,18 @@ impl RData {
             }
             RrType::NSEC3PARAM => {
                 need(5)?;
-                let hash_alg = buf[*pos];
-                let flags = buf[*pos + 1];
+                let hash_alg = b_at(*pos)?;
+                let flags = b_at(*pos + 1)?;
                 let iterations = u16_at(*pos + 2)?;
-                let salt_len = buf[*pos + 4] as usize;
+                let salt_len = usize::from(b_at(*pos + 4)?);
                 *pos += 5;
                 if *pos + salt_len > end {
                     return Err(Error::wire("NSEC3PARAM salt truncated"));
                 }
-                let salt = buf[*pos..*pos + salt_len].to_vec();
+                let salt = buf
+                    .get(*pos..*pos + salt_len)
+                    .ok_or_else(|| Error::wire("NSEC3PARAM salt truncated"))?
+                    .to_vec();
                 *pos += salt_len;
                 RData::Nsec3Param {
                     hash_alg,
@@ -463,25 +494,28 @@ impl RData {
             }
             RrType::CAA => {
                 need(2)?;
-                let flags = buf[*pos];
-                let tag_len = buf[*pos + 1] as usize;
+                let flags = b_at(*pos)?;
+                let tag_len = usize::from(b_at(*pos + 1)?);
                 *pos += 2;
                 if *pos + tag_len > end {
                     return Err(Error::wire("CAA tag truncated"));
                 }
-                let tag = buf[*pos..*pos + tag_len].to_vec();
+                let tag = buf
+                    .get(*pos..*pos + tag_len)
+                    .ok_or_else(|| Error::wire("CAA tag truncated"))?
+                    .to_vec();
                 *pos += tag_len;
-                let value = buf[*pos..end].to_vec();
+                let value = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Caa { flags, tag, value }
             }
             RrType::TLSA | RrType::SMIMEA => {
                 need(3)?;
-                let usage = buf[*pos];
-                let selector = buf[*pos + 1];
-                let matching_type = buf[*pos + 2];
+                let usage = b_at(*pos)?;
+                let selector = b_at(*pos + 1)?;
+                let matching_type = b_at(*pos + 2)?;
                 *pos += 3;
-                let data = buf[*pos..end].to_vec();
+                let data = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Tlsa {
                     usage,
@@ -506,7 +540,12 @@ impl RData {
                     if *pos + len > end {
                         return Err(Error::wire("SVCB param value truncated"));
                     }
-                    params.push((key, buf[*pos..*pos + len].to_vec()));
+                    params.push((
+                        key,
+                        buf.get(*pos..*pos + len)
+                            .ok_or_else(|| Error::wire("SVCB param value truncated"))?
+                            .to_vec(),
+                    ));
                     *pos += len;
                 }
                 RData::Svcb {
@@ -516,7 +555,7 @@ impl RData {
                 }
             }
             _ => {
-                let data = buf[*pos..end].to_vec();
+                let data = tail(*pos)?.to_vec();
                 *pos = end;
                 RData::Unknown(data)
             }
@@ -570,7 +609,7 @@ impl RData {
             RData::Txt(strings) => {
                 for s in strings {
                     out.push(s.len().min(255) as u8);
-                    out.extend_from_slice(&s[..s.len().min(255)]);
+                    out.extend_from_slice(crate::wire::capped(s, 255));
                 }
             }
             RData::Srv {
@@ -660,9 +699,9 @@ impl RData {
                 out.push(*flags);
                 out.extend_from_slice(&iterations.to_be_bytes());
                 out.push(salt.len().min(255) as u8);
-                out.extend_from_slice(&salt[..salt.len().min(255)]);
+                out.extend_from_slice(crate::wire::capped(salt, 255));
                 out.push(next_hashed.len().min(255) as u8);
-                out.extend_from_slice(&next_hashed[..next_hashed.len().min(255)]);
+                out.extend_from_slice(crate::wire::capped(next_hashed, 255));
                 write_type_bitmap(out, types);
             }
             RData::Nsec3Param {
@@ -675,12 +714,12 @@ impl RData {
                 out.push(*flags);
                 out.extend_from_slice(&iterations.to_be_bytes());
                 out.push(salt.len().min(255) as u8);
-                out.extend_from_slice(&salt[..salt.len().min(255)]);
+                out.extend_from_slice(crate::wire::capped(salt, 255));
             }
             RData::Caa { flags, tag, value } => {
                 out.push(*flags);
                 out.push(tag.len().min(255) as u8);
-                out.extend_from_slice(&tag[..tag.len().min(255)]);
+                out.extend_from_slice(crate::wire::capped(tag, 255));
                 out.extend_from_slice(value);
             }
             RData::Tlsa {
@@ -704,7 +743,7 @@ impl RData {
                 for (key, value) in params {
                     out.extend_from_slice(&key.to_be_bytes());
                     out.extend_from_slice(&(value.len().min(0xffff) as u16).to_be_bytes());
-                    out.extend_from_slice(&value[..value.len().min(0xffff)]);
+                    out.extend_from_slice(crate::wire::capped(value, 0xffff));
                 }
             }
             RData::Unknown(data) => out.extend_from_slice(data),
@@ -751,19 +790,25 @@ fn read_char_string(buf: &[u8], pos: &mut usize, end: usize) -> Result<Vec<u8>> 
     if *pos >= end {
         return Err(Error::wire("character-string truncated"));
     }
-    let l = buf[*pos] as usize;
+    let l = usize::from(
+        buf.byte_at(*pos)
+            .map_err(|_| Error::wire("character-string truncated"))?,
+    );
     *pos += 1;
     if *pos + l > end {
         return Err(Error::wire("character-string truncated"));
     }
-    let s = buf[*pos..*pos + l].to_vec();
+    let s = buf
+        .get(*pos..*pos + l)
+        .ok_or_else(|| Error::wire("character-string truncated"))?
+        .to_vec();
     *pos += l;
     Ok(s)
 }
 
 fn write_char_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(s.len().min(255) as u8);
-    out.extend_from_slice(&s[..s.len().min(255)]);
+    out.extend_from_slice(crate::wire::capped(s, 255));
 }
 
 /// Parse an NSEC/NSEC3 type-bitmap (RFC 4034 §4.1.2).
@@ -773,13 +818,21 @@ fn parse_type_bitmap(buf: &[u8], pos: &mut usize, end: usize) -> Result<Vec<RrTy
         if *pos + 2 > end {
             return Err(Error::wire("type bitmap window truncated"));
         }
-        let window = buf[*pos];
-        let len = buf[*pos + 1] as usize;
+        let window = buf
+            .byte_at(*pos)
+            .map_err(|_| Error::wire("type bitmap window truncated"))?;
+        let len = usize::from(
+            buf.byte_at(*pos + 1)
+                .map_err(|_| Error::wire("type bitmap window truncated"))?,
+        );
         *pos += 2;
         if len == 0 || len > 32 || *pos + len > end {
             return Err(Error::wire("type bitmap window length invalid"));
         }
-        for (i, &byte) in buf[*pos..*pos + len].iter().enumerate() {
+        let window_bytes = buf
+            .get(*pos..*pos + len)
+            .ok_or_else(|| Error::wire("type bitmap window truncated"))?;
+        for (i, &byte) in window_bytes.iter().enumerate() {
             for bit in 0..8 {
                 if byte & (0x80 >> bit) != 0 {
                     let t = (window as u16) * 256 + (i as u16) * 8 + bit as u16;
@@ -803,16 +856,22 @@ fn write_type_bitmap(out: &mut Vec<u8>, types: &[RrType]) {
     let mut windows: Vec<(u8, [u8; 32], usize)> = Vec::new();
     for &t in &sorted {
         let window = (t >> 8) as u8;
+        // `idx` is a byte offset inside a 32-byte window, so it cannot exceed
+        // 31; `get_mut` is what makes the compiler prove that too.
         let idx = ((t & 0xff) / 8) as usize;
         let bit = ((t & 0xff) % 8) as usize;
         match windows.iter_mut().find(|(w, _, _)| *w == window) {
             Some((_, bytes, used)) => {
-                bytes[idx] |= 0x80 >> bit;
+                if let Some(slot) = bytes.get_mut(idx) {
+                    *slot |= 0x80 >> bit;
+                }
                 *used = (*used).max(idx + 1);
             }
             None => {
                 let mut bytes = [0u8; 32];
-                bytes[idx] |= 0x80 >> bit;
+                if let Some(slot) = bytes.get_mut(idx) {
+                    *slot |= 0x80 >> bit;
+                }
                 windows.push((window, bytes, idx + 1));
             }
         }
@@ -820,7 +879,7 @@ fn write_type_bitmap(out: &mut Vec<u8>, types: &[RrType]) {
     for (window, bytes, used) in windows {
         out.push(window);
         out.push(used as u8);
-        out.extend_from_slice(&bytes[..used]);
+        out.extend_from_slice(crate::wire::capped(&bytes, used));
     }
 }
 
@@ -847,10 +906,21 @@ impl Record {
         if p + 10 > buf.len() {
             return Err(Error::wire("record header truncated"));
         }
-        let rr_type = RrType(u16::from_be_bytes([buf[p], buf[p + 1]]));
-        let class = RrClass(u16::from_be_bytes([buf[p + 2], buf[p + 3]]));
-        let ttl = u32::from_be_bytes([buf[p + 4], buf[p + 5], buf[p + 6], buf[p + 7]]);
-        let rdlen = u16::from_be_bytes([buf[p + 8], buf[p + 9]]) as usize;
+        // The fixed ten-octet record header (RFC 1035 §4.1.3). `u16_at(p + 8)`
+        // is the read that fails unless all ten octets are present, so the
+        // guard above and these reads say the same thing.
+        let rr_type = RrType(buf.u16_at(p).map_err(|_| Error::wire("record header truncated"))?);
+        let class = RrClass(
+            buf.u16_at(p + 2)
+                .map_err(|_| Error::wire("record header truncated"))?,
+        );
+        let ttl = buf
+            .u32_at(p + 4)
+            .map_err(|_| Error::wire("record header truncated"))?;
+        let rdlen = usize::from(
+            buf.u16_at(p + 8)
+                .map_err(|_| Error::wire("record header truncated"))?,
+        );
         p += 10;
         let end = p + rdlen;
         if end > buf.len() {
@@ -859,7 +929,11 @@ impl Record {
         let rdata = if rr_type == RrType::OPT {
             // OPT records are pseudo-records handled by the message layer;
             // keep the raw options.
-            RData::Unknown(buf[p..end].to_vec())
+            RData::Unknown(
+                buf.get(p..end)
+                    .ok_or_else(|| Error::wire("RDATA length exceeds the message"))?
+                    .to_vec(),
+            )
         } else {
             RData::parse(buf, &mut p, end, rr_type)?
         };
@@ -897,7 +971,14 @@ impl Record {
         if rdlen > u16::MAX as usize {
             return Err(Error::wire("RDATA exceeds the 16-bit length field"));
         }
-        out[rdlen_pos..rdlen_pos + 2].copy_from_slice(&(rdlen as u16).to_be_bytes());
+        // `rdlen_pos` is where the placeholder was written two lines ago, so
+        // the range is in range by construction; `get_mut` states that rather
+        // than relying on it.
+        let dst = out
+            .get_mut(rdlen_pos..)
+            .and_then(|tail| tail.get_mut(..2))
+            .ok_or_else(|| Error::internal("RDLENGTH offset out of range"))?;
+        dst.copy_from_slice(&(rdlen as u16).to_be_bytes());
         Ok(())
     }
 }

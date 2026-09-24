@@ -66,6 +66,14 @@
 #![deny(clippy::todo, clippy::unimplemented, clippy::dbg_macro)]
 #![warn(missing_docs)]
 #![allow(clippy::needless_return)]
+// `slice[i]` and `&slice[a..b]` answer "is there a byte here?" by panicking, and
+// this crate parses bytes that arrived from the network, where a panic is a
+// remote denial of service. The lint is therefore on for the shipped library —
+// and *only* for it: `cfg(not(test))` keeps it out of the crate's own test
+// modules, where indexing a fixture is the clearest way to say what the bytes
+// are and a wrong index is a failing test rather than a fault. Test targets
+// (`tests/`, `examples/`) are separate crates and are unaffected.
+#![cfg_attr(not(test), warn(clippy::indexing_slicing))]
 
 extern crate alloc;
 
@@ -94,6 +102,7 @@ pub mod rrset;
 pub mod stability;
 pub mod time;
 pub mod upstream;
+pub mod wire;
 
 #[cfg(feature = "std")]
 pub mod transport;
@@ -114,6 +123,8 @@ pub mod resolver;
 pub mod server;
 #[cfg(feature = "std")]
 pub mod stats;
+#[cfg(feature = "std")]
+pub mod sync;
 
 #[cfg(feature = "std")]
 pub use resolver::{Resolution, Resolver, ResolverConfig, SharedState};

@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar};
+
+use crate::sync::Mutex;
 use std::thread::JoinHandle;
 
 use crate::message::Message;
@@ -71,7 +73,7 @@ pub struct Server {
     resolver: Resolver,
     config: ServerConfig,
     /// Thread handles (kept alive by the server).
-    handles: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
     /// Live TCP connection count.
     tcp_connections: Arc<AtomicUsize>,
     /// Datagrams shed because the handler queue was full.
@@ -79,7 +81,7 @@ pub struct Server {
     /// Set by `shutdown`; every loop checks it.
     shutdown: Arc<AtomicBool>,
     /// TCP listeners to poke awake when shutting down.
-    tcp_addrs: std::sync::Mutex<Vec<SocketAddr>>,
+    tcp_addrs: Mutex<Vec<SocketAddr>>,
 }
 
 /// Live counters and thread count; the resolver's own `Debug` is reachable
@@ -89,7 +91,7 @@ impl core::fmt::Debug for Server {
         write!(
             f,
             "Server(threads={}, tcp_connections={}, udp_shed={}, shutting_down={})",
-            self.handles.lock().map(|h| h.len()).unwrap_or(0),
+            self.handles.lock().len(),
             self.tcp_connections.load(Ordering::Relaxed),
             self.udp_shed.load(Ordering::Relaxed),
             self.shutdown.load(Ordering::Relaxed)
@@ -108,11 +110,11 @@ impl Server {
         Self {
             resolver,
             config,
-            handles: std::sync::Mutex::new(Vec::new()),
+            handles: Mutex::new(Vec::new()),
             tcp_connections: Arc::new(AtomicUsize::new(0)),
             udp_shed: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            tcp_addrs: std::sync::Mutex::new(Vec::new()),
+            tcp_addrs: Mutex::new(Vec::new()),
         }
     }
 
@@ -124,7 +126,7 @@ impl Server {
     /// outside any other way.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let addrs: Vec<SocketAddr> = self.tcp_addrs.lock().map(|a| a.clone()).unwrap_or_default();
+        let addrs: Vec<SocketAddr> = self.tcp_addrs.lock().clone();
         for addr in addrs {
             // Wake the accept loop; the connection itself is dropped on the
             // floor by the loop when it sees the flag.
@@ -172,10 +174,7 @@ impl Server {
             let handle = std::thread::Builder::new()
                 .name("dns-udp-recv".into())
                 .spawn(move || udp_recv_loop(sock, queue, shed, shutdown))?;
-            self.handles
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(handle);
+            self.handles.lock().push(handle);
         }
         for _ in 0..self.config.udp_handlers.max(1) {
             let queue = queue.clone();
@@ -183,10 +182,7 @@ impl Server {
             let handle = std::thread::Builder::new()
                 .name("dns-udp-handler".into())
                 .spawn(move || udp_handler_loop(queue, resolver))?;
-            self.handles
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(handle);
+            self.handles.lock().push(handle);
         }
         Ok(local)
     }
@@ -204,14 +200,8 @@ impl Server {
         let handle = std::thread::Builder::new()
             .name("dns-tcp-accept".into())
             .spawn(move || tcp_accept_loop(listener, resolver, max, conns, shutdown, idle))?;
-        self.handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(handle);
-        self.tcp_addrs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(local);
+        self.handles.lock().push(handle);
+        self.tcp_addrs.lock().push(local);
         Ok(local)
     }
 
@@ -220,12 +210,7 @@ impl Server {
     /// Returns once [`Server::shutdown`] has been called: until then the
     /// loops are meant to run forever, so this blocks forever too.
     pub fn join(&self) {
-        let handles: Vec<JoinHandle<()>> = self
-            .handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect();
+        let handles: Vec<JoinHandle<()>> = self.handles.lock().drain(..).collect();
         for h in handles {
             let _ = h.join();
         }
@@ -265,7 +250,7 @@ impl<T> WorkQueue<T> {
     /// queue is full; shedding is the correct overload behaviour, since
     /// queueing without bound would just move the flood into memory.
     fn push(&self, item: T) -> bool {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.inner.lock();
         if q.len() >= self.capacity || self.shutdown.load(Ordering::Relaxed) {
             return false;
         }
@@ -277,7 +262,7 @@ impl<T> WorkQueue<T> {
     /// Block until an item is available, or return `None` when the server
     /// is shutting down.
     fn pop(&self) -> Option<T> {
-        let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.inner.lock();
         loop {
             if let Some(item) = q.pop_front() {
                 return Some(item);
@@ -314,7 +299,7 @@ fn udp_recv_loop(
             Err(_) => continue,
         };
         let job = UdpJob {
-            bytes: buf[..n].to_vec(),
+            bytes: crate::wire::capped(&buf, n).to_vec(),
             src,
             sock: sock.clone(),
         };
@@ -390,7 +375,12 @@ fn read_deadline(
         if shutdown.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        match stream.read(&mut buf[filled..]) {
+        // The loop condition proved `filled < buf.len()`, so the tail exists;
+        // `get_mut` is what says so without a slicing expression.
+        let Some(rest) = buf.get_mut(filled..) else {
+            return Ok(false);
+        };
+        match stream.read(rest) {
             Ok(0) => return Ok(false), // peer closed cleanly
             Ok(n) => filled += n,
             Err(e)

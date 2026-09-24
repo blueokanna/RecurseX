@@ -17,7 +17,8 @@ pub mod tls;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::sync::Mutex;
+use crate::sync::Mutex;
+use crate::wire::WireBytes;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use courierust::courierust_tls::RootStore;
@@ -76,11 +77,11 @@ pub fn deframe_response(bytes: &[u8]) -> Result<Message> {
     if bytes.len() < 2 {
         return Err(Error::wire("DoQ response shorter than length prefix"));
     }
-    let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    let len = usize::from(bytes.u16_at(0)?);
     if bytes.len() != 2 + len {
         return Err(Error::wire("DoQ response length mismatch"));
     }
-    Message::parse(&bytes[2..])
+    Message::parse(bytes.rest_at(2)?)
 }
 
 /// A single DoQ connection: one QUIC connection speaking RFC 9250.
@@ -137,7 +138,7 @@ struct BuiltinConnection {
 
 impl DoqConnection for BuiltinConnection {
     fn request(&mut self, framed_query: &[u8]) -> Result<Vec<u8>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         let conn = guard
             .as_mut()
             .ok_or_else(|| Error::transport("doq connection closed"))?;
@@ -154,7 +155,7 @@ impl DoqConnection for BuiltinConnection {
     }
 
     fn close(&mut self) {
-        if let Some(conn) = self.inner.lock().unwrap().as_mut() {
+        if let Some(conn) = self.inner.lock().as_mut() {
             conn.close();
         }
     }
@@ -270,17 +271,23 @@ impl DnsTransport for DoqTransport {
             conn.close();
             r?
         } else {
-            let mut guard = self.conn.lock().unwrap();
+            let mut guard = self.conn.lock();
             let conn = match guard.as_mut() {
                 Some(c) if c.is_open() => c,
                 _ => {
+                    // The caller's timeout is the bound, verbatim. It used to be
+                    // floored at 10 s "because a QUIC handshake needs more than a
+                    // UDP exchange", which quietly turned a 200 ms request into a
+                    // ten-second stall and made every deadline above it — the
+                    // engine's per-query budget included — meaningless for DoQ.
+                    // A caller that wants ten seconds can ask for ten seconds.
                     let c = quic::QuicConnection::connect(
                         endpoint,
                         self.host.as_deref(),
                         self.roots.clone(),
                         self.verify,
                         self.now,
-                        timeout_ms.max(10_000),
+                        timeout_ms,
                     )?;
                     *guard = Some(c);
                     guard.as_mut().unwrap()
@@ -295,7 +302,7 @@ impl DnsTransport for DoqTransport {
             }
         };
         let _ = deframe_response(&resp)?;
-        Ok(resp[2..].to_vec())
+        Ok(resp.rest_at(2)?.to_vec())
     }
 }
 
@@ -336,19 +343,32 @@ mod tests {
     #[test]
     fn builtin_provider_is_not_a_noop() {
         // The default transport must carry a real QUIC stack, not a
-        // "not implemented" provider.
+        // "not implemented" provider. 192.0.2.1 is TEST-NET: the Initial goes
+        // nowhere and nothing ever comes back, so the transport has to give up
+        // by itself.
         let t = DoqTransport::default();
         let ep = Endpoint::new("192.0.2.1".parse().unwrap(), 853, Proto::DoQ);
-        // A blackhole endpoint should yield a timeout/io error, NOT an
-        // `Unsupported` "supply a DoqProvider" error.
+        let started = std::time::Instant::now();
         let r = t.exchange(b"\x00", &ep, 200);
-        assert!(r.is_err(), "expected an error for a blackhole DoQ endpoint");
-        if let Err(e) = r {
-            assert_ne!(
-                e.kind,
-                crate::error::ErrorKind::Unsupported,
-                "DoQ must use the built-in client, not report unsupported"
-            );
-        }
+        let elapsed = started.elapsed();
+        let e = r.expect_err("a blackhole DoQ endpoint must fail");
+        assert_ne!(
+            e.kind,
+            crate::error::ErrorKind::Unsupported,
+            "DoQ must use the built-in client, not report unsupported"
+        );
+        assert_eq!(
+            e.kind,
+            crate::error::ErrorKind::Timeout,
+            "an unreachable peer must surface as a timeout, not as {e}"
+        );
+        // And the requested timeout is the bound. This assertion is the reason
+        // the test exists: the transport used to floor the caller at 10 s, so a
+        // 200 ms request took ten seconds. That is not a slow test, it is a
+        // broken contract, and it is invisible without a clock in the test.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "a 200 ms budget took {elapsed:?}"
+        );
     }
 }

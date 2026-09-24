@@ -38,6 +38,7 @@ use courierust::courierust_tls::crypto::x25519;
 use courierust::courierust_tls::x509::{self, RootStore};
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::wire::WireBytes;
 
 /// TLS 1.3 handshake message types (RFC 8446 §Appendix B.3).
 mod hstype {
@@ -144,6 +145,22 @@ fn extension(ext_type: u16, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(body);
     out
+}
+
+/// The X25519 key share carried by a `key_share` extension body
+/// (`u16 group || u16 len || key`), or `None` for anything this client cannot
+/// use. A share that is absent, malformed, or for another group is *ignored*
+/// rather than fatal, so the handshake fails later with the honest reason
+/// ("no usable key share") instead of a parse error that hides the cause.
+/// Reading through [`WireBytes`] is what makes the short cases values rather
+/// than panics.
+fn x25519_key_share(body: &[u8]) -> Option<[u8; 32]> {
+    // `x25519` (group 0x001d) with a 32-octet key (RFC 8446 §4.2.8.2).
+    const X25519_WITH_32_OCTET_KEY: [u8; 4] = [0x00, 0x1d, 0x00, 0x20];
+    if body.array_at::<4>(0).ok()? != X25519_WITH_32_OCTET_KEY {
+        return None;
+    }
+    body.array_at::<32>(4).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -268,18 +285,20 @@ pub fn decode_server_transport_params(bytes: &[u8]) -> Result<ServerTransportPar
     let mut out = ServerTransportParams::default();
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let (id, used) = courierust::courierust_quic::varint::decode(&bytes[pos..])
+        let (id, used) = courierust::courierust_quic::varint::decode(bytes.rest_at(pos)?)
             .map_err(|_| Error::wire("QUIC transport parameter id malformed"))?;
         pos += used;
-        let (len, used) = courierust::courierust_quic::varint::decode(&bytes[pos..])
+        let (len, used) = courierust::courierust_quic::varint::decode(bytes.rest_at(pos)?)
             .map_err(|_| Error::wire("QUIC transport parameter length malformed"))?;
         pos += used;
         let len =
             usize::try_from(len).map_err(|_| Error::wire("QUIC parameter length overflow"))?;
-        if pos + len > bytes.len() {
-            return Err(Error::wire("QUIC transport parameter truncated"));
-        }
-        let value = &bytes[pos..pos + len];
+        // The bound is checked by the read itself: `slice_at` reports a length
+        // that runs past the end, and it reports it through arithmetic that
+        // cannot overflow rather than a comparison that can wrap.
+        let value = bytes
+            .slice_at(pos, len)
+            .map_err(|_| Error::wire("QUIC transport parameter truncated"))?;
         pos += len;
         match id {
             0x04 => out.initial_max_data = decode_param_u64(value)?,
@@ -576,12 +595,20 @@ impl ClientHandshake {
         if msg.len() < 4 {
             return Err(Error::wire("TLS handshake message too short"));
         }
-        let msg_type = msg[0];
-        let len = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+        let msg_type = msg.byte_at(0)?;
+        // A handshake length is three octets (RFC 8446 §4). Read as a `u32` and
+        // masked it would be one bad edit away from consuming `msg[4]`, which
+        // is the first byte of the body it is supposed to describe.
+        let len = (u32::from_be_bytes([
+            0,
+            msg.byte_at(1)?,
+            msg.byte_at(2)?,
+            msg.byte_at(3)?,
+        ])) as usize;
         if 4 + len != msg.len() {
             return Err(Error::wire("TLS handshake message length mismatch"));
         }
-        let body = &msg[4..];
+        let body = msg.rest_at(4)?;
         match msg_type {
             hstype::SERVER_HELLO if !self.saw_server_hello => {
                 self.parse_server_hello(body)?;
@@ -642,16 +669,16 @@ impl ClientHandshake {
         if body.len() < 35 {
             return Err(Error::wire("ServerHello too short"));
         }
-        if body[0] != 0x03 || body[1] != 0x03 {
+        if body.byte_at(0)? != 0x03 || body.byte_at(1)? != 0x03 {
             return Err(Error::wire("ServerHello legacy version is not TLS 1.2"));
         }
-        let random = &body[2..34];
+        let random = body.slice_at(2, 32)?;
         if random == HRR_RANDOM {
             return Err(Error::wire(
                 "HelloRetryRequest received (server group mismatch; refusing to retry)",
             ));
         }
-        let sid_len = body[34] as usize;
+        let sid_len = usize::from(body.byte_at(34)?);
         let mut pos = 35usize;
         if sid_len != 0 {
             return Err(Error::wire(
@@ -662,9 +689,9 @@ impl ClientHandshake {
         if pos + 3 > body.len() {
             return Err(Error::wire("ServerHello truncated"));
         }
-        let suite = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let suite = body.u16_at(pos)?;
         pos += 2;
-        if body[pos] != 0 {
+        if body.byte_at(pos)? != 0 {
             return Err(Error::wire("ServerHello compression method is not null"));
         }
         pos += 1;
@@ -680,7 +707,7 @@ impl ClientHandshake {
         if pos + 2 > body.len() {
             return Err(Error::wire("ServerHello missing extensions"));
         }
-        let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        let ext_total = usize::from(body.u16_at(pos)?);
         pos += 2;
         if pos + ext_total > body.len() {
             return Err(Error::wire("ServerHello extensions truncated"));
@@ -690,35 +717,29 @@ impl ClientHandshake {
         let mut ep = pos;
         let end = pos + ext_total;
         while ep + 4 <= end {
-            let etype = u16::from_be_bytes([body[ep], body[ep + 1]]);
-            let elen = u16::from_be_bytes([body[ep + 2], body[ep + 3]]) as usize;
+            let etype = body.u16_at(ep)?;
+            let elen = usize::from(body.u16_at(ep + 2)?);
             ep += 4;
-            if ep + elen > end {
-                return Err(Error::wire("ServerHello extension truncated"));
-            }
-            let ev = &body[ep..ep + elen];
+            let ev = body
+                .slice_at(ep, elen)
+                .map_err(|_| Error::wire("ServerHello extension truncated"))?;
             match etype {
                 0x002b => {
                     // supported_versions in a ServerHello is a single
                     // u16 `selected_version` (RFC 8446 §4.2.1) — unlike
                     // the ClientHello, which carries a length-prefixed
                     // list. It must be exactly TLS 1.3 (0x0304).
-                    if elen == 2 && ev[0] == 0x03 && ev[1] == 0x04 {
+                    if elen == 2 && matches!(ev.array_at::<2>(0), Ok([0x03, 0x04])) {
                         saw_versions = true;
                     }
                 }
-                0x0033
-                    // key_share: u16 group || u16 len || key. A guard keeps
-                    // a malformed extension from overwriting a good one.
-                    if elen >= 4 + 32
-                        && ev[0] == 0x00
-                        && ev[1] == 0x1d
-                        && ev[2] == 0x00
-                        && ev[3] == 0x20 =>
-                {
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(&ev[4..36]);
-                    server_key_share = Some(k);
+                0x0033 => {
+                    // Only an x25519 share is usable; a malformed extension is
+                    // ignored rather than trusted, so a wrong share surfaces
+                    // as a missing one — the honest diagnosis.
+                    if let Some(k) = x25519_key_share(ev) {
+                        server_key_share = Some(k);
+                    }
                 }
                 _ => {}
             }
@@ -765,7 +786,7 @@ impl ClientHandshake {
         if pos + 2 > body.len() {
             return Err(Error::wire("EncryptedExtensions truncated"));
         }
-        let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        let ext_total = usize::from(body.u16_at(pos)?);
         pos += 2;
         if pos + ext_total > body.len() {
             return Err(Error::wire("EncryptedExtensions truncated"));
@@ -773,14 +794,14 @@ impl ClientHandshake {
         let end = pos + ext_total;
         let mut params = None;
         while pos + 4 <= end {
-            let etype = u16::from_be_bytes([body[pos], body[pos + 1]]);
-            let elen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+            let etype = body.u16_at(pos)?;
+            let elen = usize::from(body.u16_at(pos + 2)?);
             pos += 4;
-            if pos + elen > end {
-                return Err(Error::wire("EncryptedExtensions extension truncated"));
-            }
+            let extension = body
+                .slice_at(pos, elen)
+                .map_err(|_| Error::wire("EncryptedExtensions extension truncated"))?;
             if etype == 0x0039 {
-                params = Some(decode_server_transport_params(&body[pos..pos + elen])?);
+                params = Some(decode_server_transport_params(extension)?);
             }
             pos += elen;
         }
@@ -791,16 +812,16 @@ impl ClientHandshake {
         if body.len() < 4 {
             return Err(Error::wire("CertificateVerify truncated"));
         }
-        let scheme = u16::from_be_bytes([body[0], body[1]]);
-        let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+        let scheme = body.u16_at(0)?;
+        let sig_len = usize::from(body.u16_at(2)?);
         if 4 + sig_len != body.len() {
             return Err(Error::wire("CertificateVerify signature length mismatch"));
         }
-        let signature = &body[4..];
-        if self.chain.is_empty() {
-            return Err(Error::wire("CertificateVerify before any certificate"));
-        }
-        let leaf_der = &self.chain[0];
+        let signature = body.rest_at(4)?;
+        let leaf_der = self
+            .chain
+            .first()
+            .ok_or_else(|| Error::wire("CertificateVerify before any certificate"))?;
         let leaf = x509::parse_certificate(leaf_der).map_err(|e| {
             Error::new(
                 ErrorKind::Dnssec,
@@ -1023,13 +1044,21 @@ impl ClientHandshake {
             ));
         }
         let key = &leaf.spki.key;
-        if key.len() != 1 + 2 * clen || key[0] != 0x04 {
+        // An uncompressed EC point is `0x04 || X || Y`. A truncated key fails
+        // the leading-byte read and the length check for the same reason, so
+        // they share one error: `matches!` keeps a short key from turning into
+        // a propagated "read past the end", which would send the reader looking
+        // for a buffer bug instead of at the certificate.
+        if key.len() != 1 + 2 * clen || !matches!(key.byte_at(0), Ok(0x04)) {
             return Err(Error::new(
                 ErrorKind::Dnssec,
                 "leaf certificate key is not an uncompressed EC point",
             ));
         }
-        Ok((key[1..1 + clen].to_vec(), key[1 + clen..].to_vec()))
+        Ok((
+            key.slice_at(1, clen)?.to_vec(),
+            key.rest_at(1 + clen)?.to_vec(),
+        ))
     }
 }
 
@@ -1046,7 +1075,7 @@ fn parse_rsa_public_key(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if tag_n != 0x02 {
         return None;
     }
-    let (tag_e, e_raw, _) = read_der_tlv(&content[n_used..])?;
+    let (tag_e, e_raw, _) = read_der_tlv(content.rest_at(n_used).ok()?)?;
     if tag_e != 0x02 {
         return None;
     }
@@ -1058,91 +1087,95 @@ fn parse_rsa_public_key(der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((n, e))
 }
 
-/// Remove a single leading `0x00` sign byte from an INTEGER value.
+/// Remove a single leading `0x00` sign byte from an INTEGER value. A lone
+/// `0x00` is the encoding of zero itself and is kept.
 fn strip_int_leading_zero(v: &[u8]) -> Vec<u8> {
-    if v.len() > 1 && v[0] == 0 {
-        v[1..].to_vec()
-    } else {
-        v.to_vec()
+    match v.split_first() {
+        Some((0, rest)) if !rest.is_empty() => rest.to_vec(),
+        _ => v.to_vec(),
     }
 }
 
 /// Read one DER TLV: returns `(tag, value, total_consumed)`.
+///
+/// A value shorter than the length it declares is a truncation, which is `None`
+/// — this parser has no error type because every failure in DER is the same
+/// failure: the bytes are not what they claim to be.
 fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], usize)> {
-    if data.is_empty() {
-        return None;
-    }
-    let tag = data[0];
-    let mut pos = 1usize;
-    if pos >= data.len() {
-        return None;
-    }
-    let first_len = data[pos];
-    pos += 1;
-    let len = if first_len & 0x80 == 0 {
-        first_len as usize
+    let (tag, rest) = data.split_first()?;
+    let (first_len, rest) = rest.split_first()?;
+    // A short-form length is at most 127 and lives in the octet itself; a
+    // long-form length carries the number of length octets in its low seven
+    // bits (X.690 §8.1.3). The indefinite form is not DER and is not accepted.
+    let (len, body_at) = if first_len & 0x80 == 0 {
+        (usize::from(*first_len), 0usize)
     } else {
-        let nbytes = (first_len & 0x7f) as usize;
-        if nbytes == 0 || nbytes > 4 || pos + nbytes > data.len() {
+        let nbytes = usize::from(first_len & 0x7f);
+        if nbytes == 0 || nbytes > 4 {
             return None;
         }
-        let mut l = 0usize;
-        for &b in &data[pos..pos + nbytes] {
-            l = (l << 8) | b as usize;
+        let mut len = 0usize;
+        for &byte in rest.get(..nbytes)? {
+            len = (len << 8) | usize::from(byte);
         }
-        pos += nbytes;
-        l
+        (len, nbytes)
     };
-    if pos + len > data.len() {
-        return None;
-    }
-    Some((tag, &data[pos..pos + len], pos + len))
+    // A length that reaches past the end is a truncation, and one that stops
+    // short is fine: `total_consumed` is what lets a caller walk a sequence.
+    let value = rest.get(body_at..)?.get(..len)?;
+    Some((*tag, value, 2 + body_at + len))
 }
 
 /// Parse an RFC 8446 §4.4.2 Certificate message body into the DER chain
 /// (leaf first). The message must carry no request context.
 pub fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if body.is_empty() {
-        return Err(Error::wire("Certificate message empty"));
-    }
-    let ctx_len = body[0] as usize;
+    // `u8 context_len || u24 list_len || entries`. QUIC always sends an empty
+    // context (RFC 9001 §8.2); a non-empty one belongs to a resumption
+    // handshake over a byte stream and has no meaning here.
+    let ctx_len = usize::from(
+        body.first()
+            .copied()
+            .ok_or_else(|| Error::wire("Certificate message empty"))?,
+    );
     if ctx_len != 0 {
         return Err(Error::wire("Certificate carries a request context"));
     }
-    let mut pos = 1usize;
-    if pos + 3 > body.len() {
-        return Err(Error::wire("Certificate list length truncated"));
-    }
-    let list_len =
-        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
-    pos += 3;
-    let end = pos + list_len;
-    if end > body.len() {
-        return Err(Error::wire("Certificate list truncated"));
-    }
+    let list_len = usize::try_from(
+        body.u24_at(1)
+            .map_err(|_| Error::wire("Certificate list length truncated"))?,
+    )
+    .map_err(|_| Error::wire("Certificate list length overflow"))?;
+    // Parse the list as its own buffer, which is what it is. Every entry offset
+    // is then bounded by the list rather than by the message, so a length that
+    // runs past the list is a truncation even though the message continues.
+    let list = body
+        .slice_at(4, list_len)
+        .map_err(|_| Error::wire("Certificate list truncated"))?;
+    let mut pos = 0usize;
     let mut chain = Vec::new();
-    while pos < end {
-        if pos + 3 > end {
-            return Err(Error::wire("Certificate entry length truncated"));
-        }
-        let cert_len = ((body[pos] as usize) << 16)
-            | ((body[pos + 1] as usize) << 8)
-            | (body[pos + 2] as usize);
+    while pos < list.len() {
+        let cert_len = usize::try_from(
+            list.u24_at(pos)
+                .map_err(|_| Error::wire("Certificate entry length truncated"))?,
+        )
+        .map_err(|_| Error::wire("Certificate entry length overflow"))?;
         pos += 3;
-        if pos + cert_len > end {
-            return Err(Error::wire("Certificate entry truncated"));
-        }
-        chain.push(body[pos..pos + cert_len].to_vec());
+        chain.push(
+            list.slice_at(pos, cert_len)
+                .map_err(|_| Error::wire("Certificate entry truncated"))?
+                .to_vec(),
+        );
         pos += cert_len;
-        if pos + 2 > end {
-            return Err(Error::wire("Certificate entry extensions truncated"));
-        }
-        let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
-        pos += 2;
-        if pos + ext_len > end {
-            return Err(Error::wire("Certificate entry extensions truncated"));
-        }
-        pos += ext_len;
+        // The entry extensions (`u16 len || bytes`) are not interpreted, but
+        // they must be present and inside the list. Skipping them is still a
+        // read, so it is still checked.
+        let ext_len = usize::from(
+            list.u16_at(pos)
+                .map_err(|_| Error::wire("Certificate entry extensions truncated"))?,
+        );
+        list.slice_at(pos + 2, ext_len)
+            .map_err(|_| Error::wire("Certificate entry extensions truncated"))?;
+        pos += 2 + ext_len;
     }
     if chain.is_empty() {
         return Err(Error::wire("Certificate message has no certificates"));
@@ -1237,5 +1270,231 @@ mod tests {
         let chain = parse_certificate_list(&body).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0], vec![0xAA]);
+    }
+
+    #[test]
+    fn a_certificate_entry_is_bounded_by_the_list_not_the_message() {
+        // list_len = 6, entry claims a 8-octet certificate, and the message
+        // carries eight more bytes after the list. The trailing bytes are the
+        // point: a parser that bounded entries by the *message* would accept
+        // this and hand the caller bytes belonging to the next handshake
+        // message, so this test fails if that bound is ever loosened.
+        let mut past_list = vec![0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x08, 0xAA, 0xAA, 0xAA];
+        past_list.extend_from_slice(&[0xBB; 8]);
+        assert!(parse_certificate_list(&past_list).is_err());
+
+        // A list that claims to be longer than the message.
+        let overlong = vec![0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0xAA, 0x00, 0x00];
+        assert!(parse_certificate_list(&overlong).is_err());
+
+        // An entry with no room for its own length field.
+        assert!(parse_certificate_list(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00]).is_err());
+        // Entry extensions that run past the list.
+        assert!(parse_certificate_list(&[0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x01, 0xAA, 0x00, 0x10])
+            .is_err());
+
+        // A non-empty request context belongs to a stream handshake.
+        assert!(parse_certificate_list(&[0x01, 0x00, 0x00, 0x00]).is_err());
+        // Nothing at all, and a list with no entries.
+        assert!(parse_certificate_list(&[]).is_err());
+        assert!(parse_certificate_list(&[0x00, 0x00, 0x00, 0x00]).is_err());
+        // Truncated inside the list-length field.
+        assert!(parse_certificate_list(&[0x00, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn a_handshake_length_is_three_octets() {
+        // RFC 8446 §4: a handshake length is three octets. Reading it as four
+        // consumes the first body byte, which is not a subtle failure — every
+        // message would be one byte short and the transcript would not match
+        // the peer's.
+        let body = vec![0xAAu8; 198];
+        let msg = hs_message(1, &body);
+        assert_eq!(msg.len(), 202);
+        assert_eq!(msg.u24_at(1).unwrap() as usize, body.len());
+        // 198 == 0x0000c6: the fourth octet of the 4-octet form is absent.
+        assert_eq!(&msg[1..4], &[0x00, 0x00, 0xc6]);
+        assert_eq!(msg.first(), Some(&1u8));
+    }
+
+    #[test]
+    fn der_tlv_reads_both_length_forms_and_refuses_truncation() {
+        // Short form.
+        assert_eq!(
+            read_der_tlv(&[0x30, 0x03, 0x01, 0x02, 0x03]).unwrap(),
+            (0x30, &[0x01, 0x02, 0x03][..], 5)
+        );
+        // Long form: 0x81 says one length octet follows.
+        assert_eq!(
+            read_der_tlv(&[0x04, 0x81, 0x02, 0xAA, 0xBB]).unwrap(),
+            (0x04, &[0xAA, 0xBB][..], 5)
+        );
+        // A value shorter than its length is a truncation, not a short read.
+        assert!(read_der_tlv(&[0x30, 0x04, 0x01]).is_none());
+        // A long-form length that needs octets the buffer does not have.
+        assert!(read_der_tlv(&[0x30, 0x82, 0x01]).is_none());
+        // The indefinite form is not DER.
+        assert!(read_der_tlv(&[0x30, 0x80, 0x00, 0x00]).is_none());
+        // A tag with no length, and nothing at all.
+        assert!(read_der_tlv(&[0x30]).is_none());
+        assert!(read_der_tlv(&[]).is_none());
+        // Trailing bytes are left alone: `total_consumed` is what lets a caller
+        // walk a SEQUENCE.
+        let (_, value, used) = read_der_tlv(&[0x02, 0x01, 0x05, 0x02, 0x01, 0x03]).unwrap();
+        assert_eq!((value, used), (&[0x05][..], 3));
+    }
+
+    #[test]
+    fn an_integer_sign_byte_is_stripped_but_zero_is_kept() {
+        assert_eq!(strip_int_leading_zero(&[0x00, 0x05]), vec![0x05]);
+        // A lone `0x00` is the encoding of zero, not a sign byte.
+        assert_eq!(strip_int_leading_zero(&[0x00]), vec![0x00]);
+        // Exactly one byte is a sign byte.
+        assert_eq!(strip_int_leading_zero(&[0x00, 0x00, 0x05]), vec![0x00, 0x05]);
+        // No leading zero: the bytes are the value.
+        assert_eq!(strip_int_leading_zero(&[0x7F]), vec![0x7F]);
+        assert_eq!(strip_int_leading_zero(&[0x80, 0x01]), vec![0x80, 0x01]);
+        assert_eq!(strip_int_leading_zero(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn rsa_public_key_der_parses_and_refuses_truncation() {
+        // SEQUENCE { INTEGER 5, INTEGER 3 }.
+        let (n, e) =
+            parse_rsa_public_key(&[0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x03]).unwrap();
+        assert_eq!((n, e), (vec![0x05], vec![0x03]));
+
+        // With the positive-sign octet on the modulus.
+        let (n, _) = parse_rsa_public_key(&[
+            0x30, 0x07, 0x02, 0x02, 0x00, 0x05, 0x02, 0x01, 0x03,
+        ])
+        .unwrap();
+        assert_eq!(n, vec![0x05]);
+
+        // Declared two octets, one present.
+        assert!(parse_rsa_public_key(&[0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x02, 0x03]).is_none());
+        // Not a SEQUENCE.
+        assert!(parse_rsa_public_key(&[0x31, 0x03, 0x02, 0x01, 0x05]).is_none());
+        // Truncated before the exponent.
+        assert!(parse_rsa_public_key(&[0x30, 0x03, 0x02, 0x01, 0x05]).is_none());
+        // A zero-length modulus is not a key.
+        assert!(parse_rsa_public_key(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x01, 0x03]).is_none());
+        assert!(parse_rsa_public_key(&[]).is_none());
+    }
+
+    #[test]
+    fn a_truncated_transport_parameter_is_refused_not_read() {
+        // id 0x03 claims eight octets with none present.
+        assert!(decode_server_transport_params(&[0x03, 0x08]).is_err());
+        // A length that overflows the buffer.
+        assert!(decode_server_transport_params(&[0x03, 0xff, 0x01]).is_err());
+        // A length field with no value behind it.
+        assert!(decode_server_transport_params(&[0x03, 0x01]).is_err());
+        // An unknown parameter is skipped, not fatal, and the one after it is
+        // still read.
+        let mut params = vec![0x42, 0x01, 0x00];
+        params.extend_from_slice(&[0x04, 0x01, 0x10]);
+        assert_eq!(
+            decode_server_transport_params(&params).unwrap().initial_max_data,
+            0x10
+        );
+    }
+
+    #[test]
+    fn only_an_x25519_key_share_is_accepted() {
+        let mut offered = vec![0x00, 0x1d, 0x00, 0x20];
+        offered.extend_from_slice(&[0x09; 32]);
+        assert_eq!(x25519_key_share(&offered).unwrap(), [0x09; 32]);
+
+        // Another group (secp256r1 is 0x0017) with a plausible length.
+        let mut other_group = vec![0x00, 0x17, 0x00, 0x20];
+        other_group.extend_from_slice(&[0x09; 32]);
+        assert!(x25519_key_share(&other_group).is_none());
+
+        // The right group, but the length behind it is not 32.
+        let mut wrong_length = vec![0x00, 0x1d, 0x00, 0x1f];
+        wrong_length.extend_from_slice(&[0x09; 31]);
+        assert!(x25519_key_share(&wrong_length).is_none());
+
+        // The header has to be *at* offset zero; four bytes that look like it
+        // elsewhere are not a key share.
+        let mut shifted = vec![0x00, 0x00, 0x1d, 0x00, 0x20];
+        shifted.extend_from_slice(&[0x09; 32]);
+        assert!(x25519_key_share(&shifted).is_none());
+
+        assert!(x25519_key_share(&[]).is_none());
+        assert!(x25519_key_share(&[0x00, 0x1d, 0x00]).is_none());
+    }
+
+    /// A ServerHello body whose `supported_versions` extension carries
+    /// `selected_version` and whose `key_share` carries `key_share`, so the
+    /// extension scanners can be exercised without inventing a whole
+    /// handshake.
+    fn server_hello_body(selected_version: &[u8], key_share: &[u8]) -> Vec<u8> {
+        let mut ext = Vec::new();
+        // supported_versions: a single u16 in a ServerHello (RFC 8446 §4.2.1).
+        ext.extend_from_slice(&[0x00, 0x2b]);
+        ext.extend_from_slice(&(selected_version.len() as u16).to_be_bytes());
+        ext.extend_from_slice(selected_version);
+        ext.extend_from_slice(&[0x00, 0x33]);
+        ext.extend_from_slice(&((key_share.len() + 4) as u16).to_be_bytes());
+        ext.extend_from_slice(&[0x00, 0x1d]);
+        ext.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        ext.extend_from_slice(key_share);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x5A; 32]); // random, not the HRR constant
+        body.push(0x00); // empty legacy_session_id
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(0x00); // null compression
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        body
+    }
+
+    #[test]
+    fn a_server_hello_needs_a_usable_x25519_key_share() {
+        const TLS13: &[u8] = &[0x03, 0x04];
+        let cfg = ClientConfig {
+            alpn: b"doq".to_vec(),
+            server_name: Some("dns.example.test".into()),
+            hostname: Some("dns.example.test".into()),
+            roots: RootStore::new(),
+            verify: false,
+            now: 1_700_000_000,
+            transport_params: TransportParams::client_defaults(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        // 0x09 followed by zeros is the x25519 base point: a legal peer public
+        // key whose shared secret is never all-zero.
+        let mut base_point = [0u8; 32];
+        base_point[0] = 9;
+
+        let mut handshake = ClientHandshake::new(cfg.clone());
+        handshake
+            .parse_server_hello(&server_hello_body(TLS13, &base_point))
+            .expect("an x25519 ServerHello must be accepted");
+        assert_eq!(handshake.suite(), Some(suite::AES_128_GCM_SHA256));
+
+        // Thirty-one octets: the group check sees a length it did not offer, so
+        // the extension is ignored and the failure names the missing key share
+        // rather than reporting a length error somewhere else.
+        let mut short_key = ClientHandshake::new(cfg.clone());
+        let err = short_key
+            .parse_server_hello(&server_hello_body(TLS13, &base_point[..31]))
+            .expect_err("a 31-octet key share is not x25519 with 32 octets");
+        assert_eq!(err.kind, ErrorKind::Wire);
+
+        // The extension block claims more bytes than the body has.
+        let mut truncated = server_hello_body(TLS13, &base_point);
+        truncated.truncate(truncated.len() - 3);
+        let mut cut = ClientHandshake::new(cfg.clone());
+        assert!(cut.parse_server_hello(&truncated).is_err());
+
+        // A server that selects TLS 1.2 has not selected TLS 1.3.
+        let mut downgrade = ClientHandshake::new(cfg);
+        assert!(downgrade
+            .parse_server_hello(&server_hello_body(&[0x03, 0x03], &base_point))
+            .is_err());
     }
 }

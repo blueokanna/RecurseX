@@ -464,8 +464,12 @@ fn validate_group(
     rrsigs: &[Record],
     now_secs: u32,
 ) -> Verdict {
-    // The signer zone: the RRSIG signer name.
-    let Some(signer) = rrsig_signer(&rrsigs[0]).cloned() else {
+    // The signer zone: the RRSIG signer name. A caller only reaches here with
+    // at least one signature; `first` states that rather than asserting it.
+    let Some(first) = rrsigs.first() else {
+        return Verdict::Indeterminate;
+    };
+    let Some(signer) = rrsig_signer(first).cloned() else {
         return Verdict::Indeterminate;
     };
     // Fetch the signer's DNSKEYs.

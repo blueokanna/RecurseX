@@ -37,7 +37,18 @@ impl DnsTransport for UdpTransport {
         loop {
             let (n, src) = match sock.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Both spellings of "the read timed out": Unix and Go-style
+                // pollers report `WouldBlock`, while Windows reports the socket's
+                // own `WSAETIMEDOUT`. Missing the second one made a dead upstream
+                // look like an I/O fault to every caller that matches on
+                // `ErrorKind` — a timeout is not a broken socket, and the
+                // distinction is the whole reason the kinds exist.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
                     return Err(Error::new(
                         crate::error::ErrorKind::Timeout,
                         format!("udp timeout waiting for {}", endpoint.addr_str()),
@@ -51,7 +62,7 @@ impl DnsTransport for UdpTransport {
                 Err(e) => return Err(Error::io(format!("udp recv: {e}"))),
             };
             if src == target {
-                return Ok(buf[..n].to_vec());
+                return Ok(crate::wire::capped(&buf, n).to_vec());
             }
             // Datagram from an unexpected source: ignore and keep reading
             // (bounded by the read timeout).
