@@ -24,6 +24,8 @@ pub struct Forwarder {
     pub endpoint: Endpoint,
     /// TLS server name for DoT / DoH / DoH3 / DoQ (SNI + verification).
     pub host: Option<String>,
+    /// The DoH URI path; `None` means the RFC 8484 default, `/dns-query`.
+    pub path: Option<String>,
 }
 
 impl Forwarder {
@@ -32,6 +34,7 @@ impl Forwarder {
         Self {
             endpoint,
             host: None,
+            path: None,
         }
     }
 
@@ -40,6 +43,50 @@ impl Forwarder {
         Self {
             endpoint,
             host: Some(host.into()),
+            path: None,
+        }
+    }
+
+    /// Use a non-default DoH URI path.
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// The DoH path actually used on the wire.
+    pub fn doh_path(&self) -> &str {
+        self.path.as_deref().unwrap_or("/dns-query")
+    }
+}
+
+/// The identity a pooled encrypted transport is built for.
+///
+/// Not the endpoint alone. The TLS name and the DoH path are part of *what a
+/// transport is*: two forwarders that share an address but differ in SNI or
+/// path must not share a connection, or one of them presents the other's TLS
+/// identity. That configuration is not exotic — it is what
+/// `nameserver-policy` produces when two node domains resolve to the same
+/// host over different SNI names.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct TransportKey {
+    endpoint: Endpoint,
+    host: Option<String>,
+    path: Option<String>,
+}
+
+impl TransportKey {
+    /// The key for one forwarder, with `path` normalized so an explicit
+    /// `/dns-query` and an omitted path share one pooled transport instead of
+    /// building two identical ones.
+    fn of(f: &Forwarder) -> Self {
+        let path = match f.path.as_deref() {
+            None | Some("/dns-query") => None,
+            Some(p) => Some(p.to_string()),
+        };
+        Self {
+            endpoint: f.endpoint,
+            host: f.host.clone(),
+            path,
         }
     }
 }
@@ -48,13 +95,13 @@ impl Forwarder {
 pub struct ForwarderSet {
     forwarders: Vec<Forwarder>,
     #[cfg(feature = "dot")]
-    dot: Mutex<BTreeMap<Endpoint, crate::transports::dot::DotTransport>>,
+    dot: Mutex<BTreeMap<TransportKey, crate::transports::dot::DotTransport>>,
     #[cfg(feature = "doh")]
-    doh: Mutex<BTreeMap<Endpoint, crate::transports::doh::DohTransport>>,
+    doh: Mutex<BTreeMap<TransportKey, crate::transports::doh::DohTransport>>,
     #[cfg(feature = "doh3")]
-    doh3: Mutex<BTreeMap<Endpoint, crate::transports::doh3::Doh3Transport>>,
+    doh3: Mutex<BTreeMap<TransportKey, crate::transports::doh3::Doh3Transport>>,
     #[cfg(feature = "doq")]
-    doq: Mutex<BTreeMap<Endpoint, crate::transports::doq::DoqTransport>>,
+    doq: Mutex<BTreeMap<TransportKey, crate::transports::doq::DoqTransport>>,
     plain: Transports,
     roots: courierust::courierust_tls::RootStore,
     verify: bool,
@@ -101,7 +148,15 @@ impl ForwarderSet {
     }
 
     /// Add a forwarder.
+    ///
+    /// A server already present — same address, TLS name and path — is
+    /// ignored, so the same upstream may be declared in several groups
+    /// without being dialled once per group it appears in.
     pub fn add(&mut self, f: Forwarder) {
+        let key = TransportKey::of(&f);
+        if self.forwarders.iter().any(|e| TransportKey::of(e) == key) {
+            return;
+        }
         self.forwarders.push(f);
     }
 
@@ -118,8 +173,25 @@ impl ForwarderSet {
         query_bytes: &[u8],
         timeout_ms: u64,
     ) -> Result<Message> {
+        self.exchange_with(&self.forwarders, query, query_bytes, timeout_ms)
+    }
+
+    /// Send a query to `group` until one of its servers answers.
+    ///
+    /// The pool is shared across groups: a server that appears in two groups
+    /// keeps one transport, because the transport is a property of the
+    /// (address, TLS name, path) triple and not of the group that named it.
+    /// Which group a query *uses* is the caller's decision; this only tries
+    /// the servers it is handed, in order.
+    pub fn exchange_with(
+        &self,
+        group: &[Forwarder],
+        query: &Message,
+        query_bytes: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Message> {
         let mut last_err: Option<Error> = None;
-        for f in &self.forwarders {
+        for f in group {
             let resp_bytes = match self.exchange_one(f, query_bytes, timeout_ms) {
                 Ok(b) => b,
                 Err(e) => {
@@ -143,12 +215,13 @@ impl ForwarderSet {
     }
 
     fn exchange_one(&self, f: &Forwarder, query: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+        let key = TransportKey::of(f);
         match f.endpoint.proto {
             Proto::Udp | Proto::Tcp => self.plain.exchange(&f.endpoint, query, timeout_ms),
             #[cfg(feature = "dot")]
             Proto::Tls => {
                 let mut cache = self.dot.lock().unwrap();
-                let t = cache.entry(f.endpoint).or_insert_with(|| {
+                let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::dot::DotTransport::for_host(
                         host,
@@ -162,21 +235,23 @@ impl ForwarderSet {
             #[cfg(feature = "doh")]
             Proto::DoH => {
                 let mut cache = self.doh.lock().unwrap();
-                let t = cache.entry(f.endpoint).or_insert_with(|| {
+                let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
-                    crate::transports::doh::DohTransport::for_host(
+                    let mut t = crate::transports::doh::DohTransport::for_host(
                         host,
                         self.roots.clone(),
                         self.verify,
                         self.now,
-                    )
+                    );
+                    t.path = f.doh_path().to_string();
+                    t
                 });
                 t.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(feature = "doh3")]
             Proto::DoH3 => {
                 let mut cache = self.doh3.lock().unwrap();
-                let t = cache.entry(f.endpoint).or_insert_with(|| {
+                let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::doh3::Doh3Transport::for_host(
                         host,
@@ -190,7 +265,7 @@ impl ForwarderSet {
             #[cfg(feature = "doq")]
             Proto::DoQ => {
                 let mut cache = self.doq.lock().unwrap();
-                let t = cache.entry(f.endpoint).or_insert_with(|| {
+                let t = cache.entry(key).or_insert_with(|| {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::doq::DoqTransport::for_host(
                         host,

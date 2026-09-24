@@ -10,6 +10,8 @@
 - [缓存准入与稳定性数学](Cache-Admission-zh.md) —— `CacheScore` 由什么构成，为什么稳定性要「测」不能「猜」。
 - [别名依赖](Alias-Dependency-zh.md) —— 为什么缓存之外还需要一个结构，才能把 CNAME 链当作整体保持可服务。
 - [上游选择成本模型](Upstream-Selection-zh.md) —— 为什么裸 RTT 是错的信号。
+- [DNS 策略层](DNS-Policy-zh.md) —— Clash 兼容的 `hosts` / fake-IP /
+  `nameserver-policy` / `fallback-filter`，以及为什么未知键会报错。
 - [DNSSEC](DNSSEC-zh.md) —— 校验什么、怎么校验、诚实的边界。
 - [持久化](Persistence-zh.md) —— L3 层：格式、原子写、恢复规则。
 - [部署与加固](Deployment-zh.md) —— 面向真实客户端的运行方式、限速、防欺骗。

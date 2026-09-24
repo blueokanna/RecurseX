@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -22,6 +23,8 @@ use crate::prng::SplitMix64;
 use crate::qtype::{Rcode, RrClass, RrType};
 use crate::query::{ecs_option, response_matches_query, QueryKey};
 use crate::rdata::{RData, Record};
+#[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+use crate::routing::Route;
 use crate::rrset::RrSet;
 use crate::stats::{Stats, StatsSnapshot};
 use crate::time::{Clock, SystemClock, Ts};
@@ -109,6 +112,102 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// The upstream groups a resolution may draw on.
+///
+/// Group ids are what [`NameserverPolicy`](crate::routing::NameserverPolicy)
+/// stores, so the id-to-servers mapping has to be stable and total. Ids `0`
+/// and `1` are reserved for the groups every deployment has — the default
+/// servers and the fallback servers — and policy-defined groups start at `2`.
+/// Reserving them means a policy rule can refer to the fallback servers by a
+/// fixed id instead of by position in a list that grows from the front.
+#[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+#[derive(Clone, Debug, Default)]
+pub struct UpstreamGroups {
+    /// `nameservers` (or the legacy `engine.forwarders`): the group used when
+    /// no policy rule matches.
+    pub default: Vec<crate::forward::Forwarder>,
+    /// `fallback`: used when the default group's answer looks poisoned, or
+    /// for a name listed in `fallback-filter.domain`.
+    pub fallback: Vec<crate::forward::Forwarder>,
+    /// Groups defined by `nameserver-policy`, indexed from id `2`.
+    pub extra: Vec<Vec<crate::forward::Forwarder>>,
+}
+
+#[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+impl UpstreamGroups {
+    /// The servers of group `id`, or `None` when no such group exists.
+    pub fn get(&self, id: usize) -> Option<&[crate::forward::Forwarder]> {
+        match id {
+            0 => Some(self.default.as_slice()),
+            1 => Some(self.fallback.as_slice()),
+            n => self.extra.get(n - 2).map(|v| v.as_slice()),
+        }
+    }
+
+    /// Whether a fallback group with at least one server exists. Without one
+    /// the poison gate has nowhere to send the query, so it does nothing.
+    pub fn has_fallback(&self) -> bool {
+        !self.fallback.is_empty()
+    }
+
+    /// Whether any group can serve a query at all.
+    pub fn is_empty(&self) -> bool {
+        self.default.is_empty()
+            && self.fallback.is_empty()
+            && self.extra.iter().all(|g| g.is_empty())
+    }
+
+    /// Every server across every group, for building the transport pool.
+    /// Duplicates are harmless: the pool is keyed by transport identity, so
+    /// one server in three groups still gets one transport.
+    pub fn all(&self) -> Vec<crate::forward::Forwarder> {
+        let mut out = self.default.clone();
+        out.extend(self.fallback.iter().cloned());
+        for g in &self.extra {
+            out.extend(g.iter().cloned());
+        }
+        out
+    }
+}
+
+/// The Clash-compatible DNS policy layer.
+///
+/// Nothing here is tuning: every field is a statement about *where an answer
+/// comes from* that the default resolution path cannot express. They sit in
+/// front of the cache in this order:
+///
+/// 1. `hosts` — an explicit pin, always right by construction.
+/// 2. `fake_ip` — a synthetic address, when fake-IP mode is on.
+/// 3. `policy` — which upstream group serves the name.
+/// 4. `fallback` — whether the answer that came back is worth keeping.
+#[derive(Clone, Debug, Default)]
+pub struct DnsPolicy {
+    /// Static answers, consulted before the cache and the network.
+    pub hosts: crate::hosts::HostsTable,
+    /// Fake-IP mode. `None` means `normal`: real addresses only.
+    pub fake_ip: Option<crate::fakeip::FakeIpSettings>,
+    /// Suffix-based upstream selection.
+    pub policy: crate::routing::NameserverPolicy,
+    /// Answer-quality gate.
+    pub fallback: crate::routing::FallbackFilter,
+    /// Upstream groups.
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    pub upstreams: UpstreamGroups,
+}
+
+impl DnsPolicy {
+    /// Whether fake-IP mode is on.
+    pub fn fake_ip_enabled(&self) -> bool {
+        self.fake_ip.is_some()
+    }
+
+    /// Whether the layer has anything to do. A default-valued policy is the
+    /// pre-existing behaviour exactly, which is what makes it a safe default.
+    pub fn is_default(&self) -> bool {
+        self.hosts.is_empty() && self.fake_ip.is_none() && self.policy.is_empty()
+    }
+}
+
 /// Resolver configuration.
 #[derive(Clone, Debug)]
 pub struct ResolverConfig {
@@ -118,6 +217,8 @@ pub struct ResolverConfig {
     pub planner: PlannerConfig,
     /// Policy (blocklist) tuning.
     pub policy: PolicyConfig,
+    /// Clash-compatible DNS policy layer (hosts, fake-IP, routing, filter).
+    pub dns: DnsPolicy,
     /// Engine tuning.
     pub engine: EngineConfig,
     /// Client rate limiting.
@@ -149,6 +250,7 @@ impl Default for ResolverConfig {
             cache: CacheConfig::default(),
             planner: PlannerConfig::default(),
             policy: PolicyConfig::default(),
+            dns: DnsPolicy::default(),
             engine: EngineConfig::default(),
             rate_limit: RateLimitConfig::default(),
             max_inflight: 4096,
@@ -192,6 +294,67 @@ pub struct Resolution {
     pub served_at: Ts,
 }
 
+/// A NOERROR resolution carrying no records: NODATA.
+fn empty_answer(key: &QueryKey, ttl: u32, now: Ts) -> Resolution {
+    Resolution {
+        name: key.name.clone(),
+        rr_type: key.rr_type,
+        class: key.class,
+        rcode: Rcode::NOERROR,
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        rrsigs: Vec::new(),
+        validated: false,
+        ttl,
+        from_cache: false,
+        stale: false,
+        served_at: now,
+    }
+}
+
+/// The addresses in a resolution's answer section, used by the poison gate.
+#[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+fn answer_addresses(res: &Resolution) -> Vec<IpAddr> {
+    res.answers
+        .iter()
+        .filter_map(|r| match &r.rdata {
+            RData::A(v) => Some(IpAddr::V4(*v)),
+            RData::Aaaa(v) => Some(IpAddr::V6(*v)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Parse an `in-addr.arpa` reverse name into the address it stands for.
+///
+/// `4.3.2.1.in-addr.arpa` is `1.2.3.4`. Returns `None` for anything else,
+/// including `ip6.arpa` names: fake-IP is an IPv4 pool, and a v6 reverse name
+/// can never name one of its addresses.
+///
+/// The octet labels are checked for canonical form. `1.02.3.4.in-addr.arpa`
+/// is not a name any client synthesizes, so treating it as `1.2.3.4` would be
+/// inventing an equivalence rather than reading one.
+fn parse_in_addr_arpa(name: &Name) -> Option<Ipv4Addr> {
+    let labels = name.labels();
+    // Four octets, then `in-addr`, then `arpa`.
+    if labels.len() != 6 {
+        return None;
+    }
+    if !labels[4].eq_ignore_ascii_case(b"in-addr") || !labels[5].eq_ignore_ascii_case(b"arpa") {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (i, label) in labels[..4].iter().enumerate() {
+        let s = core::str::from_utf8(label).ok()?;
+        if s.is_empty() || s.len() > 3 || (s.len() > 1 && s.starts_with('0')) {
+            return None;
+        }
+        // Labels run least-significant first.
+        octets[3 - i] = s.parse().ok()?;
+    }
+    Some(Ipv4Addr::from(octets))
+}
+
 /// Shared resolver state (everything behind locks).
 pub struct SharedState {
     /// The multi-tier semantic cache.
@@ -205,6 +368,10 @@ pub struct SharedState {
     pub aliases: Mutex<AliasGraph>,
     /// The per-client rate limiter.
     pub client_limiter: Mutex<RateLimiter>,
+    /// The fake-IP pool, when fake-IP mode is on. Behind a lock because
+    /// allocation and reverse lookup both refresh recency, and recency is
+    /// what the pool's eviction order is built from.
+    pub fake_ip: Mutex<Option<crate::fakeip::FakeIpPool>>,
 }
 
 /// Table gauges, read with `try_lock`: a `Debug` impl that waits on a lock
@@ -244,6 +411,7 @@ impl SharedState {
                 config.rate_limit.client_refill_per_sec,
                 config.rate_limit.max_client_buckets,
             )),
+            fake_ip: Mutex::new(config.dns.fake_ip.as_ref().map(|s| s.build())),
         }
     }
 }
@@ -507,6 +675,9 @@ impl Resolver {
         );
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         {
+            for f in config.dns.upstreams.all() {
+                forwarder_set.add(f);
+            }
             for f in &config.engine.forwarders {
                 forwarder_set.add(f.clone());
             }
@@ -557,6 +728,9 @@ impl Resolver {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mut fs = crate::forward::ForwarderSet::new(roots, verify, now);
+        for f in self.inner.config.dns.upstreams.all() {
+            fs.add(f);
+        }
         for f in &self.inner.config.engine.forwarders {
             fs.add(f.clone());
         }
@@ -625,12 +799,6 @@ impl Resolver {
         let started = Instant::now();
         let now = self.inner.clock.now();
         self.inner.stats.queries.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .shared
-            .estimator
-            .lock()
-            .unwrap()
-            .observe_query(&key.name, now);
 
         if self.inner.policy.is_blocked(&key.name) {
             self.inner
@@ -642,6 +810,16 @@ impl Resolver {
                 format!("name blocked by policy: {}", key.name),
             ));
         }
+
+        if let Some(res) = self.local_answer(key, now) {
+            return Ok(res);
+        }
+        self.inner
+            .shared
+            .estimator
+            .lock()
+            .unwrap()
+            .observe_query(&key.name, now);
 
         let claim = self
             .inner
@@ -670,6 +848,104 @@ impl Resolver {
             .resolve_time_us_sum
             .fetch_add(elapsed, Ordering::Relaxed);
         result
+    }
+
+    /// An answer that comes from configuration instead of the network, when
+    /// the policy layer has one for this key.
+    ///
+    /// Three sources, in priority order:
+    ///
+    /// * **`hosts`** — an explicit pin. Authoritative for `A`/`AAAA`; an
+    ///   empty answer means NODATA *by decision*, so the query stops here
+    ///   rather than reaching the network. Any other record type falls
+    ///   through to normal resolution, because a pin is a statement about
+    ///   addresses, not an assertion that the name has no other records.
+    /// * **`fake_ip` reverse** — a `PTR` query for an address the pool owns
+    ///   answers with the domain assigned to it. Without this a client that
+    ///   reverse-resolves a synthetic address hits the public DNS and gets
+    ///   either NXDOMAIN or an unrelated real name, which is a bad thing to
+    ///   hand to a proxy that is about to route on it.
+    /// * **`fake_ip` forward** — `A` is synthesized; `AAAA` is answered
+    ///   NODATA, because in fake-IP mode a real IPv6 address would let the
+    ///   client dial the host directly and escape the proxy.
+    ///
+    /// Returns `None` when the layer has nothing to say — which includes a
+    /// name excluded by `fake-ip-filter`, and every name when fake-IP mode is
+    /// off. All of those are meant to be resolved for real.
+    fn local_answer(&self, key: &QueryKey, now: Ts) -> Option<Resolution> {
+        if key.class != RrClass::IN {
+            return None;
+        }
+
+        if let Some(records) = self.inner.config.dns.hosts.answer(&key.name, key.rr_type) {
+            self.inner
+                .stats
+                .hosts_answered
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(Resolution {
+                ttl: self.inner.config.dns.hosts.ttl(),
+                answers: records,
+                ..empty_answer(key, 0, now)
+            });
+        }
+
+        let settings = self.inner.config.dns.fake_ip.as_ref()?;
+        if key.rr_type == RrType::PTR {
+            let ip = parse_in_addr_arpa(&key.name)?;
+            let mut guard = self.inner.shared.fake_ip.lock().unwrap();
+            let pool = guard.as_mut()?;
+            let owner = pool.lookup(ip, now)?;
+            self.inner.stats.fake_ip_ptr.fetch_add(1, Ordering::Relaxed);
+            let ttl = settings.answer_ttl();
+            return Some(Resolution {
+                ttl,
+                answers: vec![Record {
+                    name: key.name.clone(),
+                    rr_type: RrType::PTR,
+                    class: RrClass::IN,
+                    ttl,
+                    rdata: RData::Ptr(owner),
+                }],
+                ..empty_answer(key, ttl, now)
+            });
+        }
+
+        match key.rr_type {
+            RrType::A => {}
+            // A real `AAAA` would escape the proxy; see the doc comment.
+            RrType::AAAA => return Some(empty_answer(key, settings.answer_ttl(), now)),
+            _ => return None,
+        }
+
+        let mut guard = self.inner.shared.fake_ip.lock().unwrap();
+        let pool = guard.as_mut()?;
+        let ip = match pool.allocate(&key.name, now) {
+            Ok(crate::fakeip::Allocation::Address(ip)) => ip,
+            Ok(crate::fakeip::Allocation::Filtered) => {
+                self.inner
+                    .stats
+                    .fake_ip_filtered
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Err(_) => return None,
+        };
+        self.inner
+            .stats
+            .fake_ip_answered
+            .fetch_add(1, Ordering::Relaxed);
+        let ttl = settings.answer_ttl();
+        Some(Resolution {
+            ttl,
+            answers: vec![Record {
+                name: key.name.clone(),
+                rr_type: RrType::A,
+                class: RrClass::IN,
+                ttl,
+                rdata: RData::A(ip),
+            }],
+            ..empty_answer(key, ttl, now)
+        })
     }
 
     /// Handle a client message (rate limiting + response construction).
@@ -736,11 +1012,7 @@ impl Resolver {
             qr: true,
             rd: query.flags.rd,
             ra: true,
-            // RFC 6840 §5.7: a response must not claim authenticity unless
-            // the client asked for it (DO) or explicitly asked about it (AD).
             ad: res.validated && (want_dnssec || query.flags.ad),
-            // Echo CD: the client asked us not to check, and that stays
-            // visible to it (and to any downstream cache).
             cd: query.flags.cd,
             rcode: res.rcode,
             ..HeaderFlags::default()
@@ -751,7 +1023,7 @@ impl Resolver {
             rec.ttl = res.ttl;
             m.answers.push(rec);
         }
-        // RRSIGs only when the client asked for DNSSEC.
+
         if want_dnssec {
             for r in &res.rrsigs {
                 let mut rec = r.clone();
@@ -764,7 +1036,7 @@ impl Resolver {
             rec.ttl = res.ttl;
             m.authorities.push(rec);
         }
-        // EDNS echo.
+
         if let Some(e) = &query.edns {
             m.edns = Some(crate::edns::Edns {
                 udp_payload_size: e.udp_payload_size.max(512),
@@ -795,39 +1067,91 @@ impl Resolver {
             .fetch_add(1, Ordering::Relaxed);
 
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-        let mut res = {
-            // Forwarding is a mode, not a fallback: if a forwarder is
-            // configured, its failure must be reported, never hidden behind
-            // an iterative resolution that would bypass the operator's
-            // chosen upstream (and its filtering).
-            let forwarding = self.inner.forwarder_set.lock().unwrap().is_enabled();
-            if forwarding {
-                self.forward_resolve(key)?
-            } else {
-                self.iterative_resolve(key, ns_depth)?
-            }
+        let mut res = if self.forward_route(key).is_some() {
+            self.forward_resolve(key)?
+        } else {
+            self.iterative_resolve(key, ns_depth)?
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
         let mut res = self.iterative_resolve(key, ns_depth)?;
         res.served_at = now;
 
-        // DNSSEC validation of the wire answer. CD=1 means the client asked
-        // us not to check, so the data is returned unvalidated (and the AD
-        // bit stays clear) rather than being turned into a failure.
         #[cfg(feature = "dnssec")]
         if self.inner.config.engine.dnssec && !key.cd && !res.answers.is_empty() {
             let verdict = crate::dnssec::validate_resolution(self, &res);
             res.validated = verdict == crate::dnssec::Verdict::Secure;
         }
 
-        // Populate the cache from the resolution.
         self.cache_resolution(key, &res, now);
         Ok(res)
     }
 
-    /// Resolve through the configured forwarders (RD=1).
+    /// The upstream group responsible for `key`, or `None` when the query
+    /// should be resolved iteratively.
+    ///
+    /// Three inputs, in order: the fallback filter's forced-name list, the
+    /// `nameserver-policy` suffix rules, then the default group.
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    fn forward_route(&self, key: &QueryKey) -> Option<&[crate::forward::Forwarder]> {
+        let dns = &self.inner.config.dns;
+        let groups = &dns.upstreams;
+        if dns.fallback.forces_fallback(&key.name) && groups.has_fallback() {
+            return Some(groups.fallback.as_slice());
+        }
+        let ruled = match dns.policy.route(&key.name) {
+            Route::Group(id) => groups.get(id),
+            Route::Default => None,
+        };
+
+        match ruled {
+            Some(g) if !g.is_empty() => Some(g),
+            _ if !groups.default.is_empty() => Some(groups.default.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Resolve through the group responsible for `key` (RD=1), applying the
+    /// fallback poison gate.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     fn forward_resolve(&self, key: &QueryKey) -> Result<Resolution> {
+        let dns = &self.inner.config.dns;
+        let groups = &dns.upstreams;
+        let forced = dns.fallback.forces_fallback(&key.name) && groups.has_fallback();
+        let primary = self.forward_route(key).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NoUpstream,
+                format!("no upstream group is responsible for {}", key.name),
+            )
+        })?;
+        let res = self.forward_once(key, primary)?;
+        if !forced && dns.policy.route(&key.name) != Route::Default {
+            self.inner
+                .stats
+                .policy_routed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !forced && groups.has_fallback() {
+            let addrs = answer_addresses(&res);
+            if dns.fallback.looks_poisoned(&addrs).is_some() {
+                self.inner
+                    .stats
+                    .fallback_triggered
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Ok(fallback) = self.forward_once(key, &groups.fallback) {
+                    return Ok(fallback);
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    /// One exchange against a specific group.
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    fn forward_once(
+        &self,
+        key: &QueryKey,
+        group: &[crate::forward::Forwarder],
+    ) -> Result<Resolution> {
         let query = self.with_rng(|rng| {
             crate::forward::build_forward_query(
                 key,
@@ -837,7 +1161,8 @@ impl Resolver {
             )
         });
         let bytes = query.to_bytes()?;
-        let resp = self.inner.forwarder_set.lock().unwrap().exchange(
+        let resp = self.inner.forwarder_set.lock().unwrap().exchange_with(
+            group,
             &query,
             &bytes,
             self.inner.config.engine.timeout_ms,
@@ -960,7 +1285,6 @@ impl Resolver {
                 LookupOutcome::Cname {
                     target, ttl_secs, ..
                 } => {
-                    // Fetch the actual CNAME record.
                     let ck = CacheKey::plain(current.name.clone(), RrType::CNAME, current.class);
                     match self.inner.shared.cache.lock().unwrap().lookup(&ck, now) {
                         LookupOutcome::Fresh(e) => {
@@ -972,9 +1296,6 @@ impl Resolver {
                                 }
                             }
                             ttl = ttl.min(ttl_secs.max(1));
-                            // Cached hits record the alias relation too, so a
-                            // chain first seen through the network and later
-                            // served from cache keeps the same dependencies.
                             self.link_alias(
                                 &current.name,
                                 &target,
@@ -1003,9 +1324,6 @@ impl Resolver {
         if ttl == u32::MAX {
             ttl = 0;
         }
-        // Queue background refresh of the stale chain — together with the
-        // aliases each refreshed entry keeps servable, so the whole chain
-        // (not one hop of it) comes back fresh.
         if stale {
             for k in refresh_keys {
                 self.refresh_with_dependents(&k, self.inner.config.max_chain_refresh);
@@ -1117,7 +1435,6 @@ impl Resolver {
                     ttl = ttl.min(record.ttl);
                     answers.push(record.clone());
                     rrsigs.extend(sigs);
-                    // Cache the CNAME RRset for future queries.
                     let mut set =
                         RrSet::new(record.name.clone(), RrType::CNAME, key.class, record.ttl);
                     set.add_record(record);
@@ -1135,9 +1452,6 @@ impl Resolver {
                         .lock()
                         .unwrap()
                         .insert_positive(&ck, set, now, inputs, false);
-                    // The answer for (name, type) is now derived from the
-                    // target's data: record the dependency so a later change
-                    // to the target can pull this alias along.
                     self.link_alias(&current_name, &target, current_type, key.class, now);
                     if !target.is_subdomain_of(&zone) || zone == Name::root() {
                         zone = Name::root();
@@ -1332,8 +1646,43 @@ impl Resolver {
         Ok(endpoints)
     }
 
-    /// Resolve a hostname to IP addresses (cache first, then A/AAAA).
+    /// Resolve a hostname to IP addresses (pin first, then cache, then A/AAAA).
+    ///
+    /// # Why `hosts` applies here but fake-IP does not
+    ///
+    /// This path resolves the addresses of name servers the resolver itself
+    /// dials, and of names a caller asks for directly. The two policy sources
+    /// have opposite answers here:
+    ///
+    /// * A **pin** is a real address the operator supplied. Pinning an
+    ///   internal or hidden authoritative server is a normal deployment, and
+    ///   this is the only path that can serve the delegation — so the pin is
+    ///   consulted, and a name that is pinned never falls through to the
+    ///   public DNS, because doing so would half-honour the pin.
+    /// * A **fake-IP** is a synthetic address whose only meaning is "this
+    ///   client should come to the proxy". Handing one to the engine would
+    ///   make the resolver send its own queries to an address that is not a
+    ///   server — the resolver would be querying itself. So fake-IP is
+    ///   deliberately *not* consulted on this path, in either mode.
     fn resolve_host_addresses(&self, name: &Name, ns_depth: usize) -> Option<Vec<IpAddr>> {
+        let hosts = &self.inner.config.dns.hosts;
+        if hosts.contains(name) {
+            let mut out = Vec::new();
+            for t in [RrType::A, RrType::AAAA] {
+                if let Some(records) = hosts.answer(name, t) {
+                    for r in &records {
+                        match &r.rdata {
+                            RData::A(ip) => out.push(IpAddr::V4(*ip)),
+                            RData::Aaaa(ip) => out.push(IpAddr::V6(*ip)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            return if out.is_empty() { None } else { Some(out) };
+        }
+
         let now = self.inner.clock.now();
         let mut out = Vec::new();
         for t in [RrType::A, RrType::AAAA] {
@@ -1796,6 +2145,32 @@ impl Resolver {
                         .stats
                         .alias_edges
                         .store(aliases.edge_count() as u64, Ordering::Relaxed);
+                }
+                // Fake-IP maintenance. Mappings are reclaimed here on a
+                // schedule rather than only under allocation pressure: a name
+                // nobody queries any more will never trigger an allocation
+                // again, so waiting for pressure would let its address sit
+                // out of circulation indefinitely. The gauges go in the same
+                // pass, because the pool is behind a lock and a status
+                // endpoint must not have to take it.
+                if r.inner.config.dns.fake_ip.is_some() {
+                    let mut guard = r
+                        .inner
+                        .shared
+                        .fake_ip
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(pool) = guard.as_mut() {
+                        pool.cleanup_expired(now);
+                        r.inner
+                            .stats
+                            .fake_ip_entries
+                            .store(pool.len() as u64, Ordering::Relaxed);
+                        r.inner
+                            .stats
+                            .fake_ip_evicted
+                            .store(pool.evicted(), Ordering::Relaxed);
+                    }
                 }
                 let candidates = {
                     let mut cache = r
@@ -2300,5 +2675,317 @@ mod tests {
         let mut cd = q.clone();
         cd.flags.cd = true;
         assert!(r.build_response(&cd, &res).flags.cd);
+    }
+
+    // -----------------------------------------------------------------
+    // Clash policy layer: hosts and fake-IP, end to end through the
+    // resolver (no upstream is reachable, so anything that falls through
+    // to the network fails fast instead of passing by accident).
+    // -----------------------------------------------------------------
+
+    /// Apply a `dns` configuration and point every network path at a dead
+    /// loopback port. A policy answer that wrongly fell through to the
+    /// network then fails the test instead of hanging it.
+    fn policy_resolver(json: &str) -> Resolver {
+        let mut cfg = crate::config::Config::from_json_str(json)
+            .unwrap()
+            .into_resolver_config()
+            .unwrap();
+        cfg.engine.root_servers = vec!["127.0.0.1:1".parse().unwrap()];
+        cfg.engine.timeout_ms = 50;
+        cfg.engine.max_total_attempts = 1;
+        cfg.engine.max_attempts_per_server = 1;
+        Resolver::new(cfg)
+    }
+
+    /// A `hosts` pin answers from configuration, and nothing about it
+    /// touches the cache: a reload must be visible on the next query.
+    #[test]
+    fn hosts_pin_answers_without_the_network() {
+        let r = policy_resolver(r#"{"dns": {"hosts": {"pinned.example": "10.9.8.7"}}}"#);
+        let res = r
+            .resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::A)
+            .expect("a pin must be answered locally");
+        assert_eq!(res.rcode, Rcode::NOERROR);
+        assert_eq!(res.answers.len(), 1);
+        assert!(
+            matches!(&res.answers[0].rdata, RData::A(v) if v.to_string() == "10.9.8.7"),
+            "got {:?}",
+            res.answers[0].rdata
+        );
+        assert!(!res.from_cache);
+        assert_eq!(
+            r.shared().cache.lock().unwrap().len(),
+            0,
+            "a pin must not be cached"
+        );
+    }
+
+    /// The other family is NODATA, not a leak: a client must not reach the
+    /// real address by asking the family the pin did not cover.
+    #[test]
+    fn hosts_pin_makes_the_other_family_nodata() {
+        let r = policy_resolver(r#"{"dns": {"hosts": {"pinned.example": "10.9.8.7"}}}"#);
+        let res = r
+            .resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::AAAA)
+            .expect("NODATA is a successful answer");
+        assert_eq!(res.rcode, Rcode::NOERROR);
+        assert!(res.answers.is_empty(), "AAAA must be an empty answer");
+    }
+
+    /// The pin reaches the client through the message path, with the answer
+    /// in the response rather than only in the resolution.
+    #[test]
+    fn hosts_pin_is_served_through_handle_query() {
+        let r = policy_resolver(r#"{"dns": {"hosts": {"pinned.example": "10.9.8.7"}}}"#);
+        let q = Message::query(
+            7,
+            Name::from_ascii("pinned.example").unwrap(),
+            RrType::A,
+            true,
+        );
+        let resp = r.handle_query(&q, None);
+        assert!(resp.flags.qr);
+        assert_eq!(resp.rcode(), 0);
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    /// fake-IP mode synthesizes an address from the configured range, and
+    /// the pool can reverse it — which is what makes the mode usable.
+    #[test]
+    fn fake_ip_mode_synthesizes_an_address() {
+        let r = policy_resolver(
+            r#"{"dns": {"enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.0/16"}}"#,
+        );
+        let name = Name::from_ascii("anything.example").unwrap();
+        let res = r.resolve(&name, RrType::A).unwrap();
+        assert_eq!(res.answers.len(), 1);
+        let RData::A(ip) = res.answers[0].rdata else {
+            panic!("expected an A record, got {:?}", res.answers[0].rdata);
+        };
+        assert!(ip.to_string().starts_with("198.18."), "got {ip}");
+        assert_eq!(res.ttl, 1, "a synthesized answer defaults to a 1s TTL");
+
+        // Stable across queries, and reversible.
+        let again = r.resolve(&name, RrType::A).unwrap();
+        assert_eq!(again.answers[0].rdata, res.answers[0].rdata);
+        let shared = r.shared();
+        let guard = shared.fake_ip.lock().unwrap();
+        let pool = guard.as_ref().expect("fake-ip mode must build a pool");
+        assert_eq!(pool.peek(ip), Some(&name));
+    }
+
+    /// In fake-IP mode `AAAA` is NODATA. A real IPv6 address would let the
+    /// client dial the host directly and escape the proxy entirely.
+    #[test]
+    fn fake_ip_mode_makes_aaaa_nodata() {
+        let r = policy_resolver(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#);
+        let res = r
+            .resolve(&Name::from_ascii("anything.example").unwrap(), RrType::AAAA)
+            .unwrap();
+        assert_eq!(res.rcode, Rcode::NOERROR);
+        assert!(res.answers.is_empty());
+    }
+
+    /// A name in `fake-ip-filter` is excluded from the pool and resolves for
+    /// real — here that means failing against the dead upstream, never
+    /// returning a synthetic address.
+    #[test]
+    fn fake_ip_filter_excludes_a_name() {
+        let r = policy_resolver(
+            r#"{"dns": {"enhanced-mode": "fake-ip", "fake-ip-filter": ["*.lan"]}}"#,
+        );
+        assert!(
+            r.resolve(&Name::from_ascii("printer.lan").unwrap(), RrType::A)
+                .is_err(),
+            "a filtered name must not be answered from the pool"
+        );
+        // ... while a name the filter does not cover still is.
+        assert!(r
+            .resolve(&Name::from_ascii("www.example").unwrap(), RrType::A)
+            .is_ok());
+    }
+
+    /// `hosts` outranks fake-IP: an explicit pin is a decision, and a
+    /// synthetic address would be a worse answer to the same question.
+    #[test]
+    fn hosts_outranks_fake_ip() {
+        let r = policy_resolver(
+            r#"{"dns": {
+                "enhanced-mode": "fake-ip",
+                "hosts": {"pinned.example": "10.9.8.7"}
+            }}"#,
+        );
+        let res = r
+            .resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::A)
+            .unwrap();
+        let RData::A(ip) = res.answers[0].rdata else {
+            panic!("expected an A record");
+        };
+        assert_eq!(ip.to_string(), "10.9.8.7");
+    }
+
+    /// With the policy layer absent there are no local answers at all, so an
+    /// ordinary name goes to the network — which fails here.
+    #[test]
+    fn no_policy_section_means_no_local_answers() {
+        let r = policy_resolver(r#"{"dns": {}}"#);
+        assert!(r
+            .resolve(&Name::from_ascii("www.example").unwrap(), RrType::A)
+            .is_err());
+    }
+
+    /// `4.3.2.1.in-addr.arpa` is `1.2.3.4`; anything else is not a reverse
+    /// name and must not be guessed at.
+    #[test]
+    fn reverse_names_parse_conservatively() {
+        let p = |s: &str| parse_in_addr_arpa(&Name::from_ascii(s).unwrap());
+        assert_eq!(
+            p("1.0.18.198.in-addr.arpa"),
+            Some("198.18.0.1".parse().unwrap())
+        );
+        assert_eq!(p("4.3.2.1.in-addr.arpa"), Some("1.2.3.4".parse().unwrap()));
+        // Non-canonical octets are not the address they resemble.
+        assert_eq!(p("1.0.18.0198.in-addr.arpa"), None);
+        assert_eq!(p("1.0.18.01.in-addr.arpa"), None);
+        assert_eq!(p("1.0.18.256.in-addr.arpa"), None);
+        // Wrong shape or wrong hierarchy.
+        assert_eq!(p("1.0.18.in-addr.arpa"), None);
+        assert_eq!(p("1.0.18.198.in-addr.example"), None);
+        assert_eq!(p("1.0.18.198.ip6.arpa"), None);
+        assert_eq!(p("example.com"), None);
+        // A same-length name that merely ends the same way.
+        assert_eq!(p("1.0.18.in-addr.arpa.x"), None);
+    }
+
+    /// A fake-IP address resolves back to the name it was issued for.
+    /// Without this a client reverse-resolving a synthetic address would get
+    /// NXDOMAIN or an unrelated real name from the public DNS.
+    #[test]
+    fn fake_ip_reverse_lookup_returns_the_domain() {
+        let r = policy_resolver(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#);
+        let name = Name::from_ascii("foo.example").unwrap();
+        let res = r.resolve(&name, RrType::A).unwrap();
+        let RData::A(ip) = res.answers[0].rdata else {
+            panic!("expected an A record");
+        };
+
+        let reverse = Name::from_ascii(&format!(
+            "{}.{}.{}.{}.in-addr.arpa",
+            ip.octets()[3],
+            ip.octets()[2],
+            ip.octets()[1],
+            ip.octets()[0]
+        ))
+        .unwrap();
+        let ptr = r.resolve(&reverse, RrType::PTR).unwrap();
+        assert_eq!(ptr.answers.len(), 1);
+        assert!(
+            matches!(&ptr.answers[0].rdata, RData::Ptr(target) if *target == name),
+            "got {:?}",
+            ptr.answers[0].rdata
+        );
+
+        // An address in range that was never handed out has no answer, and
+        // must not be invented.
+        let unknown = Name::from_ascii("9.9.9.198.in-addr.arpa").unwrap();
+        assert!(r.resolve(&unknown, RrType::PTR).is_err());
+    }
+
+    /// A `hosts` pin is a real address, so it must serve the resolver's own
+    /// lookups too — pinning an internal authoritative server is a normal
+    /// deployment, and this is the only path that can reach it.
+    #[test]
+    fn hosts_serves_internal_address_resolution() {
+        let r = policy_resolver(r#"{"dns": {"hosts": {"ns1.internal.example": "10.0.0.53"}}}"#);
+        let addrs = r.resolve_addresses(&Name::from_ascii("ns1.internal.example").unwrap());
+        assert_eq!(addrs, vec!["10.0.0.53".parse::<IpAddr>().unwrap()]);
+    }
+
+    /// fake-IP must never serve the resolver's own lookups: a synthetic
+    /// address is not a server, and dialling one would make the resolver
+    /// query itself.
+    #[test]
+    fn fake_ip_never_serves_internal_address_resolution() {
+        let r = policy_resolver(r#"{"dns": {"enhanced-mode": "fake-ip"}}"#);
+        let addrs = r.resolve_addresses(&Name::from_ascii("ns1.example").unwrap());
+        assert!(
+            addrs.is_empty(),
+            "a synthetic address must not be used as an upstream: {addrs:?}"
+        );
+    }
+
+    /// Local answers must not be fed to the query estimator: they produce no
+    /// cache demand and no locality signal, and would otherwise spend its
+    /// bounded table on traffic that never reaches the resolver.
+    #[test]
+    fn estimator_ignores_locally_answered_names() {
+        let r = policy_resolver(r#"{"dns": {"hosts": {"pinned.example": "10.9.8.7"}}}"#);
+        let shared = r.shared();
+        let before = shared.estimator.lock().unwrap().len();
+
+        r.resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::A)
+            .unwrap();
+        assert_eq!(
+            shared.estimator.lock().unwrap().len(),
+            before,
+            "a pinned name must not reach the estimator"
+        );
+
+        // A name that needs resolving still does.
+        let _ = r.resolve(
+            &Name::from_ascii("needs-resolving.example").unwrap(),
+            RrType::A,
+        );
+        assert!(
+            shared.estimator.lock().unwrap().len() > before,
+            "a name that must be resolved is still observed"
+        );
+    }
+
+    /// The policy counters move for the events they name, so the layer can be
+    /// diagnosed from outside instead of by guessing.
+    #[test]
+    fn policy_counters_track_their_events() {
+        let r = policy_resolver(
+            r#"{"dns": {
+                "enhanced-mode": "fake-ip",
+                "hosts": {"pinned.example": "10.9.8.7"},
+                "fake-ip-filter": ["*.lan"]
+            }}"#,
+        );
+        let s = |r: &Resolver| r.stats_snapshot();
+        assert_eq!(s(&r).hosts_answered, 0);
+
+        r.resolve(&Name::from_ascii("pinned.example").unwrap(), RrType::A)
+            .unwrap();
+        assert_eq!(s(&r).hosts_answered, 1);
+        assert_eq!(s(&r).fake_ip_answered, 0, "a pin is not a fake address");
+
+        let res = r
+            .resolve(&Name::from_ascii("synth.example").unwrap(), RrType::A)
+            .unwrap();
+        assert_eq!(s(&r).fake_ip_answered, 1);
+
+        // And the reverse direction is counted separately.
+        let RData::A(ip) = res.answers[0].rdata else {
+            panic!("expected an A record");
+        };
+        let reverse = Name::from_ascii(&format!(
+            "{}.{}.{}.{}.in-addr.arpa",
+            ip.octets()[3],
+            ip.octets()[2],
+            ip.octets()[1],
+            ip.octets()[0]
+        ))
+        .unwrap();
+        r.resolve(&reverse, RrType::PTR).unwrap();
+        assert_eq!(s(&r).fake_ip_ptr, 1);
+
+        // A filtered name is counted as filtered, not as answered.
+        assert!(r
+            .resolve(&Name::from_ascii("printer.lan").unwrap(), RrType::A)
+            .is_err());
+        assert_eq!(s(&r).fake_ip_filtered, 1);
     }
 }

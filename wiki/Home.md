@@ -15,6 +15,9 @@ actually work and why they are shaped the way they are.
   structure to keep a CNAME chain servable as a unit.
 - [Upstream selection cost model](Upstream-Selection.md) — why raw RTT is the
   wrong signal, and what we rank on instead.
+- [DNS policy layer](DNS-Policy.md) — Clash-compatible `hosts`, fake-IP,
+  `nameserver-policy` and `fallback-filter`, and why an unknown key is now an
+  error.
 - [DNSSEC](DNSSEC.md) — what is validated, how, and the honest scope.
 - [Persistence](Persistence.md) — the L3 tier: format, atomicity, restore
   rules.

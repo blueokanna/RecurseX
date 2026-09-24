@@ -39,6 +39,29 @@ pub struct Stats {
     pub coalesced: AtomicU64,
     /// Internal errors.
     pub errors: AtomicU64,
+    /// Answers served from a `hosts` pin.
+    pub hosts_answered: AtomicU64,
+    /// Names that reached `local_answer` but were **not** synthesized because
+    /// `fake-ip-filter` excludes them. A name showing up here is being
+    /// resolved for real by design.
+    pub fake_ip_filtered: AtomicU64,
+    /// `A` answers synthesized from the fake-IP pool.
+    pub fake_ip_answered: AtomicU64,
+    /// Reverse (`PTR`) answers synthesized from the fake-IP pool.
+    pub fake_ip_ptr: AtomicU64,
+    /// Live fake-IP mappings (gauge, updated by the maintenance task).
+    pub fake_ip_entries: AtomicU64,
+    /// Fake-IP mappings dropped to stay inside the cap (gauge). Non-zero here
+    /// means the pool is recycling, which is the signal to raise
+    /// `fake-ip-max-entries`.
+    pub fake_ip_evicted: AtomicU64,
+    /// Queries whose group was chosen by `nameserver-policy` (rather than
+    /// falling to the default group). A config that expects routing and shows
+    /// zero here has a suffix that does not match.
+    pub policy_routed: AtomicU64,
+    /// Queries re-sent to the `fallback` group because the default group's
+    /// answer looked poisoned.
+    pub fallback_triggered: AtomicU64,
     /// Sum of resolve times in microseconds (for the average).
     pub resolve_time_us_sum: AtomicU64,
     /// Number of resolves sampled for the average.
@@ -80,6 +103,22 @@ pub struct StatsSnapshot {
     pub coalesced: u64,
     /// Internal errors.
     pub errors: u64,
+    /// Answers served from a `hosts` pin.
+    pub hosts_answered: u64,
+    /// Names excluded from fake-IP by `fake-ip-filter`.
+    pub fake_ip_filtered: u64,
+    /// `A` answers synthesized from the fake-IP pool.
+    pub fake_ip_answered: u64,
+    /// Reverse (`PTR`) answers synthesized from the fake-IP pool.
+    pub fake_ip_ptr: u64,
+    /// Live fake-IP mappings.
+    pub fake_ip_entries: u64,
+    /// Fake-IP mappings dropped to stay inside the cap.
+    pub fake_ip_evicted: u64,
+    /// Queries whose group was chosen by `nameserver-policy`.
+    pub policy_routed: u64,
+    /// Queries re-sent to the `fallback` group by the poison gate.
+    pub fallback_triggered: u64,
     /// Average resolve time in microseconds (0 when no samples).
     pub avg_resolve_us: u64,
 }
@@ -106,6 +145,14 @@ impl Stats {
             policy_blocked: self.policy_blocked.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            hosts_answered: self.hosts_answered.load(Ordering::Relaxed),
+            fake_ip_filtered: self.fake_ip_filtered.load(Ordering::Relaxed),
+            fake_ip_answered: self.fake_ip_answered.load(Ordering::Relaxed),
+            fake_ip_ptr: self.fake_ip_ptr.load(Ordering::Relaxed),
+            fake_ip_entries: self.fake_ip_entries.load(Ordering::Relaxed),
+            fake_ip_evicted: self.fake_ip_evicted.load(Ordering::Relaxed),
+            policy_routed: self.policy_routed.load(Ordering::Relaxed),
+            fallback_triggered: self.fallback_triggered.load(Ordering::Relaxed),
             avg_resolve_us: total.checked_div(resolve_count).unwrap_or(0),
         }
     }
