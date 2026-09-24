@@ -250,6 +250,13 @@ impl fmt::Display for IpCidr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A `no_std` build leaves the test modules with the `core` prelude, so the
+    // two `alloc` names this one uses have to be spelled out. Under `std` they
+    // come from the prelude, and an import here would be dead.
+    #[cfg(not(feature = "std"))]
+    use alloc::format;
+    #[cfg(not(feature = "std"))]
+    use alloc::string::ToString;
 
     #[test]
     fn v4_contains_respects_prefix() {

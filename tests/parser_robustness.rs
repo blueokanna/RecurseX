@@ -23,7 +23,13 @@
 //!
 //! The generators are deterministic, so a failure is reproducible from the
 //! seed in the assertion message.
+//!
+//! Two of the surfaces below live behind features a minimal build does not have
+//! — `dnssec` for the RSA verifier, `doq` for the QUIC/TLS framing — so those
+//! tests are gated rather than the whole file being gated: the wire decoders are
+//! core, and they must stay covered in every configuration CI builds.
 
+#[cfg(feature = "dnssec")]
 use recurse_x::dnssec::rsa::{parse_dnskey_rsa, verify_pkcs1v15_sha256};
 use recurse_x::edns::{parse_options, Ecs, Edns};
 use recurse_x::qtype::RrType;
@@ -304,6 +310,7 @@ fn edns_option_walking_survives_garbage() {
 /// A verifier is handed bytes chosen by whoever signed — or did not sign —
 /// the answer. Invalid input is `false`, never a panic and never an error the
 /// caller has to catch.
+#[cfg(feature = "dnssec")]
 #[test]
 fn rsa_verification_rejects_malformed_input() {
     let digest = [0x5au8; 32];
@@ -375,6 +382,7 @@ fn rsa_verification_rejects_malformed_input() {
 
 /// A minimal RSA DNSKEY that parses cleanly: exponent 65537, a 128-byte
 /// modulus, in the RFC 3110 single-octet-length form.
+#[cfg(feature = "dnssec")]
 fn well_formed_rsa_dnskey() -> Vec<u8> {
     let mut key = vec![0x03, 0x01, 0x00, 0x01]; // exponent length 3, 65537
     key.extend_from_slice(&[0x01, 0x00, 0x01]);
@@ -386,6 +394,7 @@ fn well_formed_rsa_dnskey() -> Vec<u8> {
 }
 
 /// The QUIC response framing is read straight off a UDP socket.
+#[cfg(feature = "doq")]
 #[test]
 fn quic_deframing_survives_garbage() {
     use recurse_x::transports::doq::deframe_response;
@@ -410,6 +419,7 @@ fn quic_deframing_survives_garbage() {
 }
 
 /// The TLS handshake parsers run on bytes from the QUIC peer's first flight.
+#[cfg(feature = "doq")]
 #[test]
 fn tls_handshake_parsing_survives_garbage() {
     use recurse_x::transports::doq::tls::{decode_server_transport_params, parse_certificate_list};

@@ -326,6 +326,8 @@ pub fn parse_all(items: &[String]) -> Result<alloc::vec::Vec<DomainPattern>> {
 mod tests {
     use super::*;
     #[cfg(not(feature = "std"))]
+    use alloc::string::ToString;
+    #[cfg(not(feature = "std"))]
     use alloc::vec;
 
     fn n(s: &str) -> Name {

@@ -352,15 +352,20 @@ mod tests {
         let r = t.exchange(b"\x00", &ep, 200);
         let elapsed = started.elapsed();
         let e = r.expect_err("a blackhole DoQ endpoint must fail");
-        assert_ne!(
-            e.kind,
-            crate::error::ErrorKind::Unsupported,
-            "DoQ must use the built-in client, not report unsupported"
-        );
-        assert_eq!(
-            e.kind,
-            crate::error::ErrorKind::Timeout,
-            "an unreachable peer must surface as a timeout, not as {e}"
+        // Which *kind* of failure depends on the route's temper, and both are
+        // right: a network that rejects TEST-NET answers `send_to` with
+        // `ENETUNREACH` and the failure is `Io`, while a network that swallows
+        // the datagram lets the handshake run into its deadline and the failure
+        // is `Timeout`. Asserting one of them would be asserting on the
+        // runner's routing table. What must never happen is `Unsupported`, which
+        // would mean the built-in client is missing — the thing this test is
+        // actually about.
+        assert!(
+            matches!(
+                e.kind,
+                crate::error::ErrorKind::Timeout | crate::error::ErrorKind::Io
+            ),
+            "an unreachable peer must fail as a timeout or an I/O error, not as {e}"
         );
         // And the requested timeout is the bound. This assertion is the reason
         // the test exists: the transport used to floor the caller at 10 s, so a

@@ -2,16 +2,55 @@
 
 ## 命令
 
+下面就是 CI 的各个作业，按顺序。它不是一份菜单：每一行之所以存在，是因为另一个特性前沿有
+自己的代码路径，尤以三条 clippy 腿为甚——那是三个不同的程序。`.github/workflows/ci.yml` 设置了
+`RUSTFLAGS=-D warnings`，本地也要设：本地看着无害的告警，在 CI 里就是构建失败。
+
 ```sh
-# 全量：单测 + 集成测试 + 文档测试
-cargo test --all-features
+# fmt：版式由 rustfmt 定，不由作者定
+cargo fmt --all -- --check
 
-# 算法核心（含它自己的测试）是 no_std
-cargo test --no-default-features --lib
-
-# 严格 lint（警告即错误）
+# clippy：全特性、no_std 核心、以及不带传输的 std
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --no-default-features --lib -- -D warnings
+cargo clippy --no-default-features --features std --all-targets -- -D warnings
+
+# doc：rustdoc 零告警，且文档测试也是测试
+cargo doc --all-features --no-deps
+cargo test --doc --all-features
+cargo test --doc --no-default-features
+
+# test：真正发出去的东西，MSRV 与 stable 都跑
+cargo test --all-features
+cargo test
+cargo test --release --all-features
+
+# features：每个前沿都要构建，两个核心还要**跑**自己的测试
+cargo build --no-default-features
+cargo test --no-default-features --lib
+cargo build --no-default-features --features std
+cargo test --no-default-features --features std --lib
+for f in dot doh doh3 doq dnssec persist; do
+  cargo build --no-default-features --features "$f"
+done
+
+# release：发行用的 profile，以及声明了自己依赖的 examples
+cargo build --release --all-features
+cargo build --release --examples --all-features
+cargo build --examples --no-default-features --features std
+cargo package --allow-dirty
 ```
+
+其中两条腿值得点名记住，因为它们才是会咬人的：
+
+- `cargo test --no-default-features --lib` 是**唯一**在无 `std` 情况下编译核心自带测试模块的
+  地方。`#![no_std]` 让测试模块只剩 `core` 预导入，于是 `String`、`Vec`、`to_string`、
+  `format!`、`vec!` 都得写全名——而漏掉的测试模块在**其它每一条腿**上都编得过。修法就是这个
+  仓库里写的那个：在旁边加 `#[cfg(not(feature = "std"))] use alloc::string::ToString;`。
+- `cargo clippy --no-default-features --features std --all-targets` 是**唯一**在不带可选特性的
+  情况下编译 `tests/` 的地方，所以一个 import 了特性门控模块（`recurse_x::dnssec::rsa`、
+  `recurse_x::transports::doq`）的测试，只在这里解析失败。要门控的是**那个测试**而不是整个
+  文件：线格式解码器属于核心，它们在 CI 构建的每种配置里都必须保持覆盖。
 
 ## 测试覆盖了什么
 

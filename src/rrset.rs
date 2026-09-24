@@ -248,6 +248,10 @@ impl RrSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A `no_std` build leaves the test modules with the `core` prelude, so the
+    // macros and traits this one uses have to be named.
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     #[test]
     fn fingerprint_changes_with_content() {

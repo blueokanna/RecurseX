@@ -2,16 +2,61 @@
 
 ## Commands
 
+These are the CI jobs, in order. They are not a menu: each line exists because a
+different feature frontier has its own code path, and the three clippy legs in
+particular are three different programs. `.github/workflows/ci.yml` sets
+`RUSTFLAGS=-D warnings`, so export that too — a warning that is harmless locally
+is a failed build in CI.
+
 ```sh
-# full suite: unit, integration and doctests
-cargo test --all-features
+# fmt: rustfmt is the arbiter of layout, not the author
+cargo fmt --all -- --check
 
-# the algorithmic core, including its own tests, is no_std
-cargo test --no-default-features --lib
-
-# strict lint (warnings are errors)
+# clippy: all features, the no_std core, and std without the transports
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --no-default-features --lib -- -D warnings
+cargo clippy --no-default-features --features std --all-targets -- -D warnings
+
+# doc: rustdoc is warning-free, and doctests are tests
+cargo doc --all-features --no-deps
+cargo test --doc --all-features
+cargo test --doc --no-default-features
+
+# test: what ships, on the MSRV and on stable
+cargo test --all-features
+cargo test
+cargo test --release --all-features
+
+# features: every frontier builds, and the two cores also *run* their tests
+cargo build --no-default-features
+cargo test --no-default-features --lib
+cargo build --no-default-features --features std
+cargo test --no-default-features --features std --lib
+for f in dot doh doh3 doq dnssec persist; do
+  cargo build --no-default-features --features "$f"
+done
+
+# release: the profile that ships, and the examples that declare their features
+cargo build --release --all-features
+cargo build --release --examples --all-features
+cargo build --examples --no-default-features --features std
+cargo package --allow-dirty
 ```
+
+Two of those legs are worth knowing by name, because they are the ones that bite:
+
+- `cargo test --no-default-features --lib` is the *only* place the core's own
+  test modules are compiled without `std`. `#![no_std]` leaves them with the
+  `core` prelude, so `String`, `Vec`, `to_string`, `format!` and `vec!` have to be
+  named — and a test module that forgets compiles fine under every other leg.
+  The fix is the one this repo writes: `#[cfg(not(feature = "std"))] use
+  alloc::string::ToString;` next to the other imports.
+- `cargo clippy --no-default-features --features std --all-targets` is the only
+  place `tests/` is compiled *without* the optional features, which is how a test
+  that imports a feature-gated module (`recurse_x::dnssec::rsa`,
+  `recurse_x::transports::doq`) fails to resolve only here. Gate the test, not
+  the file: the wire decoders are core, and they must stay covered in every
+  configuration CI builds.
 
 ## What the tests cover
 

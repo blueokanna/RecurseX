@@ -879,6 +879,8 @@ fn ttl_nanos(secs: u64) -> Ts {
 mod tests {
     use super::*;
     #[cfg(not(feature = "std"))]
+    use alloc::string::ToString;
+    #[cfg(not(feature = "std"))]
     use alloc::vec;
 
     fn now() -> Ts {
