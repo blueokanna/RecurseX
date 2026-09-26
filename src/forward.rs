@@ -458,7 +458,7 @@ mod tests {
         response.flags.rd = query.flags.rd;
         response.flags.ra = true;
         response.flags.rcode = rcode;
-        response.questions = query.questions.clone();
+        response.questions.clone_from(&query.questions);
         response
     }
 
