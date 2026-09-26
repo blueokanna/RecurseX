@@ -42,3 +42,24 @@ timeout.
 Setup cost differs by protocol (`Udp`, `Tcp`, `Tls`/DoT, `DoH`, `DoH3`,
 `DoQ`). TCP and TLS pay a handshake; UDP pays nothing — which is one reason
 the engine prefers UDP and only falls back to TCP on truncation.
+
+## Exchange-level failure policy
+
+The cost model above ranks *paths*. It cannot help when an exchange settles on
+one forwarder and that forwarder answers with a failure: the exchange would be
+over before any other candidate is tried. `Forwarders::exchange_with` therefore
+treats a failure *reply* as a non-answer:
+
+- `REFUSED`, `SERVFAIL` and any other non-`NOERROR` code mark that forwarder as
+  failed for this exchange — recorded through `record_servfail` — and the next
+  candidate is tried. One broken upstream no longer vetoes the healthy ones,
+  which is what a nameserver list with a single dead member used to cost: every
+  lookup failed even though six of the seven servers answered.
+- `NXDOMAIN` is *not* a failure. The name does not exist, and saying so is the
+  answer, so it ends the exchange immediately and no further upstream is
+  queried — that is what makes negative answers cheap.
+- When every forwarder fails, the caller gets the last failure (a refusal
+  surfaces as `ErrorKind::Refused`, anything else as `ErrorKind::Servfail`)
+  together with the endpoint that produced it. Never a bare empty answer, so
+  the layer above can report *why* a name could not be resolved instead of
+  guessing.

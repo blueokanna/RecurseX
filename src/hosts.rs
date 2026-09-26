@@ -133,7 +133,7 @@ impl HostsTable {
         }
         // Most specific first, so the first match is the answer.
         self.wildcard
-            .sort_by(|a, b| b.0.label_count().cmp(&a.0.label_count()));
+            .sort_by_key(|entry| core::cmp::Reverse(entry.0.label_count()));
         Ok(())
     }
 

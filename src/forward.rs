@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use crate::error::{Error, ErrorKind, Result};
 use crate::message::Message;
 use crate::prng::SplitMix64;
+use crate::qtype::Rcode;
 use crate::query::response_matches_query;
 use crate::transport::{DnsTransport, Transports};
 use crate::upstream::{Endpoint, Proto};
@@ -176,13 +177,26 @@ impl ForwarderSet {
         self.exchange_with(&self.forwarders, query, query_bytes, timeout_ms)
     }
 
-    /// Send a query to `group` until one of its servers answers.
+    /// Send a query to `group` until one of its servers *answers*.
     ///
     /// The pool is shared across groups: a server that appears in two groups
     /// keeps one transport, because the transport is a property of the
     /// (address, TLS name, path) triple and not of the group that named it.
     /// Which group a query *uses* is the caller's decision; this only tries
     /// the servers it is handed, in order.
+    ///
+    /// A response carrying a server-side failure code (SERVFAIL, REFUSED,
+    /// FORMERR, NOTIMP, NOTAUTH, NOTZONE) is a statement about *that server*,
+    /// not about the name: the next server in the group is asked instead. A
+    /// subscription commonly names several public resolvers, and a resolver
+    /// that refuses or fails this network (or this name) must not be able to
+    /// veto the ones behind it — that is exactly how a query ends up
+    /// "resolved" to nothing while six working servers sit unused.
+    ///
+    /// When every server in the group either failed at the transport level or
+    /// answered a failure code, the error is the *last* failure observed, so
+    /// the caller logs a reason ("SERVFAIL from 119.29.29.29") instead of a
+    /// bare "no address".
     pub fn exchange_with(
         &self,
         group: &[Forwarder],
@@ -206,10 +220,24 @@ impl ForwarderSet {
                     continue;
                 }
             };
-            if response_matches_query(query, &resp) {
-                return Ok(resp);
+            if !response_matches_query(query, &resp) {
+                last_err = Some(Error::transport("forwarder response did not match query"));
+                continue;
             }
-            last_err = Some(Error::transport("forwarder response did not match query"));
+            let rcode = resp.rcode();
+            if rcode <= u16::from(u8::MAX) && Rcode(rcode as u8).is_failure() {
+                let code = Rcode(rcode as u8);
+                last_err = Some(Error::new(
+                    if code == Rcode::REFUSED {
+                        ErrorKind::Refused
+                    } else {
+                        ErrorKind::Servfail
+                    },
+                    format!("the upstream {} answered {code}", f.endpoint.ip),
+                ));
+                continue;
+            }
+            return Ok(resp);
         }
         Err(last_err.unwrap_or_else(|| Error::new(ErrorKind::NoUpstream, "no forwarder answered")))
     }
@@ -350,11 +378,7 @@ pub fn response_to_resolution(
     if ttl == u32::MAX {
         ttl = 0;
     }
-    // The message-level rcode is 12 bits (RFC 6891 §6.1.3). Every extended
-    // value we would otherwise have to carry is an EDNS negotiation answer
-    // (BADVERS and friends), which is not something a client asked through
-    // us can act on; reporting it as SERVFAIL is honest, truncating it to
-    // `rcode as u8` would silently turn it into a different code.
+
     let rcode = u8::try_from(resp.rcode())
         .map(crate::qtype::Rcode)
         .unwrap_or(crate::qtype::Rcode::SERVFAIL);
@@ -377,6 +401,15 @@ pub fn response_to_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Question;
+    use crate::name::Name;
+    use crate::qtype::{RrClass, RrType};
+    use crate::rdata::{RData, Record};
+    use std::net::Ipv4Addr;
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn forwarder_defaults() {
@@ -386,5 +419,156 @@ mod tests {
         set.add(Forwarder::plain(Endpoint::udp("1.1.1.1".parse().unwrap())));
         assert!(set.is_enabled());
         assert_eq!(set.forwarders().len(), 1);
+    }
+
+    /// A loopback upstream that replies to every query with `build`.
+    ///
+    /// Returns its port and the number of queries it saw, so a test can assert
+    /// that a server was *not* asked. The thread parks in `recv_from` with a
+    /// read timeout, so a test that finishes early simply detaches it.
+    fn spawn_upstream(
+        build: impl Fn(&Message) -> Message + Send + 'static,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a loopback UDP socket");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("a read timeout, so the thread cannot outlive the test forever");
+        let port = socket.local_addr().expect("bound address").port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf) {
+                let Ok(query) = Message::parse(&buf[..len]) else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                if let Ok(bytes) = build(&query).to_bytes() {
+                    let _ = socket.send_to(&bytes, peer);
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// A response with the query's id and question, and nothing else.
+    fn response_for(query: &Message, rcode: Rcode) -> Message {
+        let mut response = Message::new(query.id);
+        response.flags.qr = true;
+        response.flags.rd = query.flags.rd;
+        response.flags.ra = true;
+        response.flags.rcode = rcode;
+        response.questions = query.questions.clone();
+        response
+    }
+
+    fn answer_for(query: &Message, address: Ipv4Addr) -> Message {
+        let mut response = response_for(query, Rcode::NOERROR);
+        let question = query.question().expect("the query carries a question");
+        response.answers.push(Record {
+            name: question.qname.clone(),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::A(address),
+        });
+        response
+    }
+
+    fn query_for(name: &str) -> (Message, Vec<u8>) {
+        let mut query = Message::new(0x4242);
+        query.flags.rd = true;
+        query.questions.push(Question {
+            qname: Name::from_ascii(name).expect("a valid name"),
+            qtype: RrType::A,
+            qclass: RrClass::IN,
+        });
+        let bytes = query.to_bytes().expect("the query serializes");
+        (query, bytes)
+    }
+
+    fn plain(port: u16) -> Forwarder {
+        Forwarder::plain(Endpoint::new(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            Proto::Udp,
+        ))
+    }
+
+    /// The regression this fixes: the first upstream that *answered* used to
+    /// end the loop regardless of what it said, so one refusing server vetoed
+    /// every server behind it and the name resolved to nothing.
+    #[test]
+    fn a_refusing_upstream_does_not_veto_the_others() {
+        let (refuser, _) = spawn_upstream(|query| response_for(query, Rcode::REFUSED));
+        let (worker, _) = spawn_upstream(|query| answer_for(query, Ipv4Addr::new(203, 0, 113, 7)));
+        let group = [plain(refuser), plain(worker)];
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), false, 0);
+        let (query, bytes) = query_for("node.example.com");
+
+        let resp = set
+            .exchange_with(&group, &query, &bytes, 2_000)
+            .expect("the working upstream answers");
+        assert_eq!(resp.answers.len(), 1);
+        assert!(matches!(resp.answers[0].rdata, RData::A(a) if a == Ipv4Addr::new(203, 0, 113, 7)));
+    }
+
+    /// The same rule for SERVFAIL, which is what a resolver answers when its
+    /// own recursion is broken: still a statement about the server.
+    #[test]
+    fn a_failing_upstream_does_not_veto_the_others() {
+        let (failing, _) = spawn_upstream(|query| response_for(query, Rcode::SERVFAIL));
+        let (worker, _) = spawn_upstream(|query| answer_for(query, Ipv4Addr::new(203, 0, 113, 8)));
+        let group = [plain(failing), plain(worker)];
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), false, 0);
+        let (query, bytes) = query_for("node.example.com");
+
+        let resp = set
+            .exchange_with(&group, &query, &bytes, 2_000)
+            .expect("the working upstream answers");
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    /// NXDOMAIN is an answer *about the name*, so it is final: the servers
+    /// behind the one that answered do not get asked.
+    #[test]
+    fn nxdomain_is_a_final_answer() {
+        let (denier, _) = spawn_upstream(|query| response_for(query, Rcode::NXDOMAIN));
+        let (behind, behind_seen) =
+            spawn_upstream(|query| answer_for(query, Ipv4Addr::new(203, 0, 113, 9)));
+        let group = [plain(denier), plain(behind)];
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), false, 0);
+        let (query, bytes) = query_for("node.example.com");
+
+        let resp = set
+            .exchange_with(&group, &query, &bytes, 2_000)
+            .expect("NXDOMAIN is a valid answer");
+        assert_eq!(resp.rcode(), u16::from(Rcode::NXDOMAIN.to_u8()));
+        assert_eq!(
+            behind_seen.load(Ordering::Relaxed),
+            0,
+            "the server behind a final answer must not be asked"
+        );
+    }
+
+    /// When every upstream fails, the caller gets an error that names the last
+    /// failure instead of a silent empty answer.
+    #[test]
+    fn all_upstreams_failing_surfaces_the_failure_code() {
+        let (first, _) = spawn_upstream(|query| response_for(query, Rcode::SERVFAIL));
+        let (second, _) = spawn_upstream(|query| response_for(query, Rcode::REFUSED));
+        let group = [plain(first), plain(second)];
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), false, 0);
+        let (query, bytes) = query_for("node.example.com");
+
+        let error = set
+            .exchange_with(&group, &query, &bytes, 2_000)
+            .expect_err("no upstream produced an answer");
+        assert_eq!(error.kind(), ErrorKind::Refused);
+        assert!(
+            error.msg.contains("REFUSED"),
+            "the message must name the code: {}",
+            error.msg
+        );
     }
 }
