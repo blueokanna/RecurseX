@@ -15,19 +15,28 @@
 //! build, so signatures from zones that only use them yield
 //! [`Verdict::Indeterminate`] — never a fabricated "secure".
 //!
-//! # What `Verdict::Secure` means here
+//! # Why there is a ladder, not a boolean
 //!
-//! A group of records is `Secure` when an RRSIG over it verifies against a
-//! DNSKEY of the signer zone *and* that key is covered by a DS record found
-//! for the signer in the parent zone. The DNSKEY and DS lookups ride the
-//! same hardened resolution path as every other query (ID/0x20/source
-//! checks, bailiwick filtering) but are not themselves chain-validated:
-//! this build ships no root trust anchor and does not validate the DS
-//! RRset's own signature, and while the validator is running, its nested
-//! lookups deliberately skip validation to bound the recursion depth.
-//! `Secure` therefore means "signed by a key that matches the parent's DS",
-//! not "chained to the IANA root". A caller that needs the stronger
-//! guarantee must anchor it itself.
+//! "DNSSEC is on" and "this answer is authentic" are different claims, and a
+//! resolver that collapses them overstates what it checked. The distinction
+//! that matters is *where the chain stopped*:
+//!
+//! * A signature that verifies against a key the parent's DS matched proves
+//!   the **zone** signed the data. It does not prove the delegation itself
+//!   is the real one, because the DS RRset's own signature was not walked
+//!   upward.
+//! * Proving the delegation requires an unbroken chain to an anchor the
+//!   operator installed. This build ships **no** root trust anchor, so
+//!   `ChainAnchored` is unreachable unless the deployment installs one.
+//!
+//! [`ValidationState`] records exactly that, and the `AD` bit is set **only**
+//! for [`ValidationState::ChainAnchored`] — never for a merely
+//! signature-verified answer. RFC 4035 §3.2.3 is also an *all* rule: the
+//! Answer **and** Authority RRsets must both be authentic, which
+//! [`Verification`] reports rather than assumes.
+//!
+//! A resolver that cannot be honest about this is worse than one without
+//! DNSSEC, because its clients believe it.
 
 pub mod rsa;
 
@@ -48,6 +57,140 @@ pub enum Verdict {
     Bogus,
     /// Could not determine (missing keys/anchors).
     Indeterminate,
+}
+
+/// Where the chain of trust actually stopped.
+///
+/// This is the honest form of "is it DNSSEC-secure", and it is what the
+/// `AD` bit and the risk model are keyed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ValidationState {
+    /// Nothing could be concluded: an unsigned zone, an unsupported
+    /// algorithm, a missing key, or a preempted validation slot.
+    Indeterminate,
+    /// No validation applies because the zone is unsigned (or the algorithm
+    /// is one this build refuses to use). This is not a failure.
+    Insecure,
+    /// The signature verified against a key the parent's DS matched, but the
+    /// DS RRset's own chain was not walked to an anchor. Proves the zone
+    /// signed the data; does not prove the delegation.
+    CryptoVerified,
+    /// The full chain reached a configured trust anchor, and the answer was
+    /// otherwise authentic. Only this state permits `AD`.
+    ChainAnchored,
+}
+
+impl ValidationState {
+    /// Whether this state permits the `AD` bit (RFC 4035 §3.2.3).
+    #[inline]
+    pub fn permits_authentic_data(self) -> bool {
+        matches!(self, ValidationState::ChainAnchored)
+    }
+
+    /// Whether the data was shown to be authentic at all (either level of
+    /// signature verification). Note that authenticity and *chain* anchoring
+    /// are different claims; only [`Self::permits_authentic_data`] says the
+    /// resolver is willing to assert the former publicly.
+    #[inline]
+    pub fn is_signature_verified(self) -> bool {
+        matches!(
+            self,
+            ValidationState::CryptoVerified | ValidationState::ChainAnchored
+        )
+    }
+
+    /// A short stable name, for logs and metrics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValidationState::Indeterminate => "indeterminate",
+            ValidationState::Insecure => "insecure",
+            ValidationState::CryptoVerified => "crypto-verified",
+            ValidationState::ChainAnchored => "chain-anchored",
+        }
+    }
+
+    /// The same information in the risk model's vocabulary.
+    ///
+    /// The mapping is deliberately one-to-one rather than collapsing
+    /// "insecure" into "unverified": a zone that is *known* to be unsigned is
+    /// a different risk from one whose status could not be established, and
+    /// the risk model prices the latter as strictly worse because an
+    /// unverifiable answer is one whose error could have been manufactured.
+    pub fn trust_level(self) -> crate::risk::TrustLevel {
+        match self {
+            ValidationState::ChainAnchored => crate::risk::TrustLevel::ChainAnchored,
+            ValidationState::CryptoVerified => crate::risk::TrustLevel::CryptoVerified,
+            ValidationState::Insecure => crate::risk::TrustLevel::Unverified,
+            ValidationState::Indeterminate => crate::risk::TrustLevel::Indeterminate,
+        }
+    }
+}
+
+impl Verdict {
+    /// Map a verdict to a [`ValidationState`], given whether the deployment
+    /// has a trust anchor that the chain reached.
+    ///
+    /// `anchored` is the caller's honest answer to "was the chain walked to
+    /// an anchor?", not "is dnssec enabled?". With no anchor configured the
+    /// best possible state is [`ValidationState::CryptoVerified`], and
+    /// returning `ChainAnchored` would be a fabrication.
+    pub fn state(self, anchored: bool) -> ValidationState {
+        match self {
+            Verdict::Secure => {
+                if anchored {
+                    ValidationState::ChainAnchored
+                } else {
+                    ValidationState::CryptoVerified
+                }
+            }
+            Verdict::Insecure => ValidationState::Insecure,
+            Verdict::Indeterminate => ValidationState::Indeterminate,
+            Verdict::Bogus => ValidationState::Indeterminate,
+        }
+    }
+}
+
+/// A validation report, with the counts that make the "all" rule visible.
+///
+/// A boolean cannot express "three of four answer groups authenticated"; an
+/// operator debugging why `AD` is unset needs exactly that number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verification {
+    /// The underlying verdict.
+    pub verdict: Verdict,
+    /// Where the chain stopped.
+    pub state: ValidationState,
+    /// Answer RRset groups examined.
+    pub answer_groups: usize,
+    /// Answer RRset groups whose signature verified against an anchored key.
+    pub answer_groups_authenticated: usize,
+    /// Whether an Authority section was present, and if so whether every
+    /// group in it authenticated. `None` when there was no Authority
+    /// section to check (RFC 4035 §3.2.3 applies only when there is one).
+    pub authority_authenticated: Option<bool>,
+}
+
+impl Verification {
+    /// A report for a chain with no answer data.
+    pub fn empty() -> Self {
+        Self {
+            verdict: Verdict::Insecure,
+            state: ValidationState::Insecure,
+            answer_groups: 0,
+            answer_groups_authenticated: 0,
+            authority_authenticated: None,
+        }
+    }
+
+    /// Whether the `AD` bit may be set: the chain reached an anchor, every
+    /// answer group authenticated, and the Authority section (if any)
+    /// authenticated as well.
+    pub fn permits_authentic_data(&self) -> bool {
+        self.state.permits_authentic_data()
+            && self.answer_groups > 0
+            && self.answer_groups == self.answer_groups_authenticated
+            && self.authority_authenticated.unwrap_or(true)
+    }
 }
 
 /// Compute a SHA-256 digest.
@@ -344,47 +487,91 @@ impl Drop for ValidationGuard {
     }
 }
 
-/// Validate a completed [`crate::resolver::Resolution`]: group the answer
-/// chain, fetch the signer DNSKEYs (and the parent DS for anchoring) and
-/// verify every RRSIG.
+/// Validate a completed [`crate::resolver::Resolution`] and report where the
+/// chain stopped.
+///
+/// `anchored` is the caller's honest answer to "is a trust anchor
+/// configured?" — see [`Verdict::state`].
+pub fn validate_resolution_detailed(
+    resolver: &crate::resolver::Resolver,
+    res: &crate::resolver::Resolution,
+    anchored: bool,
+) -> Verification {
+    if res.answers.is_empty() {
+        return Verification::empty();
+    }
+    let Some(_guard) = ValidationGuard::enter() else {
+        return Verification {
+            verdict: Verdict::Indeterminate,
+            state: ValidationState::Indeterminate,
+            answer_groups: 0,
+            answer_groups_authenticated: 0,
+            authority_authenticated: None,
+        };
+    };
+    verify_chain(
+        resolver,
+        &res.answers,
+        &res.rrsigs,
+        &res.authorities,
+        anchored,
+    )
+}
+
+/// Validate a completed [`crate::resolver::Resolution`], returning the bare
+/// verdict. Prefer [`validate_resolution_detailed`]: the verdict alone
+/// cannot express *how much* of the answer was authenticated.
 pub fn validate_resolution(
     resolver: &crate::resolver::Resolver,
     res: &crate::resolver::Resolution,
 ) -> Verdict {
-    if res.answers.is_empty() {
-        return Verdict::Insecure;
-    }
-    let Some(_guard) = ValidationGuard::enter() else {
-        return Verdict::Indeterminate;
-    };
-    validate_chain(resolver, &res.answers, &res.rrsigs)
+    validate_resolution_detailed(resolver, res, false).verdict
 }
 
-/// Validate a raw forwarder response.
-pub fn validate_message(
+/// Validate a raw forwarder response and report where the chain stopped.
+pub fn validate_message_detailed(
     resolver: &crate::resolver::Resolver,
     _key: &crate::query::QueryKey,
     resp: &crate::message::Message,
-) -> Verdict {
+    anchored: bool,
+) -> Verification {
     if resp.answers.is_empty() {
-        return Verdict::Insecure;
+        return Verification::empty();
     }
     let Some(_guard) = ValidationGuard::enter() else {
-        return Verdict::Indeterminate;
+        return Verification {
+            verdict: Verdict::Indeterminate,
+            state: ValidationState::Indeterminate,
+            answer_groups: 0,
+            answer_groups_authenticated: 0,
+            authority_authenticated: None,
+        };
     };
-    let answers: Vec<Record> = resp
-        .answers
-        .iter()
-        .filter(|r| r.rr_type != RrType::RRSIG)
-        .cloned()
-        .collect();
-    let rrsigs: Vec<Record> = resp
-        .answers
-        .iter()
-        .filter(|r| r.rr_type == RrType::RRSIG)
-        .cloned()
-        .collect();
-    validate_chain(resolver, &answers, &rrsigs)
+    let split = |recs: &[Record]| -> (Vec<Record>, Vec<Record>) {
+        let data = recs
+            .iter()
+            .filter(|r| r.rr_type != RrType::RRSIG)
+            .cloned()
+            .collect();
+        let sigs = recs
+            .iter()
+            .filter(|r| r.rr_type == RrType::RRSIG)
+            .cloned()
+            .collect();
+        (data, sigs)
+    };
+    let (answers, rrsigs) = split(&resp.answers);
+    let (authorities, _) = split(&resp.authorities);
+    verify_chain(resolver, &answers, &rrsigs, &authorities, anchored)
+}
+
+/// Validate a raw forwarder response, returning the bare verdict.
+pub fn validate_message(
+    resolver: &crate::resolver::Resolver,
+    key: &crate::query::QueryKey,
+    resp: &crate::message::Message,
+) -> Verdict {
+    validate_message_detailed(resolver, key, resp, false).verdict
 }
 
 /// The verdict for a whole answer chain.
@@ -395,31 +582,33 @@ pub fn validate_message(
 /// CNAME ride along with a signed target and still be advertised as
 /// authentic, so a single group that cannot be authenticated caps the verdict
 /// at `Indeterminate`/`Insecure` even when other groups verify.
-fn validate_chain(
+/// Verify every `(owner, type)` group of one section.
+///
+/// Returns `(verdict, groups_examined, groups_authenticated)`. The counts are
+/// what make RFC 4035's "all" rule observable rather than assumed.
+fn verify_section(
     resolver: &crate::resolver::Resolver,
-    answers: &[Record],
+    records: &[Record],
     rrsigs: &[Record],
-) -> Verdict {
-    let now_secs = {
-        let t = resolver.now();
-        (t / 1_000_000_000) as u32
-    };
+    now_secs: u32,
+) -> (Verdict, usize, usize) {
     // Group data records by (owner, type).
     let mut groups: alloc::collections::BTreeMap<(Name, RrType), Vec<Record>> =
         alloc::collections::BTreeMap::new();
-    for r in answers {
+    for r in records {
         groups
             .entry((r.name.clone(), r.rr_type))
             .or_default()
             .push(r.clone());
     }
     if groups.is_empty() {
-        return Verdict::Insecure;
+        return (Verdict::Insecure, 0, 0);
     }
     let mut signed_groups = 0usize;
+    let mut authenticated = 0usize;
     let mut all_secure = true;
     let mut worst = Verdict::Insecure;
-    for ((owner, rr_type), records) in groups {
+    for ((owner, rr_type), group) in groups {
         let covered = rrsigs_for(rrsigs, rr_type)
             .into_iter()
             .filter(|s| rrsig_signer(s) == Some(&owner) || s.name == owner)
@@ -432,8 +621,8 @@ fn validate_chain(
             continue;
         }
         signed_groups += 1;
-        match validate_group(resolver, &records, &covered, now_secs) {
-            Verdict::Secure => {}
+        match validate_group(resolver, &group, &covered, now_secs) {
+            Verdict::Secure => authenticated += 1,
             Verdict::Bogus => {
                 all_secure = false;
                 worst = Verdict::Bogus;
@@ -447,7 +636,7 @@ fn validate_chain(
             Verdict::Insecure => all_secure = false,
         }
     }
-    if signed_groups > 0 && all_secure {
+    let verdict = if signed_groups > 0 && all_secure {
         Verdict::Secure
     } else if worst == Verdict::Bogus {
         Verdict::Bogus
@@ -455,6 +644,65 @@ fn validate_chain(
         Verdict::Insecure
     } else {
         worst
+    };
+    (verdict, signed_groups, authenticated)
+}
+
+/// The verdict for a whole resolution, including its Authority section.
+///
+/// RFC 4035 §3.2.3 requires **both** the Answer and Authority RRsets to be
+/// authentic before a response may be labelled; a resolver that checked only
+/// the Answer would label an unsigned denial of existence as signed.
+fn verify_chain(
+    resolver: &crate::resolver::Resolver,
+    answers: &[Record],
+    rrsigs: &[Record],
+    authorities: &[Record],
+    anchored: bool,
+) -> Verification {
+    let now_secs = {
+        let t = resolver.now();
+        (t / 1_000_000_000) as u32
+    };
+    let (verdict, total, authenticated) = verify_section(resolver, answers, rrsigs, now_secs);
+    let authority_authenticated = if authorities.is_empty() {
+        None
+    } else {
+        // Only the SOA and the NSEC/NSEC3/NS material belongs to the
+        // negative answer; the rest of an Authority section is delegation
+        // data, which RFC 4035 does not ask us to authenticate as part of
+        // *this* response.
+        let relevant: Vec<Record> = authorities
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.rr_type,
+                    RrType::SOA | RrType::NSEC | RrType::NSEC3 | RrType::NS
+                )
+            })
+            .cloned()
+            .collect();
+        if relevant.is_empty() {
+            None
+        } else {
+            let authority_sigs: Vec<Record> = authorities
+                .iter()
+                .filter(|r| r.rr_type == RrType::RRSIG)
+                .cloned()
+                .collect();
+            let (_, at, aa) = verify_section(resolver, &relevant, &authority_sigs, now_secs);
+            // Authenticated only when every group in it authenticated; a
+            // Bogus or Indeterminate authority group cannot be waved
+            // through.
+            Some(at > 0 && at == aa)
+        }
+    };
+    Verification {
+        verdict,
+        state: verdict.state(anchored),
+        answer_groups: total,
+        answer_groups_authenticated: authenticated,
+        authority_authenticated,
     }
 }
 
@@ -529,5 +777,126 @@ fn key_is_anchored(resolver: &crate::resolver::Resolver, signer: &Name, key: &Re
             .filter(|r| r.rr_type == RrType::DS && r.name == *signer)
             .any(|ds| dnskey_matches_ds(key, ds)),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property that matters more than any single verdict: a
+    /// signature-verified answer with **no** configured anchor must never be
+    /// reported as chain-anchored, and must never be advertised with `AD`.
+    #[test]
+    fn verification_without_an_anchor_is_never_chain_anchored() {
+        let s = Verdict::Secure.state(false);
+        assert_eq!(s, ValidationState::CryptoVerified);
+        assert!(s.is_signature_verified());
+        assert!(
+            !s.permits_authentic_data(),
+            "AD must not be set without an anchor"
+        );
+
+        let s = Verdict::Secure.state(true);
+        assert_eq!(s, ValidationState::ChainAnchored);
+        assert!(s.permits_authentic_data());
+    }
+
+    #[test]
+    fn bogus_is_indeterminate_not_secure() {
+        assert_eq!(Verdict::Bogus.state(true), ValidationState::Indeterminate);
+        assert_eq!(
+            Verdict::Indeterminate.state(true),
+            ValidationState::Indeterminate
+        );
+        assert_eq!(Verdict::Insecure.state(true), ValidationState::Insecure);
+        assert!(!Verdict::Insecure.state(true).is_signature_verified());
+    }
+
+    #[test]
+    fn trust_ladder_is_ordered_and_faithful() {
+        use crate::risk::TrustLevel;
+        assert_eq!(
+            ValidationState::ChainAnchored.trust_level(),
+            TrustLevel::ChainAnchored
+        );
+        assert_eq!(
+            ValidationState::CryptoVerified.trust_level(),
+            TrustLevel::CryptoVerified
+        );
+        assert_eq!(
+            ValidationState::Insecure.trust_level(),
+            TrustLevel::Unverified
+        );
+        assert_eq!(
+            ValidationState::Indeterminate.trust_level(),
+            TrustLevel::Indeterminate
+        );
+        // The penalty ordering must agree with the state ordering; a ladder
+        // whose risk penalties contradict its own severity order would be a
+        // policy bug nobody would notice from the outside.
+        let ordered = [
+            ValidationState::ChainAnchored,
+            ValidationState::CryptoVerified,
+            ValidationState::Insecure,
+            ValidationState::Indeterminate,
+        ];
+        for w in ordered.windows(2) {
+            let (a, b) = match (w.first(), w.get(1)) {
+                (Some(a), Some(b)) => (*a, *b),
+                _ => continue,
+            };
+            assert!(
+                a.trust_level().penalty() <= b.trust_level().penalty(),
+                "penalty order disagrees at {a:?} -> {b:?}"
+            );
+        }
+    }
+
+    /// RFC 4035 §3.2.3: an Authority section that did not authenticate must
+    /// block `AD`, even when every answer group did.
+    #[test]
+    fn an_unauthenticated_authority_section_blocks_ad() {
+        let v = Verification {
+            verdict: Verdict::Secure,
+            state: ValidationState::ChainAnchored,
+            answer_groups: 1,
+            answer_groups_authenticated: 1,
+            authority_authenticated: Some(false),
+        };
+        assert!(!v.permits_authentic_data());
+        let v = Verification {
+            authority_authenticated: Some(true),
+            ..v
+        };
+        assert!(v.permits_authentic_data());
+        // No Authority section at all is not a failure to authenticate.
+        let v = Verification {
+            authority_authenticated: None,
+            ..v
+        };
+        assert!(v.permits_authentic_data());
+    }
+
+    #[test]
+    fn a_partial_answer_never_permits_ad() {
+        let v = Verification {
+            verdict: Verdict::Indeterminate,
+            state: ValidationState::ChainAnchored,
+            answer_groups: 4,
+            answer_groups_authenticated: 3,
+            authority_authenticated: None,
+        };
+        assert!(!v.permits_authentic_data());
+        let empty = Verification::empty();
+        assert!(!empty.permits_authentic_data());
+    }
+
+    #[test]
+    fn unsupported_algorithms_stay_indeterminate() {
+        // A zone signed only with Ed25519 must not produce a fabricated
+        // verdict in either direction.
+        let v = validate_rrset(&[], &[], &[], 0);
+        assert_eq!(v, Verdict::Indeterminate);
     }
 }

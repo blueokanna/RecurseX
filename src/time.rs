@@ -47,11 +47,13 @@ impl Clock for SystemClock {
 }
 
 /// A manual clock for tests and deterministic simulation. Uses an interior
-/// `RwLock` so it satisfies the `Clock` bounds.
+/// [`sync::RwLock`](crate::sync::RwLock) so it satisfies the `Clock` bounds —
+/// and so that a panic somewhere else cannot turn *reading the time* into a
+/// panic, which every query does.
 #[cfg(feature = "std")]
 #[derive(Debug, Default)]
 pub struct ManualClock {
-    now: std::sync::RwLock<Ts>,
+    now: crate::sync::RwLock<Ts>,
 }
 
 #[cfg(feature = "std")]
@@ -69,13 +71,13 @@ impl ManualClock {
     /// A clock fixed at an arbitrary instant.
     pub fn at(ns: Ts) -> Self {
         Self {
-            now: std::sync::RwLock::new(ns),
+            now: crate::sync::RwLock::new(ns),
         }
     }
 
     /// Advance the clock.
     pub fn advance(&self, ns: Ts) {
-        *self.now.write().unwrap() += ns;
+        *self.now.write() += ns;
     }
 
     /// Advance by whole seconds.
@@ -85,14 +87,14 @@ impl ManualClock {
 
     /// The current value.
     pub fn get(&self) -> Ts {
-        *self.now.read().unwrap()
+        *self.now.read()
     }
 }
 
 #[cfg(feature = "std")]
 impl Clock for ManualClock {
     fn now(&self) -> Ts {
-        *self.now.read().unwrap()
+        *self.now.read()
     }
 }
 
@@ -156,7 +158,14 @@ pub fn format_rfc3339(t: Ts) -> String {
 #[cfg(feature = "std")]
 impl fmt::Display for ManualClock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ManualClock({})", *self.now.read().unwrap())
+        // `try_read`, not `read`: this can be reached from inside a panic
+        // message, and a plain read there would block behind a writer or
+        // re-enter a write guard the current thread still holds. Rendering
+        // "busy" is worse than a number and far better than a hang.
+        match self.now.try_read() {
+            Some(now) => write!(f, "ManualClock({now})"),
+            None => f.write_str("ManualClock(<locked>)"),
+        }
     }
 }
 
@@ -180,6 +189,58 @@ mod tests {
         assert_eq!(c.now(), 100 * NS_PER_SEC);
         c.advance_secs(5);
         assert_eq!(c.get(), 105 * NS_PER_SEC);
+    }
+
+    /// Rendering the clock must never wait for a holder of the write guard.
+    ///
+    /// This is not a stylistic preference. `Display` runs inside panic messages,
+    /// so the sequence it has to survive is: a thread panics while holding the
+    /// write guard, the panic hook formats the clock, and a blocking read then
+    /// meets a writer that will never be released by the panicking thread. With
+    /// `read()` the rendering hangs; with a same-thread re-entrant read, `std`
+    /// documents that it may instead panic — inside the panic path, i.e. an
+    /// abort. `try_read` is the only option that terminates either way.
+    ///
+    /// `std`'s three `RwLock` backends (futex, SRWLOCK, pthread) all report a
+    /// write-held lock as unavailable to `try_read`, on the holding thread as
+    /// well as others, so the expected rendering is exactly `<locked>`.
+    #[test]
+    #[cfg(feature = "std")]
+    fn displaying_a_write_held_clock_reports_it_instead_of_waiting() {
+        let c = ManualClock::at_secs(100);
+        assert_eq!(std::format!("{c}"), "ManualClock(100000000000)");
+        let guard = c.now.write();
+        assert_eq!(
+            std::format!("{c}"),
+            "ManualClock(<locked>)",
+            "rendering must not read a write-held clock"
+        );
+        drop(guard);
+        // The guard was only borrowed, so the value is unchanged and readable.
+        assert_eq!(std::format!("{c}"), "ManualClock(100000000000)");
+    }
+
+    /// The property the crate's lock policy exists for, checked on the clock as
+    /// well: a panic elsewhere must not make reading the time panic for
+    /// everyone. The clock is worse than the other locks if this breaks, because
+    /// it is read on every query rather than on a cache hit.
+    #[test]
+    #[cfg(feature = "std")]
+    fn the_clock_still_works_after_a_panicking_writer() {
+        let c = ManualClock::at_secs(100);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = c.now.write();
+            *guard = 7;
+            panic!("deliberate: unwind while holding the clock's write guard");
+        }));
+        std::panic::set_hook(previous);
+
+        assert!(outcome.is_err(), "the panic must have unwound");
+        assert_eq!(c.now(), 7, "the write made before the panic must survive");
+        c.advance_secs(1);
+        assert_eq!(c.get(), 7 + NS_PER_SEC, "the clock must stay usable");
     }
 
     #[test]

@@ -53,6 +53,16 @@ enum Behaviour {
     /// what an intercepting resolver sends, and RFC 2308 §2.2 forbids it for a
     /// real negative answer (which must carry the SOA).
     EmptyOnce,
+    /// Refer every query to a child zone that names twelve name servers and
+    /// glues **none** of them. That is the NXNSAttack shape (Shafir et al.,
+    /// USENIX Security 2020): cheap to enter, expensive to finish, because
+    /// each unglued name obliges an independent address resolution. A
+    /// resolver that only bounds *depth* walks straight into it.
+    NxnsReferral,
+    /// Serve the delegation chain and answer `www.example.test` with an
+    /// ECS option whose SCOPE PREFIX-LENGTH is 24, i.e. "this answer is valid
+    /// for the whole /24 you asked from".
+    EcsScoped,
 }
 
 /// A stub that answers UDP DNS on loopback. It records every query name it was
@@ -118,6 +128,13 @@ impl Stub {
                     }
                     Behaviour::Delegate | Behaviour::RefuseOnce | Behaviour::EmptyOnce => {
                         delegate(&mut resp, &question.qname, addr.port());
+                    }
+                    Behaviour::NxnsReferral => {
+                        unglued_referral(&mut resp, &question.qname.to_ascii(), UNGLUED_NS_COUNT);
+                    }
+                    Behaviour::EcsScoped => {
+                        delegate(&mut resp, &question.qname, addr.port());
+                        echo_ecs_scope(&mut resp, &query, ECS_SCOPE);
                     }
                 }
 
@@ -241,6 +258,51 @@ fn referral(resp: &mut Message, zone: &str, ns_name: &str, port: u16) {
     // A records carry no port — so the config does it. Asserted here so the
     // dependency is explicit rather than surprising.
     assert_ne!(port, 0);
+}
+
+/// How many name servers the NXNS stub publishes without glue.
+const UNGLUED_NS_COUNT: usize = 12;
+
+/// The SCOPE PREFIX-LENGTH the ECS stub declares on its answers.
+const ECS_SCOPE: u8 = 24;
+
+/// A referral to `zone` that names `count` name servers and glues none of
+/// them — the NXNSAttack shape. The zone is a child of whatever was asked, so
+/// the walk accepts it as a delegation before the gate sees it.
+fn unglued_referral(resp: &mut Message, qname: &str, count: usize) {
+    let class = RrClass::IN;
+    let ttl = 60;
+    let zone = format!("nxns.{qname}");
+    let zone_name = Name::from_ascii(&zone).unwrap();
+    debug_assert!(count > 2, "the gate's escape hatch is for small referrals");
+    for i in 0..count {
+        resp.authorities.push(Record {
+            name: zone_name.clone(),
+            rr_type: RrType::NS,
+            class,
+            ttl,
+            rdata: RData::Ns(Name::from_ascii(&format!("ns{i}.evil.test")).unwrap()),
+        });
+    }
+    // No `additionals` at all: that absence is the attack.
+}
+
+/// Add an EDNS Client Subnet option to a response, echoing the request's
+/// address but declaring a scope — i.e. "valid for this whole network".
+fn echo_ecs_scope(resp: &mut Message, query: &Message, scope: u8) {
+    let Some(asked) = query.edns.as_ref().and_then(|e| e.ecs()) else {
+        return;
+    };
+    let echo = recurse_x::edns::Ecs {
+        family: asked.family,
+        source_prefix: asked.source_prefix,
+        scope_prefix: scope,
+        address: asked.address.clone(),
+    };
+    let mut edns = recurse_x::edns::Edns::new(1232);
+    edns.options.push(recurse_x::edns::EdnsOption::Ecs(echo));
+    edns.dnssec_ok = query.edns.as_ref().map(|e| e.dnssec_ok).unwrap_or(false);
+    resp.edns = Some(edns);
 }
 
 fn config(root: SocketAddr) -> ResolverConfig {
@@ -429,4 +491,113 @@ fn the_walk_never_asks_about_an_unrelated_name() {
             "{asked} is neither the qname nor one of its ancestors"
         );
     }
+}
+
+/// A referral that names many name servers and glues none of them must be
+/// refused **before** any address lookup is attempted.
+///
+/// The assertion that matters is the query count, not the error: a resolver
+/// that bounds only *depth* answers this referral with twelve independent
+/// resolutions, each of which could itself be referral-shaped. The gate has to
+/// reject the referral itself, so the work stays at the handful of packets the
+/// walk has already spent.
+#[test]
+fn an_unglued_referral_is_refused_before_any_address_lookup() {
+    let stub = Stub::start(Behaviour::NxnsReferral);
+    let err = resolve(config(stub.addr), "www.nxns.test")
+        .expect_err("a delegation with no glue and twelve servers is not usable");
+
+    assert_eq!(err.kind, ErrorKind::Transport, "got {err:?}");
+    assert!(
+        err.msg.contains("unusable delegation"),
+        "the error must name the cause, got {}",
+        err.msg
+    );
+    // The root query plus the referral that carried it: nothing else may have
+    // been asked, and in particular no `ns*.evil.test` address lookups.
+    assert!(
+        stub.queries_seen() <= 4,
+        "the gate must stop the fan-out; saw {} queries",
+        stub.queries_seen()
+    );
+    for asked in stub.names_asked() {
+        assert!(
+            !asked.contains("evil.test"),
+            "the resolver chased {asked}, which is exactly the NXNS fan-out"
+        );
+    }
+}
+
+/// RFC 7871: an answer is filed under the **scope the server declared**, not
+/// under the prefix the client happened to ask with — and a client that sent
+/// no ECS must never be handed a subnet-scoped answer.
+///
+/// This is the end-to-end form of the cache-level rule, and the query count is
+/// the proof: a client inside the declared `/24` must be served with *zero*
+/// further upstream queries, while a client outside it (or one with no ECS at
+/// all) must go and ask.
+#[test]
+fn ecs_scope_controls_who_may_reuse_an_answer() {
+    use recurse_x::edns::{Ecs, Edns, EdnsOption};
+
+    let stub = Stub::start(Behaviour::EcsScoped);
+    let r = Resolver::new(config(stub.addr));
+
+    let ask = |ip: &str, prefix: u8| {
+        let mut msg = Message::query(
+            0x2200,
+            Name::from_ascii("www.example.test").unwrap(),
+            RrType::A,
+            true,
+        );
+        let mut edns = Edns::new(1232);
+        edns.options.push(EdnsOption::Ecs(
+            Ecs::ipv4(ip.parse().unwrap(), prefix).unwrap(),
+        ));
+        msg.edns = Some(edns);
+        r.handle_query(&msg, None)
+    };
+
+    // First client: 10.0.0.0/24. The server declares the answer valid for that
+    // whole /24, so it is filed in the /24 partition.
+    let first = ask("10.0.0.1", 24);
+    assert_eq!(first.flags.rcode, Rcode::NOERROR);
+    let after_first = stub.queries_seen();
+    assert!(after_first >= 3, "the walk must have happened");
+
+    // A client inside the declared scope, at a *different* granularity: served
+    // entirely from cache. Nothing new goes upstream.
+    let inside = ask("10.0.0.200", 25);
+    assert_eq!(inside.flags.rcode, Rcode::NOERROR);
+    assert_eq!(
+        stub.queries_seen(),
+        after_first,
+        "a client inside the declared /24 must reuse the answer"
+    );
+
+    // A client outside the scope: a different /24 is a different network, so
+    // it has to resolve for itself.
+    let outside = ask("10.9.9.1", 24);
+    assert_eq!(outside.flags.rcode, Rcode::NOERROR);
+    let after_outside = stub.queries_seen();
+    assert!(
+        after_outside > after_first,
+        "a different subnet must not reuse a subnet-scoped answer"
+    );
+
+    // A client with no ECS at all must not be handed the scoped answer either.
+    // It still gets an answer — it simply has to ask for it.
+    let mut plain = Message::query(
+        0x2201,
+        Name::from_ascii("www.example.test").unwrap(),
+        RrType::A,
+        true,
+    );
+    plain.edns = Some(Edns::new(1232));
+    let unscoped = r.handle_query(&plain, None);
+    assert_eq!(unscoped.flags.rcode, Rcode::NOERROR);
+    assert!(
+        stub.queries_seen() > after_outside,
+        "a client without ECS must not read an ECS partition"
+    );
 }

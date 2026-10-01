@@ -1,7 +1,7 @@
 # DNSSEC
 
 `dnssec` feature 校验应答链：对规范化 RRset 的 RRSIG 签名、从信任锚往下走的 DS 摘要链，
-以及 `Secure` / `Insecure` / `Bogus` 判定。校验刻意自包含——允许的依赖集里没有通用密码库，
+以及一个**四态**的验证阶梯。校验刻意自包含——允许的依赖集里没有通用密码库，
 所以 RSA 校验是手写的。
 
 ## 校验什么
@@ -11,9 +11,33 @@
 - **DS（RFC 4034 §5.1）** —— DS 摘要是对「规范化 owner 名 + DNSKEY RDATA」做 SHA-256，
   必须与父区的 DS 记录匹配。
 - **链走查** —— 从该区 DNSKEY 沿 DS 链上溯到信任锚，带递归保护。
+- **Authority 段（RFC 4035 §3.2.3）** —— 负应答里 SOA 与 NSEC/NSEC3 材料**同样**必须通过
+  认证。这条规则是「全部」而不是「任一」：只查 Answer 段的解析器会把一条未签名的
+  「不存在证明」标成已签名。
 
-判定：`Secure`（校验通过）、`Insecure`（确认无安全链）、`Bogus`（签名或链失败）、
-`Indeterminate`（无法确认）。
+## 验证阶梯，以及为什么它不是布尔值
+
+「DNSSEC 开着」和「这个答案是可信的」是两个不同的命题，把它们合并的解析器就夸大了自己查过什么。
+`ValidationState` 记录链**实际停在哪里**：
+
+| 状态 | 含义 | 置 `AD`？ | 信任惩罚 κ |
+|---|---|---|---|
+| `ChainAnchored` | 链到达**已配置的**信任锚，且 Answer 与 Authority 都可信 | **是** | 1 |
+| `CryptoVerified` | 签名验证通过、签名密钥被父区 DS 匹配，但 DS 记录自身的链没有走到锚 | 否 | 2 |
+| `Insecure` | 已知该区未签名（或使用本构建拒绝的算法） | 否 | 5 |
+| `Indeterminate` | 无法判定：算法不支持、缺密钥、`Bogus`，或验证槽被占用 | 否 | 10 |
+
+线格式校验器给出的判定仍然是 `Secure` / `Insecure` / `Bogus` / `Indeterminate`；
+`Verdict::state(anchored)` 把它映射成 `ValidationState`，诚实性就在这个映射里落实。
+
+**本构建不随附任何根信任锚，且 `engine.dnssecAnchored` 默认为 `false`，所以除非部署自己装上锚
+并明确声明，`ChainAnchored` 是**不可达**的。** 没有锚时最好的状态是 `CryptoVerified`：
+「这个区签了这份数据」——这是真实且有用的断言，但**不是**「这条委派是真的」。`AD` 位只在
+`ChainAnchored` 时置位，所以仅签名验证通过的答案只在内部使用（喂给风险模型），绝不对外宣称；
+RFC 4035 §3.2.3 不允许把较弱的断言当成较强的发布。
+
+这个阶梯也正是风险模型的挂钩点：信任惩罚 κ 乘在 stale 决策的后果系数上，因此未经认证的数据需要
+低得多的陈旧概率才能被服务。见[风险约束刷新](Refresh-Theory-zh.md) §V。
 
 ## RSA 实现
 

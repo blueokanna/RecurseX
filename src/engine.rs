@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use crate::edns::{Ecs, Edns};
 use crate::message::{HeaderFlags, Message, Question};
 use crate::name::Name;
-use crate::prng::SplitMix64;
+use crate::prng::RandomSource;
 use crate::qtype::{Rcode, RrClass, RrType};
 use crate::rdata::{RData, Record};
 
@@ -120,7 +120,7 @@ pub fn build_query(
     rd: bool,
     edns: Option<&EdnsSpec>,
     use_0x20: bool,
-    rng: &mut SplitMix64,
+    rng: &mut impl RandomSource,
 ) -> OutQuery {
     let wire_name = if use_0x20 && qname.is_0x20_eligible() {
         qname.randomized_case(rng)
@@ -325,6 +325,7 @@ pub fn make_cname_record(name: &Name, target: &Name, ttl: u32) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prng::SplitMix64;
 
     #[test]
     fn query_builds_with_edns() {

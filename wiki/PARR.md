@@ -41,29 +41,61 @@ error).
 
 ## Stage 2 — Resolution Planner
 
-Given the cache outcome of a query and the estimator's prediction, the
-planner picks one of four plans:
+The planner answers one question per cache outcome. Note which question it
+*stops* asking: popularity decides what is **worth** refreshing, never what is
+**safe** to return. Those are two different ledgers, and conflating them was the
+mistake the risk-constrained model exists to fix.
 
-| Plan                  | When                                                     |
-|-----------------------|----------------------------------------------------------|
-| `ServeFresh`          | entry is live                                            |
-| `ServeStaleAndRefresh`| expired, within the stale window, query likely (p ≥ threshold) |
-| `Prefetch`            | entry is live but near expiry and likely to be asked     |
-| `Resolve`             | miss, or stale data with a low predicted probability     |
+| Outcome | Plan | Decided by |
+|---------|------|-----------|
+| entry is live | `ServeFresh` | the entry's own TTL |
+| entry is expired, inside the stale window | `ServeStale { refresh_in_background }` | the risk model |
+| miss, or stale refused | `Resolve` | — |
 
-The planner is deliberately simple and stateless — all the state lives in the
-estimator and the cache. Default thresholds: `stale_serve_min_prob = 0.5`,
-`stale_refresh_stability = 0.85`, `prefetch_horizon_secs = 60`.
+For a stale entry the planner computes a risk
 
-## Stage 3 — Stability-aware cache
+$$R = V \cdot (1 - P_{\text{LCB}}) \cdot C \cdot \kappa$$
 
-The cache is described in [Cache-Admission](Cache-Admission.md). The key
-point for PARR: **the cache never serves a predicted TTL**. It uses the
-stability model to decide *when* to refresh in the background (very stable
-sets), *whether* to serve stale while refreshing, and *what* to admit or
-evict. The estimator's probability drives prefetch fan-out: the maintenance
-loop walks entries near expiry and refreshes those whose predicted query
-probability clears the bar, bounded per tick.
+and refuses — `Resolve` instead — unless *all four* hold: the consequence class
+permits stale data at all, the staleness is inside that class's horizon, the
+answer's conservative freshness clears `1 - (1 - \text{base}) / C`, and the
+over-serving ledger has room. `V` is the expected saved latency, so an answer
+worth 20 ms that is 99 % likely correct is not worth defending a bad one at
+1000× the price. See [Refresh-Theory](Refresh-Theory.md) for the derivation.
+
+`Prefetch` is not a plan. It is a separate policy consulted by the maintenance
+loop: an entry is a prefetch candidate when its model has at least
+`min_evidence_secs` (300 s) of actual exposure, the query is likely enough
+(`p >= 0.5` over the next 60 s), and the current time is close enough to expiry
+that a refresh now would buy the target freshness (0.9). The horizontal
+probability is the estimator's; the vertical "would it have changed" is the
+hazard model's. Defaults: `min_evidence_secs = 300`, `prefetch_horizon_secs =
+60`, `prefetch_min_probability = 0.5`, `prefetch_target_freshness = 0.9`.
+
+That test admits a candidate. **Which admitted candidate gets the next token is
+a separate question**, and it is answered by [value of
+information](Value-of-Information.md): each due entry is priced by the expected
+reduction in the risk functional that one more observation would produce, and
+the budget goes to the largest values.
+
+The planner is stateless — every number it consumes lives in the hazard model,
+the estimator, or the cache. The only mutable state it touches is the risk
+ledger, which is passed in explicitly so a caller can inspect or reset it.
+
+## Stage 3 — The change-rate model and the cache
+
+See [Cache-Admission](Cache-Admission.md) and
+[Refresh-Theory](Refresh-Theory.md). The key point for PARR: **the cache never
+serves a predicted TTL.** The authority's number goes out unchanged; the model
+only decides *internal* timing and admission.
+
+What the model adds over an EWMA score is a *measurable* quantity. A TTL is a
+claim; the number of times an RRset actually changed over a measured exposure is
+a measurement. The estimator's popularity says how often the name is *asked*;
+the hazard model says how often the data *moves*. The two are orthogonal, and
+the maintenance loop needs both: popularity without a change rate prefetches
+immortal records forever, and a change rate without popularity spends the
+refresh budget on names nobody asks for.
 
 ## Stage 4 — Adaptive resolver
 

@@ -7,8 +7,8 @@ RecurseX 是流水线，不是一坨。每层只干一件事，通过窄接口�
 |---:|---|---|---|
 | **1** | **客户端层** | `server.rs` | UDP/TCP 监听<br>按查询构造应答 |
 | **2** | **查询处理** | `query.rs`<br>`policy.rs` | Normalize（规范化）<br>请求去重（Dedup）<br>请求合并（Coalesce）<br>0x20 编码<br>速率限制（Rate Limit） |
-| **3** | **多层缓存** | `cache/`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>缓存稳定性模型<br>分数准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
-| **4** | **解析引擎** | `resolver.rs`<br>`engine.rs`<br>`dnssec/` | Root → TLD → 权威服务器<br>CNAME / DNAME<br>委派（Referrals）<br>DNSSEC 校验 |
+| **3** | **多层缓存** | `cache/`<br>`hazard.rs`<br>`risk.rs`<br>`voi.rs`<br>`provenance.rs`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>ECS 分区<br>变化率后验（`HazardModel`）<br>风险预算与后果分级<br>信息价值调度<br>答案依赖 DAG<br>分数准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
+| **4** | **解析引擎** | `resolver.rs`<br>`engine.rs`<br>`budget.rs`<br>`dnssec/` | Root → TLD → 权威服务器<br>CNAME / DNAME<br>委派（Referrals）<br>每次解析的工作信封（NXNS 门）<br>DNSSEC 校验 |
 | **5** | **上游传输** | `transport.rs`<br>`transports/`<br>`forward.rs` | `DnsTransport` Trait<br>UDP / TCP / DoT / DoH / DoH3 / DoQ<br>转发器（Forwarder） |
 | **6** | **安全 / 策略** | `policy.rs`<br>`query.rs`<br>`dnssec/` | 限速（Rate Limit）<br>过滤（Filtering）<br>防欺骗校验（Anti-spoofing）<br>DNSSEC 判定（Verdict） |
 
@@ -18,10 +18,14 @@ RecurseX 是流水线，不是一坨。每层只干一件事，通过窄接口�
    `name.rs` 的编解码器解析。
 2. **查询处理**规范化 qname（小写、去尾点）、合并并发相同查询（条件变量等待的合并器）、
    按客户端限速，构造 `QueryKey`（name、type、class、ECS 分区、DNSSEC 标志）。
-3. **缓存**先行。新鲜命中立刻带剩余 TTL 返回；过期但在窗口内的条目可以 serve-stale
-   （RFC 8767）同时触发后台刷新；未命中进入引擎。
-4. **解析引擎**沿树走。从根提示开始，一级级跟委派，做 QNAME 最小化（RFC 9156）、
-   追 CNAME/DNAME、过滤 bailiwick 外数据，（开了 `dnssec` 时）校验应答链。
+3. **缓存**先行，从请求方自己的 ECS 分区一路向上放宽 scope 到全局分区。新鲜命中立刻带剩余 TTL
+   返回；过期但在窗口内的条目要交给**风险模型**——它会问这份数据还有多大概率是对的、万一不对
+   后果有多重、它的真实性建立得有多牢——只有过了这一关才 serve-stale（RFC 8767）并触发后台刷新。
+   未命中或被拒，才进入引擎。
+4. **解析引擎**沿树走。从根提示开始，一级级跟委派，全程受一个**每次解析的工作信封**约束（一份
+   宣称的服务器数超过我们愿意查询的上限的转介，会在发出**第一个地址查询之前**就被拒），做
+   QNAME 最小化（RFC 9156）、追 CNAME/DNAME、过滤 bailiwick 外数据，（开了 `dnssec` 时）
+   校验应答链。
 5. **上游传输**按所选协议发线格式查询。UDP 截断回退 TCP；加密传输按 feature 隔离。
 6. **安全/策略**穿插其中：入口限速、引擎层应答匹配（ID + 问题回显）、缓存时 bailiwick
    规则、最后 DNSSEC 判定。
@@ -30,9 +34,9 @@ RecurseX 是流水线，不是一坨。每层只干一件事，通过窄接口�
 
 ## no_std 边界在哪
 
-`--no-default-features` 只构建线格式编解码、缓存、估计器、图、上游模型、策略和规划器
-（仅 `alloc`）。socket、线程、解析器、服务器、JSON 配置、加密传输都是 `std` 门控。
-no_std 核心让预测机制可以移植到只要「模型」不要「网络」的嵌入式目标。
+`--no-default-features` 只构建线格式编解码、缓存、危险模型、风险预算、答案依赖图、工作信封、
+估计器、别名图、上游模型、策略和规划器（仅 `alloc`）。socket、线程、解析器、服务器、JSON 配置、
+加密传输都是 `std` 门控。no_std 核心让预测机制可以移植到只要「模型」不要「网络」的嵌入式目标。
 
 ## 错误模型
 

@@ -78,8 +78,11 @@
 extern crate alloc;
 
 pub mod alias;
+pub mod behavior;
 pub mod bounded;
+pub mod budget;
 pub mod cache;
+pub mod calibration;
 pub mod cidr;
 pub mod edns;
 pub mod engine;
@@ -87,6 +90,7 @@ pub mod error;
 pub mod estimator;
 pub mod fakeip;
 pub mod float;
+pub mod hazard;
 pub mod hosts;
 pub mod message;
 pub mod name;
@@ -94,14 +98,18 @@ pub mod pattern;
 pub mod planner;
 pub mod policy;
 pub mod prng;
+pub mod provenance;
 pub mod qtype;
 pub mod query;
 pub mod rdata;
+pub mod rendezvous;
+pub mod risk;
 pub mod routing;
 pub mod rrset;
 pub mod stability;
 pub mod time;
 pub mod upstream;
+pub mod voi;
 pub mod wire;
 
 #[cfg(feature = "std")]

@@ -15,6 +15,51 @@ pub struct Stats {
     pub served_stale: AtomicU64,
     /// Background prefetches performed.
     pub prefetches: AtomicU64,
+    /// Stale answers refused because the risk model said no (the class
+    /// forbids it, the freshness bound was too low, or the aggregate risk
+    /// budget was exhausted). A non-zero rate here with a healthy upstream is
+    /// the signal that the policy is the constraint, not the network.
+    pub stale_risk_refused: AtomicU64,
+    /// Stale answers refused specifically because the entry's last refresh
+    /// had failed. Distinguished from `stale_risk_refused` because the two
+    /// have opposite remedies: this one points at an unreachable upstream,
+    /// the other at the policy.
+    pub stale_refused_after_failure: AtomicU64,
+    /// Background refreshes refused because the refresh budget was empty.
+    /// Non-zero here means `sum rho_i <= B_refresh` is actually binding, and
+    /// the cure is a larger `refresh_per_sec` — not a bigger cache.
+    pub refresh_budget_denied: AtomicU64,
+    /// Resolutions stopped because the per-query fetch budget ran out.
+    /// A non-zero rate with a healthy upstream is the signature of an
+    /// amplification attempt (see [`crate::budget`]), not of a slow network.
+    pub fetch_budget_exhausted: AtomicU64,
+    /// Referrals refused by the NXNS gate (many NS names, little or no glue).
+    pub referrals_refused: AtomicU64,
+    /// Server choices that went through the upstream affinity lottery.
+    ///
+    /// A zero rate on a delegation with several servers means the cost band
+    /// admitted only one candidate, so every resolver in the fleet is still
+    /// converging on the same server. That is a *policy* reading, not a fault —
+    /// see `engine.affinityBandPct`.
+    pub affinity_lotteries: AtomicU64,
+    /// Background refreshes selected by the value scheduler.
+    ///
+    /// A zero rate with a non-empty due set means every due entry was priced at
+    /// or below `min_value` — usually because `value_ms` came back zero, which
+    /// in turn means the estimator has no cost model for the zone yet. See
+    /// [`crate::voi`].
+    pub refresh_scheduled: AtomicU64,
+    /// Maintenance rounds whose refresh order was **not** keyed.
+    ///
+    /// Non-zero means the deployment is running with
+    /// `engine.decorrelateRefresh = false`, so equal-value ties fall back to the
+    /// cache's iteration order — the same order on every resolver holding the
+    /// same entries. Nothing about serving is wrong, but the fleet is
+    /// synchronized on the refresh path and the order is a public function of
+    /// the query stream, which is the condition [`crate::behavior`] exists to
+    /// remove. A zero rate is the intended reading; this is the only way to
+    /// tell "decorrelated" from "we forgot to pass the key".
+    pub refresh_undecorrelated: AtomicU64,
     /// Alias refreshes queued by change propagation (entries whose data is
     /// derived from a changed entry).
     pub propagated: AtomicU64,
@@ -81,6 +126,23 @@ pub struct StatsSnapshot {
     pub served_stale: u64,
     /// Background prefetches performed.
     pub prefetches: u64,
+    /// Stale answers refused by the risk model.
+    pub stale_risk_refused: u64,
+    /// Stale answers refused after a failed refresh.
+    pub stale_refused_after_failure: u64,
+    /// Background refreshes refused by the refresh budget.
+    pub refresh_budget_denied: u64,
+    /// Resolutions stopped by the per-query fetch budget.
+    pub fetch_budget_exhausted: u64,
+    /// Referrals refused by the NXNS gate.
+    pub referrals_refused: u64,
+    /// Server choices that went through the upstream affinity lottery.
+    pub affinity_lotteries: u64,
+    /// Background refreshes selected by the value scheduler.
+    pub refresh_scheduled: u64,
+    /// Maintenance rounds whose refresh order was not keyed; see the atomic
+    /// field of the same name.
+    pub refresh_undecorrelated: u64,
     /// Alias refreshes queued by change propagation.
     pub propagated: u64,
     /// Alias edges recorded.
@@ -134,6 +196,14 @@ impl Stats {
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             served_stale: self.served_stale.load(Ordering::Relaxed),
             prefetches: self.prefetches.load(Ordering::Relaxed),
+            stale_risk_refused: self.stale_risk_refused.load(Ordering::Relaxed),
+            stale_refused_after_failure: self.stale_refused_after_failure.load(Ordering::Relaxed),
+            refresh_budget_denied: self.refresh_budget_denied.load(Ordering::Relaxed),
+            fetch_budget_exhausted: self.fetch_budget_exhausted.load(Ordering::Relaxed),
+            referrals_refused: self.referrals_refused.load(Ordering::Relaxed),
+            affinity_lotteries: self.affinity_lotteries.load(Ordering::Relaxed),
+            refresh_scheduled: self.refresh_scheduled.load(Ordering::Relaxed),
+            refresh_undecorrelated: self.refresh_undecorrelated.load(Ordering::Relaxed),
             propagated: self.propagated.load(Ordering::Relaxed),
             alias_edges: self.alias_edges.load(Ordering::Relaxed),
             upstream_queries: self.upstream_queries.load(Ordering::Relaxed),

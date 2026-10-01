@@ -1,6 +1,6 @@
 //! Plain UDP DNS transport (RFC 1035, RFC 7766).
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -20,9 +20,12 @@ impl DnsTransport for UdpTransport {
     }
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
-        let bind_addr: SocketAddr = match endpoint.ip {
-            IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            IpAddr::V6(_) => "[::]:0".parse().unwrap(),
+        // Constructed rather than parsed. `"0.0.0.0:0".parse().unwrap()` is
+        // infallible in practice but is still a parse and still a panic site,
+        // and this runs once per query.
+        let bind_addr = match endpoint.ip {
+            IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let sock = UdpSocket::bind(bind_addr).map_err(|e| Error::io(format!("udp bind: {e}")))?;
         // Unconnected socket: recv_from reports the real source so a

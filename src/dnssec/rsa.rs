@@ -108,7 +108,13 @@ fn to_be_bytes(limbs: &[u32]) -> Vec<u8> {
 }
 
 fn trim(limbs: &mut Vec<u32>) {
-    while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
+    // Keep at least one limb, so that zero is a one-limb value rather than an
+    // empty one. Written without `Option::unwrap` because the guard is on the
+    // loop header: `last()` is only known to be `Some` through the `len` check,
+    // which is exactly the kind of reasoning that stops being true after an
+    // edit elsewhere in this function, and this runs on every modular
+    // exponentiation in signature verification.
+    while limbs.last() == Some(&0) && limbs.len() > 1 {
         limbs.pop();
     }
 }

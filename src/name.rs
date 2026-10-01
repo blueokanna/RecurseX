@@ -14,7 +14,6 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::error::{Error, Result};
-use crate::prng::SplitMix64;
 use crate::wire::WireBytes;
 
 /// Maximum wire size of a domain name (RFC 1035 §2.3.4).
@@ -434,7 +433,7 @@ impl Name {
     /// A 0x20 randomized variant: the same labels with randomly chosen
     /// letter case (RFC 6840 §5.6 anti-spoofing). Only applied to names
     /// where at least one letter exists.
-    pub fn randomized_case(&self, rng: &mut SplitMix64) -> Name {
+    pub fn randomized_case<R: crate::prng::RandomSource>(&self, rng: &mut R) -> Name {
         let bytes = &self.0;
         let mut out = Vec::with_capacity(bytes.len());
         for &b in bytes.iter() {
@@ -576,9 +575,21 @@ impl NameCompressor {
 }
 
 impl From<&str> for Name {
-    /// Panic-free parse of a presentation-format name; use the `TryFrom`
-    /// / `from_ascii` API for fallible parsing. This panics on malformed
-    /// input and is provided for convenience in tests and configs.
+    /// Parse a presentation-format name, panicking on malformed input.
+    ///
+    /// Prefer [`Name::from_ascii`], which reports the error. This impl exists
+    /// because a `From` conversion is convenient in tests and in constants, and
+    /// it is the crate's one deliberately fallible `From`.
+    ///
+    /// The cost is real and cannot be removed from inside this impl: `From` is
+    /// the infallible-conversion trait, so `"anything".into()` compiles wherever
+    /// a `Name` is expected and turns unusable input into a panic. A correct
+    /// `TryFrom<&str>` cannot be added alongside it — the standard library
+    /// already provides `TryFrom<&str> for Name` with `Error = Infallible`
+    /// through its blanket `From`/`Into` impl, so a second one is a coherence
+    /// error. Either this impl goes, or `TryFrom` cannot exist; there is no
+    /// third option. It is kept for compatibility, and every path that handles
+    /// external input uses [`Name::from_ascii`] instead.
     fn from(s: &str) -> Self {
         Name::from_ascii(s).expect("valid domain name")
     }
@@ -689,7 +700,7 @@ mod tests {
     #[test]
     fn randomized_case_changes_case_only() {
         let n = Name::from_ascii("www.example.com").unwrap();
-        let mut rng = SplitMix64::new(1);
+        let mut rng = crate::prng::SplitMix64::new(1);
         let r = n.randomized_case(&mut rng);
         assert_eq!(r.canonical(), n);
         // The two forms must differ in at least one case position (the

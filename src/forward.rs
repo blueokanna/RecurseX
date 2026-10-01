@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::message::Message;
-use crate::prng::SplitMix64;
+use crate::prng::RandomSource;
 use crate::query::response_matches_query;
 use crate::transport::{DnsTransport, Transports};
 use crate::upstream::{Endpoint, Proto};
@@ -310,7 +310,7 @@ pub fn build_forward_query(
     key: &crate::query::QueryKey,
     edns_udp_size: u16,
     dnssec: bool,
-    rng: &mut SplitMix64,
+    rng: &mut impl RandomSource,
 ) -> Message {
     let mut m = Message::new((rng.next_u32() & 0xffff) as u16);
     m.flags.rd = true;
@@ -370,6 +370,15 @@ pub fn response_to_resolution(
         ttl,
         from_cache: false,
         stale: false,
+        // A forwarder is free to return ECS even though we asked without
+        // it; carrying the scope through means the answer is filed under the
+        // partition the server declared rather than silently treated as
+        // global.
+        ecs_scope: resp
+            .edns
+            .as_ref()
+            .and_then(|e| e.ecs())
+            .map(|e| e.scope_prefix),
         served_at: 0,
     }
 }

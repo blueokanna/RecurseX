@@ -60,7 +60,10 @@ Two of those legs are worth knowing by name, because they are the ones that bite
 
 ## What the tests cover
 
-The suite is 291 unit tests, 22 integration tests in `tests/`, and 4 doctests.
+The suite is 431 unit tests, 24 integration tests in `tests/` (3 + 10 + 7 + 4),
+and 4 doctests — 459 in the default configuration. The `no_std` core runs 320 of
+them and the std-only core 379, which is the point of running those legs
+separately.
 
 It is hermetic in the sense that matters: **no test asserts on a reply from the
 public Internet**, so the result depends on the resolver and not on the network's
@@ -79,12 +82,32 @@ the interception.
 - **Cache** — insert/lookup across tiers, CNAME chains, serve-stale,
   NXDOMAIN store and its capacity, ECS partitioning, exact-lowest eviction,
   prefetch candidacy, sweep.
-- **Stability & admission** — the EWMA math, fingerprint TTL-independence,
-  score thresholds, the memory term (which must actually move the score).
+- **Stability & admission** — the hazard model's conjugate update, the
+  evidence ceiling that stops forged observations from driving the change rate
+  down, fingerprint TTL-independence, score thresholds, the memory term (which
+  must actually move the score).
 - **Estimator / planner / alias graph / upstream** — probability growth, TOD
-  profile shape, bounded memory, alias edges in both directions and pruning,
+  profile size, bounded memory, alias edges in both directions and pruning,
   cost ranking, timeouts creating a path model. The estimator also verifies
   its self-contained `exp` and rounding against reference values.
+- **Keyed identity & affinity** — the quantiser is one bucket per doubling and
+  total over every `f64` including NaN; a fingerprint is stable for a fixed
+  class and name and *changes* when the key does; two names in one class get
+  different fingerprints; fingerprints spread over the ordering space instead
+  of piling into one bin; `Debug` on a key prints nothing but `<redacted>`.
+  For the affinity lottery: the selection is a pure function of key and
+  subject; the share of the head slots each in-band server takes is within
+  tolerance of uniform while an out-of-band server never takes one; and the
+  minimal-disruption property is asserted as an **equality** — the number of
+  subjects that move when a candidate is withdrawn equals the number that
+  candidate was winning.
+- **Value of information** — monotone in the consequence class, in the trust
+  penalty, in `V`, and in how long ago the entry was last observed; bounded by
+  the risk of not acting; exactly zero when there is nothing to learn; and
+  finite for a class whose consequence coefficient is infinite. The scheduler is
+  tested against the starvation it prevents: the reservation is asserted
+  side by side with the value sort that would starve without it, and whether a
+  class is represented is checked per class rather than in aggregate.
 - **Policy** — rate limiting, filtering, token buckets.
 - **Engine & resolver** — response classification (answer / NXDOMAIN /
   NODATA / referral / empty), QNAME minimization steps, negative TTL rules,
@@ -131,10 +154,16 @@ internals:
   not the answer, that the walk never asks about a name unrelated to the
   question, that a refusal is retried rather than returned, that an NXDOMAIN is
   cached and not re-asked, and that a dead walk ends at `query_budget_ms`. Two of
-  its eight tests found real bugs the first time they ran: the empty-response
-  skip discarded a legal SOA-less NXDOMAIN as "no server answered", and a UDP
-  read timeout was reported as an I/O error because Windows spells it `TimedOut`
-  where Unix says `WouldBlock`.
+  those tests found real bugs the first time they ran: the empty-response skip
+  discarded a legal SOA-less NXDOMAIN as "no server answered", and a UDP read
+  timeout was reported as an I/O error because Windows spells it `TimedOut` where
+  Unix says `WouldBlock`. Two more cover the mechanisms added with the refresh
+  model: an unglued referral naming twelve servers must be refused **before** any
+  address lookup (the assertion is the *query count*, not the error, because a
+  depth-limited resolver answers that referral with twelve resolutions), and an
+  answer the server declared valid for a `/24` must be reused by a `/25` client
+  inside it with zero further upstream queries while a different `/24` and a
+  client with no ECS at all must go and ask.
 - `end_to_end.rs` builds a resolver from a JSON document, binds a UDP and a
   TCP listener on port 0, queries both over the wire, asserts the second
   query is served from cache without a new upstream query, restarts a
@@ -201,7 +230,9 @@ behind them, converted first and cleanly.
 
 Every mutex in the crate is `crate::sync::Mutex`, not `std::sync::Mutex`.
 The difference is one policy decision made in one place: `lock()` recovers
-from poisoning instead of returning a `LockResult`, so it cannot fail.
+from poisoning instead of returning a `LockResult`, so it cannot fail. The
+one reader/writer lock — the manual clock, which is read on every query — is
+`crate::sync::RwLock` for the same reason.
 
 `std::sync::Mutex` poisons itself when a thread panics while holding it, and
 every later `lock().unwrap()` then panics too — a single bug on a single
@@ -212,7 +243,15 @@ discardable, none holds an invariant whose violation could produce a wrong
 answer rather than a failed lookup, and the crate denies `unsafe_code`, so a
 torn value cannot become undefined behaviour. `src/sync.rs` has a test that
 poisons a lock with a deliberate panic and then asserts the lock still hands
-back the value it held.
+back the value it held; `src/time.rs` has the same test for the clock.
+
+A reader/writer lock needs one thing a mutex does not. Its `Display` impl can
+be reached from inside a panic message, so it must not block: a plain `read()`
+there would wait on a writer held by the thread that is panicking, and a
+same-thread re-entrant read is documented as liable to panic — an abort while
+reporting an abort. The clock therefore renders through `try_read()` and
+prints `ManualClock(<locked>)` rather than waiting, and `src/time.rs` asserts
+exactly that with the write guard held.
 
 ## Live verification
 

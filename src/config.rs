@@ -73,12 +73,15 @@ pub struct CacheJson {
     /// Absolute cap on positive TTLs; absent = default.
     #[njson(default)]
     pub max_ttl_cap: Option<u32>,
-    /// Prefetch refresh threshold (remaining TTL); absent = default.
+    /// Prefetch horizon in seconds; absent = default.
     #[njson(default)]
-    pub prefetch_threshold_ttl: Option<u32>,
-    /// Prefetch probability threshold; absent = default.
+    pub prefetch_horizon_secs: Option<u32>,
+    /// The `P_LCB(fresh, horizon)` below which a refresh is due; absent =
+    /// default. This replaces the older remaining-TTL-fraction rule: the
+    /// criterion is the refresh model's own credibility bound, not a
+    /// percentage of a TTL the zone chose for itself.
     #[njson(default)]
-    pub prefetch_probability: Option<f64>,
+    pub prefetch_target_freshness: Option<f64>,
 }
 
 impl CacheJson {
@@ -93,10 +96,12 @@ impl CacheJson {
             stale_window_secs: self.stale_window_secs.unwrap_or(d.stale_window_secs),
             negative_ttl_cap: self.negative_ttl_cap.unwrap_or(d.negative_ttl_cap),
             max_ttl_cap: self.max_ttl_cap.unwrap_or(d.max_ttl_cap),
-            prefetch_threshold_ttl: self
-                .prefetch_threshold_ttl
-                .unwrap_or(d.prefetch_threshold_ttl),
-            prefetch_probability: self.prefetch_probability.unwrap_or(d.prefetch_probability),
+            prefetch_horizon_secs: self
+                .prefetch_horizon_secs
+                .unwrap_or(d.prefetch_horizon_secs),
+            prefetch_target_freshness: self
+                .prefetch_target_freshness
+                .unwrap_or(d.prefetch_target_freshness),
             ..d
         }
     }
@@ -141,6 +146,37 @@ pub struct EngineJson {
     /// Fall back to TCP on truncation; absent = default.
     #[njson(default)]
     pub tcp_fallback: Option<bool>,
+    /// How much more expensive than the cheapest a server may be and still
+    /// compete for traffic, as a percentage; absent = 10.
+    ///
+    /// Setting **both** this and `affinityBandMs` to `0` collapses the band to
+    /// the single cheapest candidate and so disables the lottery entirely —
+    /// the right setting for a delegation whose servers have genuinely unequal
+    /// standing (a primary and a fallback, say), and the wrong one for a
+    /// redundant set. Zeroing only the percentage does *not* disable it: the
+    /// absolute tolerance still admits near-ties, which is precisely the case
+    /// the percentage exists to complement.
+    #[njson(default, alias = "affinity_band_pct", alias = "affinity-band-pct")]
+    pub affinity_band_pct: Option<f64>,
+    /// The absolute part of that tolerance, in milliseconds; absent = 2.
+    ///
+    /// Two tolerances rather than one: a percentage alone collapses to
+    /// nothing when the cheapest server is fast, which is exactly the case it
+    /// exists for. See [`crate::rendezvous::CostBand`].
+    #[njson(default, alias = "affinity_band_ms", alias = "affinity-band-ms")]
+    pub affinity_band_ms: Option<f64>,
+    /// Key the cache-refresh order by this deployment's secret; absent = `true`.
+    ///
+    /// Setting it to `false` is how a deployment with no secret to hold gets a
+    /// reproducible name order back. The cost is real and is reported rather
+    /// than hidden: the order becomes the same on every resolver holding the
+    /// same entries, so the fleet synchronizes on the refresh path and an
+    /// observer who can see a query can predict which entry is refreshed next.
+    /// `refresh_undecorrelated` in the statistics counts the rounds that ran
+    /// this way, so the state cannot be entered by accident without showing up.
+    /// See [`crate::behavior`].
+    #[njson(default, alias = "decorrelate_refresh", alias = "decorrelate-refresh")]
+    pub decorrelate_refresh: Option<bool>,
     /// Forwarding upstreams (optional): `{"proto":"dot","ip":"1.1.1.1","port":853,"host":"cloudflare-dns.com"}`.
     ///
     /// Configuring any forwarder switches the resolver to forwarding mode
@@ -816,6 +852,17 @@ impl Config {
             use_0x20: engine.use_0x20.unwrap_or(d.engine.use_0x20),
             max_cname_depth: engine.max_cname_depth.unwrap_or(d.engine.max_cname_depth),
             tcp_fallback: engine.tcp_fallback.unwrap_or(d.engine.tcp_fallback),
+            affinity_band: crate::rendezvous::CostBand {
+                percent: engine
+                    .affinity_band_pct
+                    .unwrap_or(d.engine.affinity_band.percent),
+                absolute_ms: engine
+                    .affinity_band_ms
+                    .unwrap_or(d.engine.affinity_band.absolute_ms),
+            },
+            decorrelate_refresh: engine
+                .decorrelate_refresh
+                .unwrap_or(d.engine.decorrelate_refresh),
             ..d.engine
         };
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
@@ -1003,6 +1050,51 @@ mod tests {
             EngineConfig::default().query_budget_ms
         );
         assert!(rc.engine.query_budget_ms > 0);
+    }
+
+    /// The decorrelation switch: default on, off only when asked, and the
+    /// off state is what makes `refresh_undecorrelated` meaningful.
+    ///
+    /// A counter that can never be non-zero is worse than no counter, so the
+    /// thing worth testing is that the fallback is *reachable* from
+    /// configuration. The behaviour it guards -- and the reading of a non-zero
+    /// rate -- are documented on the statistic itself.
+    #[test]
+    fn refresh_decorrelation_is_on_unless_turned_off() {
+        let default = EngineConfig::default();
+        assert!(
+            default.decorrelate_refresh,
+            "the default must be the decorrelated order"
+        );
+
+        for key in [
+            "decorrelateRefresh",
+            "decorrelate_refresh",
+            "decorrelate-refresh",
+        ] {
+            // Spelling variants resolve to the same field.
+            let json = alloc::format!(r#"{{"engine":{{"{key}":false}}}}"#);
+            let rc = Config::from_json_str(&json)
+                .unwrap_or_else(|e| panic!("{key} was rejected: {e}"))
+                .into_resolver_config()
+                .unwrap();
+            assert!(!rc.engine.decorrelate_refresh, "for {key}");
+
+            // And `true` is accepted as well as `false`.
+            let json = alloc::format!(r#"{{"engine":{{"{key}":true}}}}"#);
+            let rc = Config::from_json_str(&json)
+                .unwrap()
+                .into_resolver_config()
+                .unwrap();
+            assert!(rc.engine.decorrelate_refresh, "for {key}");
+        }
+
+        // Absent means the default, not `false`.
+        let rc = Config::from_json_str(r#"{"listen":[]}"#)
+            .unwrap()
+            .into_resolver_config()
+            .unwrap();
+        assert!(rc.engine.decorrelate_refresh);
     }
 
     #[test]

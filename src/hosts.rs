@@ -112,10 +112,6 @@ impl HostsTable {
             }
             return Ok(());
         }
-        // Every other pattern is matched in order of specificity. Keeping
-        // them in one list (rather than separate lists per pattern kind) is
-        // what lets a `Subtree` entry and an embedded-wildcard entry compete
-        // on label count instead of on which list they happen to be in.
         if let Some((_, slot)) = self.wildcard.iter_mut().find(|(p, _)| *p == parsed) {
             for a in addrs {
                 if !slot.contains(a) {
@@ -394,8 +390,6 @@ mod tests {
             a_addrs(&t.answer(&n("time.apple.com"), RrType::A).unwrap()),
             vec!["10.0.0.7"]
         );
-        // Wrong label count or wrong tail is not owned, so it resolves
-        // normally rather than silently answering.
         assert!(t.answer(&n("time.a.b.com"), RrType::A).is_none());
         assert!(t.answer(&n("time.apple.org"), RrType::A).is_none());
     }
@@ -408,12 +402,10 @@ mod tests {
             ("+.example.com", &["10.0.0.1"]),
             ("time.*.com", &["10.0.0.2"]),
         ]);
-        // Only the embedded pattern matches this one.
         assert_eq!(
             a_addrs(&t.answer(&n("time.apple.com"), RrType::A).unwrap()),
             vec!["10.0.0.2"]
         );
-        // Only the subtree matches this one.
         assert_eq!(
             a_addrs(&t.answer(&n("time.apple.example.com"), RrType::A).unwrap()),
             vec!["10.0.0.1"]

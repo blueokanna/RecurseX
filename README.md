@@ -4,12 +4,17 @@
 
 RecurseX is a recursive DNS resolver written in Rust. It walks the delegation
 tree the way BIND and Unbound do, so if you have ever read `named.conf` you
-already know what it does. What is different is what it does *with the data it
-has seen*: every cached RRset carries a measured history, every cache decision
-is taken from a score computed by one function, and every table in the resolver
-has a bound that an attacker cannot push past.
+already know what it does. What is different is *how it decides to trust what
+it already holds*: an expired cache entry is served only when a conservative
+probability bound, a consequence class and an aggregate risk budget all agree,
+and the entry is refreshed where refreshing actually changes that bound.
 
 The resolver is not a `HashMap<query, answer>`. That is the whole point.
+
+> The design and the argument behind it are written up in
+> **[`paper/RecurseX-risk-constrained-refresh.md`](paper/RecurseX-risk-constrained-refresh.md)**
+> and, at implementation depth, in the wiki's
+> [Risk-constrained refresh](wiki/Refresh-Theory.md).
 
 ```mermaid
 flowchart LR
@@ -21,31 +26,183 @@ flowchart LR
     D -. "measure: stability, RTT, loss" .-> C
 ```
 
-## TTL is a claim, stability is a measurement
+## A TTL is a claim; the change rate is a measurement
 
 An authoritative server tells you what it *asserts* about a record's lifetime.
 It does not tell you how often the record actually changes, and those are
 different quantities. A `TTL 3600` on a record that rotates every five minutes
 and a `TTL 3600` on a record that has not moved in six months cost the same
-amount of memory and deserve completely different treatment:
+amount of memory and deserve completely different treatment.
 
-- the volatile one should not be trusted when it is stale, should be refreshed
-  early and often, and is not worth occupying a hot slot;
-- the stable one can be refreshed in the background on a schedule nobody
-  notices, and is safe to serve-stale while that happens.
+Earlier versions of this resolver tried to close that gap with an EWMA
+"stability score". That was wrong, and the reasons are worth keeping: the
+score was not a probability (so the thresholds on it were arbitrary), it
+ignored the sampling cadence (ten looks two seconds apart and ten looks over
+ten hours produced the same number), and it could not be conservative (an EWMA
+moving away from a neutral `0.5` makes a barely-observed name look *more*
+trustworthy the less it has been watched).
 
-RecurseX measures the second quantity. Each cache entry owns a
-`StabilityModel`: sample count, change count, an EWMA stability score, a
-long-run change ratio, an EWMA of the authoritative TTL and of its volatility,
-and consecutive refresh failures. A refresh compares the new RRset against the
-old one *by content* (TTLs excluded — a TTL-only change is not a data change),
-and that comparison is what moves the model.
+What replaced it is a **posterior over the change rate**, and a **one-sided
+credibility bound** on it:
 
-**The measured history never touches the TTL you serve.** If the authority says
-300, the client gets 300. Stability only moves internal timing: when to
-prefetch, whether to serve stale, which tier to admit to, and what to evict.
-That separation is a hard rule in this codebase, not a guideline — nothing in
-`stability.rs`, `planner.rs` or `cache/score.rs` can write a TTL.
+```
+Pr(Y = 1 | λ, h) = 1 − e^(−λh)        observations: an exposure h and an outcome Y
+Pr(Y = 0 | λ, h) = e^(−λh)            λ | data  ~ Gamma(α, β),  α = α₀ + Σ w·Y,  β = α₀T + Σ w·h
+
+P_LCB(fresh, Δ) = e^(−λ_hi·Δ)         λ_hi = the exact Chernoff bound on Gamma(α, β)
+```
+
+Read that last line as a sentence: *even taking the most pessimistic change
+rate still consistent with what we have observed, the probability this data is
+correct `Δ` seconds from now is at least this.* That is a claim a safety
+argument can be built on, and it is what every stale decision consumes.
+
+Three consequences are worth naming:
+
+- **Irregular sampling is modelled, not averaged away.** The likelihood
+  conditions on each observation's own exposure, so a resolver that looks
+  often and a resolver that looks rarely draw different inferences from the
+  same zone — which is correct — instead of the same unitless number, which
+  is not.
+- **`Y = 0` does not mean "nothing happened".** It means no visible
+difference was found at that sample; a change that came and went between two
+samples is invisible. That is why the output is a distribution and why the
+model keeps no "change count" in its state at all.
+- **A failed refresh is not evidence of stability.** Recording a timeout as
+  "unchanged" would make an unreachable upstream masquerade as a stable zone,
+  and the resolver *more* willing to answer from memory the worse the network
+  got. Failures age the evidence and teach the model nothing.
+
+### Forgetting is also an anti-forgery bound
+
+Evidence is exponentially forgotten with a time constant `τ` (one day by
+default), because DNS data is not stationary. That has a second effect worth
+stating plainly: forgetting puts a **hard ceiling** on accumulated evidence
+(`b → wτ`). No quantity of refreshes — honest or forged — can drive the
+change rate to zero, so the credibility bound never closes and `P_LCB` is
+strictly below 1 for every entry that has ever existed. An attacker in a
+position to answer our refreshes cannot manufacture unbounded confidence that
+a name never changes, because the model never accumulates unbounded
+confidence in anything. It is a property of the update rule, not a check
+bolted on afterwards.
+
+The second half of the same defence: an answer accepted on the strength of
+ID, port and 0x20 case alone is worth half an authenticated one in the
+statistics, and because the weight scales the *ceiling* as well as the rate,
+an unauthenticated channel can never buy the same confidence however long it
+is observed.
+
+**The measured history never touches the TTL you serve.** If the authority
+says 300, the client gets 300. The model only moves internal timing: when to
+refresh, whether stale may be served, which tier to admit to, what to evict.
+That separation is a hard rule in this codebase, not a guideline.
+
+### Value and safety are different questions
+
+The tempting gate for serve-stale is *"is this name popular?"*. It is wrong,
+and wrong in the direction that hurts: popularity measures the **benefit** of
+an answer and is silent about its **safety**, so applying it means the busiest
+zone in a deployment is the one most likely to be answered from a copy that a
+decommissioned nameserver or a revoked key has invalidated. The failure is
+correlated with traffic, which is the shape of an outage.
+
+So the two questions are answered separately. **Value** (expected saved
+latency) decides what is worth refreshing and in what order. **Risk** decides
+whether stale may be served at all:
+
+```
+R = V · (1 − P_LCB(fresh, a)) · C · κ(trust)
+
+C  ∈ {1 (A/AAAA), 5 (CNAME), 25 (MX/SRV), 100 (NS/glue), ∞ (DNSKEY/DS/NSEC)}
+κ  ∈ {1 chain-anchored, 2 crypto-verified, 5 unverified, 10 indeterminate}
+```
+
+The classes are not decoration. The *same* A record is cheap as answer data
+and `Critical` as glue, because stale glue poisons every later query beneath
+that zone. And key material is `∞`: a stale proof of existence is not a
+freshness failure, it is a security failure — it can resurrect a revoked key.
+
+Every admitted stale answer charges an aggregate **risk budget**, and every
+spawned refresh charges a **refresh budget**. Both are leaky/token buckets, so
+the constraints hold by construction rather than on average, and both export
+their denial counts — because "the policy is the constraint" and "the network
+is the constraint" need opposite fixes.
+
+### A refresh is only useful at the bottleneck
+
+An answer is assembled from several entries — a CNAME, its target, a
+delegation, a nameserver address, a DNSSEC proof — and it is correct only if
+all of them are. The conservative bound is therefore the **minimum** over
+them, not their product: one authoritative republish changes a CNAME and its
+target in the same instant, so an independence assumption would understate the
+risk.
+
+The minimum has a consequence that changes the scheduler: **refreshing
+anything except the weakest link cannot raise the bound at all.** A prefetcher
+that refreshes every expiring member of a chain spends its whole budget and
+improves the guarantee by exactly zero whenever the same member stays weakest.
+So the refresh plan is ordered bottleneck-first, and every entry reports what a
+refresh of it would actually buy, letting a caller stop when the marginal
+refresh stops mattering.
+
+## Where the refresh budget goes
+
+The bottleneck argument says *which* entry to refresh. It does not say which
+entry to refresh **next**, and the maintenance loop holds a finite budget —
+`RefreshBudget` mints tokens at a fixed rate — so that second question is the one
+that decides the outcome. The answer used to be "the entry with the lowest
+`P_LCB`", and that is a threshold, not an allocation. A threshold can only say
+"look at this too"; it is blind to how much an observation would *teach*, to how
+much the answer is *worth*, and to how much harm the record's class can do.
+
+All three are visible to the risk functional the rest of the system already
+uses, so the scheduler prices an observation by the **expected reduction in
+risk** it produces:
+
+```text
+R   = V · (1 − p) · C · κ
+VoI = R(do nothing) − E[R(after observing)]
+```
+
+with both sides evaluated at the horizon, and the expectation over the two
+outcomes an observation can have — the data changed, or it did not — weighted by
+the model's own predictive probability `p₀ = (β / (β + age))^α`.
+
+What makes the number trustworthy is how the "after" state is obtained: by
+cloning the hazard model and calling **the same `observe` the real refresh path
+calls**. Not a re-derivation of the conjugate update — a second source of truth
+whose failure mode would be silent, ranking by an update the model never
+performs.
+
+Three properties fall out that a threshold simply does not have:
+
+- **An observation of something you just observed is worth zero.** A refresh
+  reports the exposure since the last observation, so confirming a one-minute-old
+  fact carries almost no evidence and confirming an hour-old one carries a great
+  deal. Both can have the same `P_LCB` when the scheduler runs. Asserted by
+  `looking_at_something_we_just_looked_at_buys_nothing`.
+- **Value is monotone in what is at stake** — in the consequence class, in the
+  trust penalty, and in the saved latency `V`. A record nobody waits for is not
+  worth a token however uncertain its model is.
+- **Value never exceeds the risk of not acting.** An observation can only remove
+  risk.
+
+Each observation costs one token, so the best allocation is the top-N by value —
+the work is in computing the values, not in the selection, and the selection is
+not dressed up as more than a sort. What the scheduler *does* add on top is a
+**per-class reservation**: a pure value sort starves, and starvation here is
+self-reinforcing, because an entry that is never observed has its evidence decay
+by design, so its bound widens, so it can no longer be **served stale** when a
+lookup arrives. The guarantee is stated exactly and tested side by side with the
+starvation it prevents: if the budget is at least `classes × reservation`, every
+class contributes at least `reservation`.
+
+Prediction is used for the *value* and the credibility bound for *safety*. That
+is not an inconsistency — a value is an expectation and asking "what will we
+learn, on average" is exactly right; a safety decision asks "what is the
+probability we are wrong" and a mean is not a guarantee. The same split already
+separates `CacheScore` from `risk`. [The derivation, the honest limits and a
+worked value are in the wiki](wiki/Value-of-Information.md).
 
 ## The loop
 
@@ -61,14 +218,17 @@ flowchart LR
     M --> C
 ```
 
-The estimator answers one question the planner actually asks:
+The estimator answers one question the *value* side of scheduling asks:
 `P(a query for this zone within the next 60 seconds)`. It builds that from a
 per-zone 96-bucket time-of-day profile (15-minute buckets) plus a short-term
-recency term, and combines them with the larger of a Poisson demand estimate
-and an EWMA inter-arrival rate. Serve-stale requires `p >= 0.5` *and* a mature,
-very stable entry; anything else resolves synchronously. That is the entire
-"prediction" — a probability and a stability score, both of which are
-recomputed from observations, and both of which can say "I don't know".
+recency term. That probability gates whether a background refresh is worth a
+slot; it never gates whether stale data may be served, because a cache hit
+being cheap says nothing about whether it is safe.
+
+The safety side is the hazard model and the risk budget above. It is
+deliberately blind to the estimator: a test exists whose only purpose is to
+make a future change that reintroduces the dependency have to delete the test
+on purpose.
 
 ## What actually happens to a query
 
@@ -84,7 +244,8 @@ recomputed from observations, and both of which can say "I don't know".
    the same answer. The in-flight table is bounded (`max_inflight`), and the
    owner *always* publishes — `Owner::drop` publishes an error if the
    resolution unwinds, so a waiter cannot hang on a slot nobody will fill.
-4. **Cache first**: exact key, then the ECS-less key, then a CNAME for the
+4. **Cache first**: the requester's ECS partition, then every broader ECS
+   scope that contains it, then the global partition; then a CNAME for the
    same name, then the NXDOMAIN store. A hit that is fresh is served; a hit
    that is expired but inside the stale window goes to the planner, which
    either serves it stale (and queues a refresh) or sends the query onward.
@@ -108,9 +269,17 @@ arguments, so an entry's tier and its position in the eviction order cannot
 disagree:
 
 ```
-score = 0.30·popularity + 0.18·locality + 0.20·stability
+score = 0.30·popularity + 0.18·locality + 0.20·durability
       + 0.16·ttl        + 0.11·cost     − 0.05·memory
 ```
+
+The `durability` term is the model's estimate over a one-minute horizon, and
+it is the only term with a calibrated meaning. The score as a whole is a
+**value** function — what is worth keeping in memory — and it is never a
+safety gate: two entries can share a score while one is a delegation about to
+expire and the other is a TXT record nobody queried, and no choice of weights
+fixes that, because the distinction is not a matter of degree. Whether an
+answer may be served is decided by the risk functional above.
 
 Thresholds: hot at 0.72, warm at 0.35, cold at 0.15; below 0.15 the entry is
 not cached at all.
@@ -167,6 +336,73 @@ Two details that are easy to get wrong and are pinned by tests here:
 - **An unmeasured path is ranked by the best case it could achieve**, not by a
   pessimistic guess: unknown paths sort ahead of measured ones and get probed
   exactly once, after which their own measurements decide.
+
+### A redundant server set is used as a set
+
+Ranking by cost is right, and it is not enough. Every resolver in a fleet holds
+the same delegation, computes the same costs from the same measurements, and
+therefore converges on the **same** server — and stays there, because the
+measurement it takes confirms the choice. A delegation with five equivalent
+servers is then exercised as one machine.
+
+So candidates whose cost is inside a tolerance band compete in a **keyed
+rendezvous lottery**; candidates outside it keep their exact cost order. Inside
+the band the servers are, by construction, indistinguishable at the resolution
+of the measurements, and one is chosen by
+
+```
+score_i = −ln(U_i) / w_i ,   U_i uniform on (0,1] from the keyed hash
+```
+
+which is the exponential race: `i` wins with probability exactly `w_i / Σ w_j`,
+and withdrawing a candidate changes **only** the questions it was winning. That
+second property is asserted for equality in the test suite, not within a
+tolerance — a `hash % n` construction fails it outright, which is why there is
+not one.
+
+The head of the ranking is a pure function of a 128-bit secret drawn at startup
+and the question, so every resolver holding the same key agrees, and an observer
+who can see a query cannot compute which authoritative we will contact. That
+matters: an attacker who can compute the next hop knows exactly which path to
+pre-position a spoofing attempt against.
+
+`engine.affinityBandPct` and `engine.affinityBandMs` set the band; setting
+**both** to `0` collapses it to the cheapest candidate and disables the lottery.
+`stats.affinityLotteries` counts how often it ran, so "the band only ever
+admitted one server" is observable rather than indistinguishable from "the
+feature is off".
+
+### The refresh order is keyed, not alphabetical
+
+The maintenance loop's budget is finite, so the *order* in which entries consume
+it decides which ones get looked at. The first key is fixed and is not a choice:
+ascending `P_LCB(fresh, horizon)`, worst confidence first. The ties were
+previously broken by name — which is a public function of the query stream, and
+therefore two defects at once. Every resolver holding the same entries refreshed
+the same names in the same sequence (a fleet-wide thundering herd against the
+authoritative), and an observer who could see a query knew which entry we would
+look at next, which is the interval in which a forged answer has the best chance
+of entering the model.
+
+Ties are now broken by a **keyed behavioural fingerprint**: the measured change
+bound, TTL, TTL volatility, trust level and resolution cost, quantised at one
+bucket per doubling — coarse enough that the class does not churn as the model
+drifts, and tagged under a secret. `Debug` redacts the key and no accessor
+returns it, because such an accessor's only realistic outcome is a log line.
+
+`engine.decorrelateRefresh` (default `true`) is the way out for a deployment with
+no secret to hold — a hermetic replay harness, say. Turning it off restores name
+order, and `stats.refreshUndecorrelated` counts the rounds that ran that way, so
+the correlated state is a reading rather than an accident. The switch exists
+because that counter would otherwise be unreachable code.
+
+This is the honest half of what a "behavioural hash" can be. It is not an
+address and it cannot route a packet: a hash computed at the sender cannot select
+a destination, because a destination's behaviour is not known at the sender, and
+forwarding by hash distance still needs a next-hop for every region of the hash
+space — which is a routing table. [Which parts of that proposal survive contact
+with physics is written out in the wiki](wiki/Beyond-The-Lookup.md), including
+the parts that do not.
 
 ### Bounds, and what each one is defending against
 
@@ -258,6 +494,17 @@ code delivers:
   bound — the bucket table stays capped and evicting an idle bucket is free
   (it would have refilled to capacity anyway), so a flood costs a bounded
   amount of memory and CPU rather than unbounded work per packet.
+- **The affinity lottery spreads *our* load, not the Internet's.** It removes
+  fleet convergence on one authoritative, which is a real and common defect. It
+  does not mitigate a volumetric attack on an authoritative, and it does not
+  change a single byte of what a client receives: the selection happens between
+  us and the server we ask. The answer's records, order-independence (RFC 2181
+  §5.1) and TTLs are the zone's.
+- **The behavioural fingerprint is not an address.** It is not on the wire, it
+  cannot route anything, and a hash computed at a sender cannot select a
+  destination. [Which parts of the "serverless behavioural-hash network"
+  proposal are physically possible and which are not is written out in the
+  wiki](wiki/Beyond-The-Lookup.md) rather than silently omitted.
 
 ## Building
 
@@ -266,7 +513,7 @@ Rust 1.78 or newer (the CI matrix runs the MSRV and stable):
 ```sh
 cargo build --release                       # everything, default features
 cargo build --no-default-features           # no_std + alloc algorithmic core
-cargo test --all-features                   # 166 tests + 4 doctests
+cargo test --all-features                   # 455 tests + 4 doctests
 cargo run --example quick_check             # live resolution, needs network
 ```
 
@@ -384,7 +631,11 @@ cargo run --example server_demo      # blocks; query it with dig -p 5353
 | --- | --- |
 | `src/name.rs`, `src/message.rs`, `src/rdata.rs`, `src/edns.rs` | wire format: names, compression, messages, all RR types, EDNS(0) |
 | `src/cache/` | tiered cache, admission scoring, L3 snapshot (`persist`) |
-| `src/estimator.rs`, `src/planner.rs`, `src/stability.rs` | the predictive half: demand, decisions, measured history |
+| `src/hazard.rs`, `src/risk.rs`, `src/provenance.rs`, `src/planner.rs` | the decision half: change-rate posterior and credibility bound, risk functional and budgets, dependency set, planner |
+| `src/voi.rs` | the allocation half: what one more observation is worth, in risk units, and which entries to spend a finite refresh budget on |
+| `src/budget.rs`, `src/calibration.rs` | the per-resolution work envelope (the NXNS gate) and the calibration surface (Brier, log loss, reliability table, latency quantiles) |
+| `src/estimator.rs`, `src/stability.rs`, `src/cache/score.rs` | the value half: demand estimation, the per-entry model facade, admission ranking |
+| `src/behavior.rs`, `src/rendezvous.rs` | keyed behavioural identity (refresh-order decorrelation) and weighted rendezvous selection (upstream affinity) |
 | `src/alias.rs` | alias dependencies between cached answers |
 | `src/upstream.rs`, `src/transport.rs`, `src/transports/` | path models and the transports behind them |
 | `src/resolver.rs` | the resolution loop, coalescing, maintenance |
@@ -396,17 +647,23 @@ cargo run --example server_demo      # blocks; query it with dig -p 5353
 
 ## Tests and CI
 
-There are 291 unit tests, 22 integration tests in `tests/`, and 4 doctests, and
-the suite does not assert on any reply from the public Internet: upstreams in the
-tests are local stub servers, so `cargo test` is hermetic in the sense that its
+There are 431 unit tests, 24 integration tests in `tests/`, and 4 doctests —
+459 in the default configuration — and the suite does not assert on any reply
+from the public Internet: upstreams in the tests are local stub servers, so
+`cargo test` is hermetic in the sense that its
 result is about the resolver and not about the network. What is covered includes
-the wire codec (including rejection cases), cache admission/eviction/serve-stale/
-persistence, the estimator's `exp` implementation against reference values,
-planner decisions, the alias graph's both directions and pruning, upstream cost
-selection, the coalescer (including an owner that vanishes without publishing),
-UDP truncation to the advertised size, the server's end-to-end UDP/TCP paths,
-DNSSEC RSA verification against an openssl-generated vector, and the self-tests
-of the float helpers.
+the wire codec (including rejection cases), cache admission/eviction/serve-stale
+and **ECS partitioning**, persistence, the change-rate posterior and its Chernoff
+bound (including the property that forged observations cannot manufacture
+evidence), the risk budget and the over-serving ledger, the per-resolution work
+envelope (including the NXNS gate), the answer provenance DAG and its
+bound-preserving trim lemma, calibration (Brier / log loss / reliability),
+the estimator's `exp` implementation against reference values, planner decisions,
+the alias graph's both directions and pruning, upstream cost selection, the
+coalescer (including an owner that vanishes without publishing), UDP truncation
+to the advertised size, the server's end-to-end UDP/TCP paths, DNSSEC RSA
+verification against an openssl-generated vector and the four-state trust ladder,
+and the self-tests of the float helpers.
 
 The integration tests are the ones an embedder cares about: they build a
 resolver from a JSON document, serve it over UDP *and* TCP, assert the second
@@ -414,7 +671,12 @@ query is answered from cache without touching upstream, restart a process from
 its `persist` snapshot, and stop everything through the public shutdown API.
 `tests/iterative_path.rs` walks a stub root and a stub `test` zone through
 delegation, NXDOMAIN, a refusal and a black hole, which is where the
-*resolution* rules are pinned down rather than the codec.
+*resolution* rules are pinned down rather than the codec. It also pins the two
+mechanisms the refresh model added, and both assertions are about *counts* rather
+than error codes: an unglued referral naming twelve servers is refused before a
+single address lookup, and an answer the server scoped to a `/24` is reused
+inside that `/24` at zero upstream cost while a different `/24` and a client with
+no ECS at all have to go and ask.
 `tests/wire_robustness.rs` feeds the decoder 20,000 deterministic pseudo-random
 buffers plus hostile count fields, compression-pointer cycles and every
 truncation boundary, and asserts the parser never panics and that anything it
@@ -460,4 +722,8 @@ the build red.
 
 ## License
 
-Apache-2.0.
+Copyright 2026 blueokanna. RecurseX is available under the
+[PolyForm Shield License 1.0.0](LICENSE). It is source-available: it prohibits providing a product that competes with
+RecurseX or with a product the licensor provides using RecurseX. The standard
+PolyForm Shield terms do not impose a blanket ban on non-competitive commercial
+sales or subscriptions.

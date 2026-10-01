@@ -29,7 +29,7 @@
 //! data and derives packet-protection keys from its secrets.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use courierust::courierust_quic::frame::Frame;
@@ -376,9 +376,9 @@ impl QuicConnection {
         now: i64,
         timeout_ms: u64,
     ) -> Result<Self> {
-        let bind_addr: SocketAddr = match endpoint.ip {
-            IpAddr::V4(_) => "0.0.0.0:0".parse().expect("static IPv4 bind address"),
-            IpAddr::V6(_) => "[::]:0".parse().expect("static IPv6 bind address"),
+        let bind_addr = match endpoint.ip {
+            IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let socket =
             UdpSocket::bind(bind_addr).map_err(|e| Error::io(format!("doq udp bind: {e}")))?;
@@ -864,10 +864,11 @@ impl QuicConnection {
                 .ok_or_else(|| Error::wire("doq empty datagram"))?;
             // Version negotiation packet (version 0 in a long header).
             if first & 0x80 != 0 && dg.len() >= 5 && dg.u32_at(1)? == 0 {
-                self.closed = Some(Error::transport(
+                let err = Error::transport(
                     "doq server does not support QUIC version 1 (version negotiation)",
-                ));
-                return Err(self.closed.clone().unwrap());
+                );
+                self.closed = Some(err.clone());
+                return Err(err);
             }
             // Retry packet (always alone in a datagram, RFC 9000 §17.2.5).
             if first & 0x80 != 0
@@ -996,8 +997,9 @@ impl QuicConnection {
             return Ok(()); // Retry for another connection
         }
         if self.retry_scid.is_some() || self.handshake_confirmed || self.saw_server_scid {
-            self.closed = Some(Error::wire("doq unexpected Retry"));
-            return Err(self.closed.clone().unwrap());
+            let err = Error::wire("doq unexpected Retry");
+            self.closed = Some(err.clone());
+            return Err(err);
         }
         // Verify the integrity tag (RFC 9001 §5.8).
         let retry_wire = dg.slice_at(0, tag_at)?;
@@ -1112,11 +1114,12 @@ impl QuicConnection {
                     trace(format_args!(
                         "recv CONNECTION_CLOSE error={error_code} frame_type={frame_type:?} reason={reason_str:?}"
                     ));
-                    self.closed = Some(Error::transport(format!(
+                    let err = Error::transport(format!(
                         "doq server closed connection (error {}): {reason_str}",
                         error_code
-                    )));
-                    return Err(self.closed.clone().unwrap());
+                    ));
+                    self.closed = Some(err.clone());
+                    return Err(err);
                 }
                 Frame::PathChallenge(tag) => {
                     // Respond to path validation (RFC 9000 §8.2.2).
@@ -1134,8 +1137,9 @@ impl QuicConnection {
                 }
                 Frame::ResetStream { stream_id, .. } | Frame::StopSending { stream_id, .. } => {
                     if stream_id == self.stream_id && !self.query_rx.complete() {
-                        self.closed = Some(Error::transport("doq server reset the query stream"));
-                        return Err(self.closed.clone().unwrap());
+                        let err = Error::transport("doq server reset the query stream");
+                        self.closed = Some(err.clone());
+                        return Err(err);
                     }
                 }
                 Frame::HandshakeDone
@@ -1367,8 +1371,9 @@ impl QuicConnection {
             // remote out-of-memory, exactly the failure the length check was
             // written to prevent.
             let Some(end) = reassembly_end(offset, data.len(), MAX_RESPONSE_BUFFER) else {
-                self.closed = Some(Error::transport("doq response exceeds buffer limit"));
-                return Err(self.closed.clone().unwrap());
+                let err = Error::transport("doq response exceeds buffer limit");
+                self.closed = Some(err.clone());
+                return Err(err);
             };
             self.query_rx.buf.resize(end, 0);
             // `end - data.len()` is where the new bytes start; it is not
@@ -1392,8 +1397,9 @@ impl QuicConnection {
             self.query_rx.fin = true;
         }
         if self.query_rx.buf.len() > MAX_RESPONSE_BUFFER {
-            self.closed = Some(Error::transport("doq response exceeds buffer limit"));
-            return Err(self.closed.clone().unwrap());
+            let err = Error::transport("doq response exceeds buffer limit");
+            self.closed = Some(err.clone());
+            return Err(err);
         }
         // Replenish the stream + connection windows as we consume.
         self.conn_rx_consumed = self.conn_rx_consumed.max(self.query_rx.buf.len() as u64);
@@ -1542,14 +1548,18 @@ impl QuicConnection {
             return Ok(());
         }
         if self.pto_count >= MAX_PTO_COUNT {
-            self.closed = Some(Error::new(
-                crate::error::ErrorKind::Timeout,
-                "doq too many PTOs",
-            ));
-            return Err(self.closed.clone().unwrap());
+            let err = Error::new(crate::error::ErrorKind::Timeout, "doq too many PTOs");
+            self.closed = Some(err.clone());
+            return Err(err);
         }
         let timeout = self.pto_timeout();
-        let last_sent = self.sent.iter().map(|p| p.sent).max().unwrap();
+        let Some(last_sent) = self.sent.iter().map(|p| p.sent).max() else {
+            // Unreachable: the emptiness check above returned. Written as a
+            // `let ... else` rather than `.max().unwrap()` so that a future
+            // edit which reorders these two checks cannot introduce a panic
+            // into the retransmission timer.
+            return Ok(());
+        };
         if Instant::now() < last_sent + timeout {
             return Ok(());
         }

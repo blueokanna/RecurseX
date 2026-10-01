@@ -8,8 +8,8 @@ networked parts are isolated behind the `std` feature.
 |---:|---|---|---|
 | **1** | **Client Layer**<br>客户端层 | `server.rs` | UDP/TCP 监听器<br>每次查询的响应构建器 |
 | **2** | **Query Processing**<br>查询处理 | `query.rs`<br>`policy.rs` | 规范化（Normalize）<br>请求去重（Dedup）<br>请求合并（Coalesce）<br>0x20 编码<br>速率限制（Rate Limit） |
-| **3** | **Multi-tier Cache**<br>多级缓存 | `cache/`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>缓存稳定性模型<br>评分准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
-| **4** | **Resolution Engine**<br>解析引擎 | `resolver.rs`<br>`engine.rs`<br>`dnssec/` | Root → TLD → Authoritative<br>CNAME / DNAME<br>Referral 处理<br>DNSSEC 验证 |
+| **3** | **Multi-tier Cache**<br>多级缓存 | `cache/`<br>`hazard.rs`<br>`risk.rs`<br>`voi.rs`<br>`provenance.rs`<br>`stability.rs`<br>`cache/score.rs`<br>`cache/persist.rs` | Hot / Warm / Cold + NXDOMAIN<br>ECS 分区<br>变化率后验（`HazardModel`）<br>风险预算与后果分级<br>信息价值调度<br>答案依赖 DAG<br>评分准入（Score Admission）<br>过期缓存服务（Serve-stale）<br>预取（Prefetch）<br>L3 持久化 |
+| **4** | **Resolution Engine**<br>解析引擎 | `resolver.rs`<br>`engine.rs`<br>`budget.rs`<br>`dnssec/` | Root → TLD → Authoritative<br>CNAME / DNAME<br>Referral 处理<br>每次解析工作信封（NXNS 门）<br>DNSSEC 验证 |
 | **5** | **Upstream Transport**<br>上游传输 | `transport.rs`<br>`transports/`<br>`forward.rs` | `DnsTransport` Trait<br>UDP / TCP / DoT / DoH / DoH3 / DoQ<br>Forwarder 集合 |
 | **6** | **Security / Policy**<br>安全与策略 | `policy.rs`<br>`query.rs`<br>`dnssec/` | 速率限制<br>内容过滤<br>防欺骗检查（Anti-spoofing）<br>DNSSEC 判定（Verdicts） |
 
@@ -21,13 +21,19 @@ networked parts are isolated behind the `std` feature.
    deduplicates concurrent identical queries (a coalescer with a condvar
    wait), applies the client rate limit, and builds a `QueryKey` (name, type,
    class, ECS partition, DNSSEC flags).
-3. **Cache** is consulted first. A fresh hit returns immediately with the
-   remaining TTL. An expired-but-within-window entry may be served stale
-   (RFC 8767) while a refresh is kicked off. A miss proceeds to the engine.
+3. **Cache** is consulted first, walking ECS partitions upward from the
+   requester's own to the global one. A fresh hit returns immediately with the
+   remaining TTL. An expired-but-within-window entry is put to the *risk* model
+   — which asks how likely the data still is to be correct, how bad it would be
+   if it were not, and how well its authenticity was established — and only
+   then served stale (RFC 8767) with a refresh kicked off. A miss, or a refusal,
+   proceeds to the engine.
 4. **Resolution engine** walks the tree. It queries the root hints, follows
-   referrals one zone at a time, applies QNAME minimization (RFC 9156),
-   chases CNAME/DNAME, filters out-of-bailiwick data, and (with `dnssec`)
-   validates the answer chain.
+   referrals one zone at a time under a per-resolution work budget (which
+   refuses a referral advertising more servers than we are willing to look up
+   before a single address query is sent), applies QNAME minimization
+   (RFC 9156), chases CNAME/DNAME, filters out-of-bailiwick data, and (with
+   `dnssec`) validates the answer chain.
 5. **Upstream transport** delivers the wire query over the selected
    protocol. UDP truncation falls back to TCP. Encrypted transports are
    feature-gated.
@@ -41,11 +47,12 @@ simulations.
 
 ## Where the no_std boundary is
 
-`--no-default-features` builds the wire codec, cache, estimator, graph,
-upstream model, policy and planner without `std` (only `alloc`). Sockets,
-threads, the resolver, the server, JSON config and the encrypted transports
-are `std`-gated. The no_std core is what makes the prediction machinery
-portable to embedded targets that only want the model, not the network.
+`--no-default-features` builds the wire codec, cache, hazard model, risk budget,
+answer provenance, work budget, estimator, alias graph, upstream model, policy
+and planner without `std` (only `alloc`). Sockets, threads, the resolver, the
+server, JSON config and the encrypted transports are `std`-gated. The no_std core
+is what makes the prediction machinery portable to embedded targets that only
+want the model, not the network.
 
 ## Error model
 

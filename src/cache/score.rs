@@ -1,21 +1,44 @@
-//! Cache admission scoring.
+//! Cache admission and eviction ranking.
 //!
-//! A cache that admits everything is a cache that thrashes. RecurseX scores
-//! every candidate entry and admits it to the tier its score earns:
+//! A cache that admits everything is a cache that thrashes. RecurseX ranks
+//! every candidate entry and admits it to the tier its rank earns:
 //!
 //! ```text
-//! CacheScore =
+//! ValueScore =
 //!     α × popularity        — estimated query rate for the zone
 //!   + β × temporal locality  — how recently (and how often) it was served
-//!   + γ × stability          — the observed stability model score
+//!   + γ × durability         — P(fresh, 60 s): the model's estimate
 //!   + δ × TTL                — longer-lived entries amortize better
 //!   + ε × resolution cost    — expensive-to-resolve data is worth keeping
 //!   − ζ × memory cost        — large entries cost more to keep hot
 //! ```
 //!
 //! All terms are normalized to `0..1` so the weights are comparable. The
-//! score is recomputed on every serve and drives both admission and
-//! eviction (a victim is the lowest-scored entry in a tier).
+//! rank is recomputed on every serve and drives both admission and eviction
+//! (a victim is the lowest-ranked entry in a tier).
+//!
+//! # This is a *value* function, not a safety gate
+//!
+//! Nothing here decides whether an answer may be served. The score answers
+//! "what is worth keeping in memory", which is a resource-allocation
+//! question; whether stale data may be returned is a risk question and
+//! lives in [`crate::risk`], evaluated per decision against a credibility
+//! bound and a consequence class.
+//!
+//! The separation is not cosmetic. A linear combination of six normalized
+//! terms cannot be given a safety meaning: two entries can share a score
+//! while one is a delegation about to expire and the other is a TXT record
+//! nobody queried, and no choice of weights fixes that, because the
+//! distinction is not a matter of degree. Conflating them is how a resolver
+//! ends up trading a nameserver delegation for a cache hit.
+//!
+//! The weights below are therefore *not* fitted constants with a statistical
+//! justification: they are declared operating points, and the honest claim
+//! is that the ordering they induce is reasonable, not that it is optimal.
+//! `durability` is the only term with a calibrated meaning
+//! ([`crate::hazard`]), and it is used here only as one of six, evaluated at
+//! the posterior-predictive mean because ranking is estimation rather than a
+//! safety decision.
 
 use crate::stability::StabilityModel;
 use crate::time::Ts;
@@ -38,8 +61,9 @@ pub struct ScoreWeights {
     pub popularity: f64,
     /// β — temporal locality weight.
     pub locality: f64,
-    /// γ — stability weight.
-    pub stability: f64,
+    /// γ — durability weight (the conservative freshness probability over a
+    /// one-minute horizon; see [`crate::hazard`]).
+    pub durability: f64,
     /// δ — TTL weight.
     pub ttl: f64,
     /// ε — resolution-cost weight.
@@ -53,7 +77,7 @@ impl Default for ScoreWeights {
         Self {
             popularity: 0.30,
             locality: 0.18,
-            stability: 0.20,
+            durability: 0.20,
             ttl: 0.16,
             cost: 0.11,
             memory: 0.05,
@@ -85,11 +109,11 @@ pub fn memory_term(bytes: usize) -> f64 {
     (bytes as f64 / MEM_REF_BYTES).clamp(0.0, 1.0)
 }
 
-/// The admission score of one entry: the weighted sum of all six terms
-/// (the memory term is subtracted), clamped to `0..1`.
+/// The rank of one entry: the weighted sum of all six terms (the memory
+/// term is subtracted), clamped to `0..1`.
 ///
-/// This is the only scoring entry point — admission, re-scoring on a serve,
-/// and eviction ranking all call it with the same arguments, so an entry's
+/// This is the only ranking entry point — admission, re-ranking on a serve,
+/// and eviction ordering all call it with the same arguments, so an entry's
 /// tier and its position in the eviction order can never disagree.
 pub fn score(
     weights: &ScoreWeights,
@@ -104,13 +128,13 @@ pub fn score(
     let locality = (1.0 - (age_secs / LOCALITY_WINDOW_SECS).min(1.0)).max(0.0);
 
     let pop = inputs.popularity.clamp(0.0, 1.0);
-    let stab = stability.score().clamp(0.0, 1.0);
+    let durable = stability.durability_score().clamp(0.0, 1.0);
     let ttl = (ttl_secs as f64 / TTL_REF_SECS).clamp(0.0, 1.0);
     let cost = (inputs.est_cost_ms / COST_REF_MS).clamp(0.0, 1.0);
 
     let raw = weights.popularity * pop
         + weights.locality * locality
-        + weights.stability * stab
+        + weights.durability * durable
         + weights.ttl * ttl
         + weights.cost * cost
         - weights.memory * memory_term(entry_bytes);

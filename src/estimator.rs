@@ -17,81 +17,9 @@ use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use core::fmt;
 
+use crate::float::exp_nonpos;
 use crate::name::Name;
 use crate::time::Ts;
-
-/// `e^x` for `x ≤ 0`, computed without `libm`.
-///
-/// `core` has no transcendental functions (they live in `std`/`libm`), and
-/// the allowed dependency set does not include `libm`, so the estimator
-/// carries its own `exp`. The argument here is always `-λ·Δt ≤ 0`, so we
-/// use the standard decomposition `e^x = 2^(x·log₂e)` with a Taylor
-/// expansion of `2^f` on `f ∈ [-0.5, 0.5]` and an exponent-field shift for
-/// the `2^n` part — no allocations, no unsafe, ~1e-11 relative error.
-/// Round half away from zero (IEEE-754 `round`), via bit arithmetic —
-/// `core` does not provide `f64::round` (it needs `libm`).
-fn round_f64(y: f64) -> f64 {
-    let bits = y.to_bits();
-    // Biased exponent, then unbiased.
-    let biased = ((bits >> 52) & 0x7ff) as i32;
-    let exp = biased - 1023;
-    if exp >= 52 {
-        // Integral (or infinite/NaN); nothing to round.
-        return y;
-    }
-    let sign = bits >> 63;
-    if exp < 0 {
-        // |y| < 1: round to ±1 when |y| ≥ 0.5, else ±0.
-        let abs = bits & 0x7fff_ffff_ffff_ffff;
-        if abs >= 0x3fe0_0000_0000_0000 {
-            if sign == 1 {
-                -1.0
-            } else {
-                1.0
-            }
-        } else if sign == 1 {
-            -0.0
-        } else {
-            0.0
-        }
-    } else {
-        // 0 ≤ exp < 52: the low (52 − exp) bits are the fraction.
-        let frac_bits = 52 - exp as u32;
-        let frac_mask = (1u64 << frac_bits) - 1;
-        let frac = bits & frac_mask;
-        let half = 1u64 << (frac_bits - 1);
-        if frac >= half {
-            // Round the magnitude up (away from zero); carries into the
-            // exponent naturally (e.g. 1.5 → 2.0).
-            let up = (bits & !frac_mask) + (1u64 << frac_bits);
-            f64::from_bits(up)
-        } else {
-            f64::from_bits(bits & !frac_mask)
-        }
-    }
-}
-
-fn exp_nonpos(x: f64) -> f64 {
-    debug_assert!(x <= 0.0);
-    if x <= -745.0 {
-        return 0.0;
-    }
-    let y = x * core::f64::consts::LOG2_E;
-    let n = round_f64(y);
-    let t = (y - n) * core::f64::consts::LN_2; // |t| ≤ 0.35
-                                               // exp(t) = Σ t^i / i! (10 terms ⇒ rel. err < 1e-11 on |t| ≤ 0.35).
-    let mut p = 1.0;
-    let mut term = 1.0;
-    let mut i = 1.0;
-    while i <= 9.0 {
-        term *= t / i;
-        p += term;
-        i += 1.0;
-    }
-    // Multiply by 2^n by nudging the exponent field (works for p ∈ [0.5,2)).
-    let bits = (p.to_bits() as i64).wrapping_add((n as i64) << 52);
-    f64::from_bits(bits as u64)
-}
 
 /// Number of time-of-day buckets (96 × 15 min = one day).
 pub const TOD_BUCKETS: usize = 96;
@@ -519,7 +447,7 @@ mod tests {
             (1e20, 1e20),
         ];
         for (x, want) in cases {
-            let got = round_f64(*x);
+            let got = crate::float::round(*x);
             assert!(
                 (got - want).abs() <= f64::EPSILON.max(got.abs() * 1e-15),
                 "round({x}) = {got}, want {want}"

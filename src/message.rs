@@ -319,9 +319,7 @@ impl Message {
         for (dst, n) in header_tail.chunks_exact_mut(2).zip(counts) {
             dst.copy_from_slice(&n.to_be_bytes());
         }
-        // `count_pos` was recorded where the header was written, so the range
-        // is in bounds by construction — the check is what keeps that a fact
-        // rather than an assumption.
+
         let dst = out
             .get_mut(count_pos..)
             .and_then(|tail| tail.get_mut(..header_tail.len()))
@@ -510,8 +508,6 @@ mod tests {
             qtype: RrType::A,
             qclass: RrClass::IN,
         });
-        // Two records whose owner names share the "example.com" suffix, so
-        // the second owner name and the CNAME target compress.
         m.answers.push(Record {
             name: Name::from_ascii("www.example.com").unwrap(),
             rr_type: RrType::CNAME,
@@ -536,8 +532,6 @@ mod tests {
         let bytes = m.to_bytes().unwrap();
         let m2 = Message::parse(&bytes).unwrap();
         assert_eq!(m, m2);
-        // Verify compression actually happened: the second owner name is a
-        // 2-byte pointer (0xc0 0x0c) referencing the first name.
         assert!(bytes.windows(2).any(|w| w == [0xc0, 0x0c]));
         assert!(bytes.len() < 100, "compressed size should be small");
     }
@@ -565,7 +559,6 @@ mod tests {
 
     #[test]
     fn truncate_oversized_response_sets_tc_and_fits() {
-        // A response with many distinct records so it far exceeds 512 bytes.
         let mut m = Message::new(7);
         m.flags.qr = true;
         m.questions.push(Question {
@@ -591,10 +584,8 @@ mod tests {
         assert!(m.is_truncated());
         let bytes = m.to_bytes().unwrap();
         assert!(bytes.len() <= 512, "truncated size {}", bytes.len());
-        // The question survives truncation.
         assert_eq!(m.questions.len(), 1);
 
-        // A small response is left untouched.
         let mut small = Message::new(8);
         small.flags.qr = true;
         small.answers.push(Record {

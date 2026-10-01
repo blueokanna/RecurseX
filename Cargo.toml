@@ -3,9 +3,9 @@ name = "recurse-x"
 version = "0.2.1"
 edition = "2021"
 rust-version = "1.78"
-license = "Apache-2.0"
+license = "PolyForm-Shield-1.0.0"
 authors = ["blueokanna", "HyphenTeam"]
-description = "A predictive adaptive recursive DNS resolver: a stability-measured multi-tier cache, alias-coherent prefetch, and expected-cost upstream selection."
+description = "A risk-constrained recursive DNS resolver: a credibility-bounded RRset change model, dependency-consistent cache refresh, and a budgeted serve-stale policy."
 homepage = "https://github.com/blueokanna/RecurseX"
 repository = "https://github.com/blueokanna/RecurseX"
 readme = "README.md"
@@ -20,6 +20,8 @@ exclude = [
     "Cargo.lock",
     "rust-toolchain.toml",
     "wiki/",
+    "paper/",
+    "patent/",
     ".vscode/",
 ]
 

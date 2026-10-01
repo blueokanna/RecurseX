@@ -22,7 +22,7 @@ use crate::message::{HeaderFlags, Message};
 use crate::name::Name;
 use crate::planner::{PlannerConfig, ResolutionPlanner};
 use crate::policy::{PolicyConfig, PolicyEngine, RateLimiter};
-use crate::prng::SplitMix64;
+use crate::prng::{Csprng, RandomSource};
 use crate::qtype::{Rcode, RrClass, RrType};
 use crate::query::{ecs_option, response_matches_query, QueryKey};
 use crate::rdata::{RData, Record};
@@ -79,6 +79,20 @@ pub struct EngineConfig {
     pub edns_udp_size: u16,
     /// Whether to request and validate DNSSEC.
     pub dnssec: bool,
+    /// Whether a DNSSEC trust anchor is configured.
+    ///
+    /// This is the difference between `CryptoVerified` and `ChainAnchored`
+    /// in [`crate::risk::TrustLevel`], and it defaults to `false` because
+    /// this build ships **no** root trust anchor. Claiming `ChainAnchored`
+    /// without one is exactly the over-claim the honest DNSSEC ladder exists
+    /// to prevent, so the flag cannot be inferred from `dnssec`.
+    pub dnssec_anchored: bool,
+    /// The per-resolution work envelope.
+    ///
+    /// Bounded *work*, not just bounded depth: the NXNS shape defeats a
+    /// depth limit by making each level of the tree cheap to enter and
+    /// expensive to finish. See [`crate::budget`].
+    pub fetch_limits: crate::budget::FetchLimits,
     /// Fall back to TCP on truncation.
     pub tcp_fallback: bool,
     /// Retransmit budget for the expected-cost model.
@@ -87,6 +101,26 @@ pub struct EngineConfig {
     pub max_ns_depth: usize,
     /// Maximum number of ranked servers tried per query.
     pub max_servers_tried: usize,
+    /// How much more expensive than the cheapest a server may be and still
+    /// compete for traffic.
+    ///
+    /// Candidates inside the band are indistinguishable at the resolution of
+    /// the measurements, so they are permuted by a keyed rendezvous lottery
+    /// keyed on the query name; candidates outside it keep their exact cost
+    /// order. A band that admits only one candidate disables the lottery, which
+    /// is the correct behaviour for a delegation whose servers genuinely
+    /// differ. See [`crate::rendezvous`].
+    pub affinity_band: crate::rendezvous::CostBand,
+    /// Key the refresh order by the deployment's secret.
+    ///
+    /// On by default and there is no reason to turn it off in production. It
+    /// exists because the fallback has to be *reachable* for the counter that
+    /// reports it to mean anything: a deployment that cannot hold a secret (a
+    /// hermetic replay harness, a build whose entropy source is unavailable)
+    /// sets this to `false`, gets name order back, and can see from
+    /// `refresh_undecorrelated` that its refresh order is correlated across the
+    /// fleet. See [`crate::behavior`].
+    pub decorrelate_refresh: bool,
     /// Maximum total wire attempts per query (bounds worst-case latency).
     pub max_total_attempts: u32,
     /// Forwarding upstreams (when set, queries go through these instead of
@@ -109,11 +143,15 @@ impl Default for EngineConfig {
             max_referrals: 32,
             edns_udp_size: 1232,
             dnssec: false,
+            dnssec_anchored: false,
+            fetch_limits: crate::budget::FetchLimits::default(),
             tcp_fallback: true,
             retransmit_budget: 2,
             max_ns_depth: 6,
             max_servers_tried: 6,
             max_total_attempts: 10,
+            affinity_band: crate::rendezvous::CostBand::default(),
+            decorrelate_refresh: true,
             #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
             forwarders: Vec::new(),
         }
@@ -317,7 +355,13 @@ pub struct ResolverConfig {
     /// Maximum alias entries refreshed alongside one target (see
     /// [`Resolver::refresh_with_dependents`]).
     pub max_chain_refresh: usize,
-    /// Serve-stale TTL reported to clients (RFC 8767 recommends 30 s).
+    /// Serve-stale TTL reported to clients (RFC 8767 §4 recommends ≤ 30 s).
+    ///
+    /// A stale answer is one the resolver has already decided it cannot
+    /// vouch for, so it must not be cached by the client for a long time:
+    /// a short TTL makes the client come back, and the next attempt may
+    /// find a working upstream. This is deliberately *not* the remaining
+    /// TTL of the expired record — that would be a negative number.
     pub stale_serve_ttl: u32,
     /// Optional L3 persistent cache tier (persist feature).
     #[cfg(feature = "persist")]
@@ -370,6 +414,15 @@ pub struct Resolution {
     pub from_cache: bool,
     /// Whether the answer was served stale.
     pub stale: bool,
+    /// The ECS scope prefix length the answering server declared, when the
+    /// response carried an EDNS Client Subnet option.
+    ///
+    /// This is *learned* metadata, not a request parameter: it is what TCP or
+    /// UDP wire format told us about how far the answer generalises, and
+    /// [`crate::cache::answer_partition`] needs it to place the entry in the
+    /// right partition. `None` means the response carried no ECS option, which
+    /// RFC 7871 §7.2.2 says is equivalent to a scope of 0.
+    pub ecs_scope: Option<u8>,
     /// Wall time when the resolution was served.
     pub served_at: Ts,
 }
@@ -388,6 +441,7 @@ fn empty_answer(key: &QueryKey, ttl: u32, now: Ts) -> Resolution {
         ttl,
         from_cache: false,
         stale: false,
+        ecs_scope: None,
         served_at: now,
     }
 }
@@ -545,10 +599,35 @@ impl Drop for RefreshSlot {
     }
 }
 
-/// Reseed the query-ID / 0x20 PRNG from OS entropy after this many draws,
-/// so an observer who recovered part of the SplitMix64 stream cannot
-/// predict far ahead (anti cache-poisoning hardening).
-const RNG_RESEED_EVERY: u64 = 4096;
+/// The query-ID / 0x20 generator.
+///
+/// This is a ChaCha20 counter-mode CSPRNG ([`Csprng`]), not a seeded
+/// arithmetic generator, because RFC 5452 §9.2 requires the IDs to be
+/// unpredictable to an attacker who has already observed a large number of
+/// the resolver's queries. A 64-bit state generator fails that requirement
+/// after a single observed output; a keyed stream does not. The stream is
+/// additionally rekeyed from OS entropy once it has produced
+/// [`crate::prng::DEFAULT_REKEY_BYTES`] of keystream, which bounds the
+/// keystream per key well inside the cipher's own limit.
+type QueryIdGenerator = Csprng;
+
+/// The bytes that identify the *question* to the upstream affinity lottery.
+///
+/// The wire form of the name rather than its text: [`Name`] is canonical, so
+/// two spellings of one name cannot produce two subjects, and the encoding is
+/// the same one the wire uses, so the subject is a function of the question and
+/// of nothing else — not of the client, not of the clock, and not of how the
+/// name was written down.
+///
+/// The type is part of the subject because the same name at a different type is
+/// a different question, and its delegation may well be served by a different
+/// server set.
+fn affinity_subject(qname: &Name, qtype: RrType) -> Vec<u8> {
+    let mut subject = Vec::with_capacity(qname.wire_len() + 2);
+    subject.extend_from_slice(qname.as_bytes());
+    subject.extend_from_slice(&qtype.to_u16().to_be_bytes());
+    subject
+}
 
 /// A slot that the waiters for one in-flight query block on.
 struct Slot {
@@ -735,14 +814,30 @@ pub struct ResolverInner {
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub forwarder_set: Mutex<crate::forward::ForwarderSet>,
     inflight: Mutex<Inflight>,
+    /// The aggregate risk budget. Every admitted stale answer charges it.
+    risk: Mutex<crate::risk::RiskLedger>,
+    /// The aggregate refresh budget. Every queued background refresh spends
+    /// a token.
+    refresh_budget: Mutex<crate::risk::RefreshBudget>,
     /// Live background refreshes (bounded by `max_concurrent_refreshes`).
     refreshing: std::sync::atomic::AtomicU64,
     /// Set by [`Resolver::shutdown`]: background loops exit at their next
     /// tick instead of running until the process dies.
     shutting_down: std::sync::atomic::AtomicBool,
-    rng: Mutex<SplitMix64>,
-    /// How many draws have been taken from `rng` (drives periodic reseed).
-    rng_draws: std::sync::atomic::AtomicU64,
+    rng: Mutex<QueryIdGenerator>,
+
+    /// The secret behind upstream affinity.
+    ///
+    /// Two independent keys rather than one with derived subkeys: there is no
+    /// key hierarchy to manage here, and independence is the property that
+    /// matters — a weakness in one use must not be transferable to the other.
+    affinity: crate::rendezvous::RendezvousKey,
+
+    /// The secret behind behavioural fingerprints, which decide the order in
+    /// which equally-due cache entries consume the refresh budget.
+    fingerprint: crate::behavior::FingerprintKey,
+    /// How many times the generator has been rekeyed (diagnostics).
+    rng_rekeys: std::sync::atomic::AtomicU64,
 }
 
 /// Configuration summary plus the shared-table gauges; the resolver's own
@@ -768,7 +863,8 @@ impl Resolver {
     /// A resolver with the given configuration.
     pub fn new(config: ResolverConfig) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let rng = SplitMix64::seeded();
+        let clock_now = clock.now();
+        let rng = crate::entropy::secure_random();
         let shared = Arc::new(SharedState::new(&config));
         #[cfg(feature = "persist")]
         if let Some(p) = &config.persist {
@@ -812,26 +908,70 @@ impl Resolver {
                 #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
                 forwarder_set: Mutex::new(forwarder_set),
                 inflight: Mutex::new(Inflight::new(config.max_inflight)),
+                risk: Mutex::new(crate::risk::RiskLedger::new(config.planner.risk, clock_now)),
+                refresh_budget: Mutex::new(crate::risk::RefreshBudget::from_config(
+                    &config.planner.risk,
+                    clock_now,
+                )),
                 refreshing: std::sync::atomic::AtomicU64::new(0),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 rng: Mutex::new(rng),
-                rng_draws: std::sync::atomic::AtomicU64::new(0),
+                rng_rekeys: std::sync::atomic::AtomicU64::new(0),
+                affinity: crate::rendezvous::RendezvousKey::random(),
+                fingerprint: crate::behavior::FingerprintKey::random(),
             }),
         }
     }
 
-    /// Run `f` with the shared PRNG locked, reseeding it from OS entropy
-    /// every [`RNG_RESEED_EVERY`] draws. The query-ID / 0x20 generator is a
-    /// seeded SplitMix64, which is unpredictable to an off-path attacker;
-    /// periodic reseeding additionally bounds what an *on-path* observer
-    /// (e.g. a server we query) can learn about the stream and predict.
-    fn with_rng<T>(&self, f: impl FnOnce(&mut SplitMix64) -> T) -> T {
+    /// Run `f` with the shared query-ID generator locked, rekeying it from
+    /// OS entropy once it has produced its threshold of keystream.
+    ///
+    /// The rekey is driven by *bytes produced*, not by a draw count: the
+    /// quantity that bounds a stream cipher is keystream volume, and a draw
+    /// count would only bound it indirectly and differently for 0x20-heavy
+    /// queries than for plain ones.
+    fn with_rng<T>(&self, f: impl FnOnce(&mut QueryIdGenerator) -> T) -> T {
         let mut rng = self.inner.rng.lock();
-        let draws = self.inner.rng_draws.fetch_add(1, Ordering::Relaxed);
-        if draws % RNG_RESEED_EVERY == 0 {
-            rng.reseed(crate::entropy::seed_u64());
+        if crate::entropy::rekey_if_due(&mut rng) {
+            self.inner.rng_rekeys.fetch_add(1, Ordering::Relaxed);
         }
         f(&mut rng)
+    }
+
+    /// How many times the query-ID generator has been rekeyed.
+    pub fn rng_rekeys(&self) -> u64 {
+        self.inner.rng_rekeys.load(Ordering::Relaxed)
+    }
+
+    /// The honest DNSSEC trust level of an answer, given whether it was
+    /// validated.
+    ///
+    /// `validated == true` is **not** the same as `ChainAnchored`: this build
+    /// ships no root trust anchor, so a verified signature is
+    /// `CryptoVerified` — "the signature verified against a key the parent's
+    /// DS matched" — and only a deployment that installs an anchor can claim
+    /// the answer is chained to the IANA root. Collapsing the two would let
+    /// the `AD` bit and the risk model overstate what was checked.
+    #[cfg(feature = "dnssec")]
+    fn trust_level(&self, validated: bool) -> crate::risk::TrustLevel {
+        use crate::dnssec::ValidationState;
+        let state = if validated {
+            if self.inner.config.engine.dnssec_anchored {
+                ValidationState::ChainAnchored
+            } else {
+                ValidationState::CryptoVerified
+            }
+        } else {
+            ValidationState::Insecure
+        };
+        state.trust_level()
+    }
+
+    /// Without the `dnssec` feature nothing is ever verified, and the honest
+    /// answer is `Unverified` rather than a fabricated level.
+    #[cfg(not(feature = "dnssec"))]
+    fn trust_level(&self, _validated: bool) -> crate::risk::TrustLevel {
+        crate::risk::TrustLevel::Unverified
     }
 
     /// Replace the trust roots used for encrypted forwarders
@@ -948,9 +1088,14 @@ impl Resolver {
             Claim::Owner(owner) => owner,
         };
 
-        // One budget for this client query and everything it spawns.
+        // One budget for this client query and everything it spawns. The
+        // wall clock bounds *how long* the tree may run; the fetch budget
+        // bounds *how much work* it may do, which is what a depth limit
+        // cannot do — an NXNS-style referral is cheap to enter and expensive
+        // to finish.
         let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
-        let result = self.resolve_inner(key, 0, deadline);
+        let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
+        let result = self.resolve_inner(key, 0, deadline, &mut budget);
         owner.publish(result.clone());
 
         let elapsed = started.elapsed().as_micros() as u64;
@@ -1154,7 +1299,16 @@ impl Resolver {
             qr: true,
             rd: query.flags.rd,
             ra: true,
-            ad: res.validated && (want_dnssec || query.flags.ad),
+            // The `AD` bit is a *public assertion* that the answer is
+            // authentic, and it is set only for a chain anchored in a
+            // configured trust anchor. A signature-verified answer without
+            // an anchor is reported internally as authenticated (it feeds
+            // the risk model) but not advertised: telling a client `AD` when
+            // the delegation itself was never proven would overstate what
+            // the resolver checked, and RFC 4035 §3.2.3 does not permit it.
+            ad: res.validated
+                && self.inner.config.engine.dnssec_anchored
+                && (want_dnssec || query.flags.ad),
             cd: query.flags.cd,
             rcode: res.rcode,
             ..HeaderFlags::default()
@@ -1200,6 +1354,7 @@ impl Resolver {
         key: &QueryKey,
         ns_depth: usize,
         deadline: Deadline,
+        budget: &mut crate::budget::FetchBudget,
     ) -> Result<Resolution> {
         let now = self.inner.clock.now();
 
@@ -1217,16 +1372,20 @@ impl Resolver {
         let mut res = if self.forward_route(key).is_some() {
             self.forward_resolve(key)?
         } else {
-            self.iterative_resolve(key, ns_depth, deadline)?
+            self.iterative_resolve(key, ns_depth, deadline, budget)?
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
-        let mut res = self.iterative_resolve(key, ns_depth, deadline)?;
+        let mut res = self.iterative_resolve(key, ns_depth, deadline, budget)?;
         res.served_at = now;
 
         #[cfg(feature = "dnssec")]
         if self.inner.config.engine.dnssec && !key.cd && !res.answers.is_empty() {
-            let verdict = crate::dnssec::validate_resolution(self, &res);
-            res.validated = verdict == crate::dnssec::Verdict::Secure;
+            let v = crate::dnssec::validate_resolution_detailed(
+                self,
+                &res,
+                self.inner.config.engine.dnssec_anchored,
+            );
+            res.validated = v.state.is_signature_verified();
         }
 
         self.cache_resolution(key, &res, now);
@@ -1316,9 +1475,14 @@ impl Resolver {
         )?;
         #[cfg(feature = "dnssec")]
         if self.inner.config.engine.dnssec && !key.cd {
-            let verdict = crate::dnssec::validate_message(self, key, &resp);
+            let v = crate::dnssec::validate_message_detailed(
+                self,
+                key,
+                &resp,
+                self.inner.config.engine.dnssec_anchored,
+            );
             let mut res = crate::forward::response_to_resolution(key, &resp);
-            res.validated = verdict == crate::dnssec::Verdict::Secure;
+            res.validated = v.state.is_signature_verified();
             return Ok(res);
         }
         Ok(crate::forward::response_to_resolution(key, &resp))
@@ -1381,18 +1545,59 @@ impl Resolver {
                     }
                 }
                 LookupOutcome::Stale(entry) => {
-                    let plan = planner.plan(
-                        &LookupOutcome::Stale(entry.clone()),
-                        now,
-                        &self.inner.shared.estimator.lock(),
-                    );
+                    // The stale decision is a *risk* decision: the freshness
+                    // bound, the consequence class of the record in its role,
+                    // and how well the answer's authenticity was established.
+                    // Popularity is not consulted — it decides what is worth
+                    // refreshing, not what is safe to return.
+                    //
+                    // Only the entry's own model is used here, and that is
+                    // sound for a chain: the loop walks hop by hop and every
+                    // earlier hop was found `Fresh` to have reached this
+                    // point, so this entry is the weakest link of the answer
+                    // assembled so far.
+                    let value_ms = self
+                        .inner
+                        .shared
+                        .estimator
+                        .lock()
+                        .est_cost_ms(&entry.key.name);
+                    let trust = self.trust_level(entry.validated);
+                    let failure = entry.stability.consecutive_failures();
+                    let ctx =
+                        crate::planner::StaleContext::from_entry(&entry, now, value_ms, trust);
+                    let plan = {
+                        let mut ledger = self.inner.risk.lock();
+                        planner.plan(
+                            &LookupOutcome::Stale(entry.clone()),
+                            now,
+                            Some(&ctx),
+                            &mut ledger,
+                        )
+                    };
                     if plan == crate::planner::Plan::Resolve {
+                        if failure > 0 {
+                            self.inner
+                                .stats
+                                .stale_refused_after_failure
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.inner
+                            .stats
+                            .stale_risk_refused
+                            .fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
                     stale = true;
                     ttl = ttl.min(self.inner.config.stale_serve_ttl.max(1));
                     validated &= entry.validated;
-                    refresh_keys.push(cache_key);
+                    // Refresh the key the entry actually lives at, not the key
+                    // we asked with. Under ECS those differ whenever the answer
+                    // was found at a broader scope than the requester's own
+                    // partition, and *that* key is the one `mark_refreshing`
+                    // can find — refreshing the requester's key would silently
+                    // do nothing.
+                    refresh_keys.push(entry.key.clone());
                     match entry.kind {
                         EntryKind::Positive(rrset) => {
                             if rrset.rr_type == RrType::CNAME && current.rr_type != RrType::CNAME {
@@ -1482,6 +1687,9 @@ impl Resolver {
             ttl,
             from_cache: true,
             stale,
+            // A cache hit learned nothing new about the scope: the entry
+            // already sits in the partition it was filed under.
+            ecs_scope: None,
             served_at: now,
         })
     }
@@ -1492,6 +1700,7 @@ impl Resolver {
         key: &QueryKey,
         ns_depth: usize,
         deadline: Deadline,
+        budget: &mut crate::budget::FetchBudget,
     ) -> Result<Resolution> {
         let now = self.inner.clock.now();
         let mut current_name = key.name.clone();
@@ -1507,6 +1716,11 @@ impl Resolver {
         let mut referrals = 0usize;
         let mut cached_rrsigs: Vec<Record> = Vec::new();
         let mut minimized: Option<Name> = None;
+        // The ECS scope the most recent answer declared. Overwritten on every
+        // exchange and read only by the arms that cache something, so the
+        // value that matters is always the one from the response that
+        // answered.
+        let mut ecs_scope: Option<u8> = None;
 
         loop {
             // The budget covers the whole tree, so a nested walk that has spent
@@ -1527,9 +1741,18 @@ impl Resolver {
                 return Err(Error::internal("referral loop during resolution"));
             }
 
-            // Cache check during CNAME chasing.
+            // Cache check during CNAME chasing. The lookup carries the
+            // requester's partition, so it walks up through the ECS scopes
+            // exactly as the top-level lookup does.
             if depth > 0 {
-                let ck = CacheKey::plain(current_name.clone(), current_type, key.class);
+                let ck = key
+                    .cache_key()
+                    .with_ecs(crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope));
+                let ck = CacheKey {
+                    rr_type: current_type,
+                    name: current_name.clone(),
+                    ..ck
+                };
                 match self.inner.shared.cache.lock().lookup(&ck, now) {
                     LookupOutcome::Fresh(entry) => {
                         if let EntryKind::Positive(rrset) = entry.kind {
@@ -1561,6 +1784,7 @@ impl Resolver {
                 current_type,
                 key,
                 deadline,
+                budget,
                 // A minimized prefix may legitimately come back bare; the
                 // full name may not.
                 query_name == current_name,
@@ -1570,6 +1794,13 @@ impl Resolver {
                 let mut est = self.inner.shared.estimator.lock();
                 est.observe_upstream(&zone, rtt_ms as f64);
             }
+            // RFC 7871 §7.2.2: a response with no ECS option is equivalent to
+            // a SCOPE PREFIX-LENGTH of 0, which `answer_partition` handles.
+            ecs_scope = resp
+                .edns
+                .as_ref()
+                .and_then(|e| e.ecs())
+                .map(|e| e.scope_prefix);
 
             match engine::classify_response(&resp, &current_name, current_type, &zone) {
                 ResponseKind::Answer {
@@ -1604,7 +1835,12 @@ impl Resolver {
                     let mut set =
                         RrSet::new(record.name.clone(), RrType::CNAME, key.class, record.ttl);
                     set.add_record(record);
-                    let ck = CacheKey::plain(current_name.clone(), RrType::CNAME, key.class);
+                    let ck = CacheKey {
+                        name: current_name.clone(),
+                        rr_type: RrType::CNAME,
+                        class: key.class,
+                        ecs: crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope),
+                    };
                     let inputs = self
                         .inner
                         .shared
@@ -1653,8 +1889,33 @@ impl Resolver {
                             ttl = ttl.min(negative_ttl(s));
                         }
                         let soa_ttl = soa.as_ref().map(negative_ttl).unwrap_or(0);
+                        let partition = crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope);
                         let mut cache = self.inner.shared.cache.lock();
-                        cache.insert_nxdomain(&query_name, r, soa.clone(), soa_ttl, now);
+                        match partition {
+                            // A scope-0 answer is valid for every client, so
+                            // it may go into the shared NXDOMAIN store. Any
+                            // other scope may not: the store is keyed by name
+                            // alone, which would hand one subnet's negative
+                            // answer to the world.
+                            None => {
+                                cache.insert_nxdomain(&query_name, r, soa.clone(), soa_ttl, now)
+                            }
+                            Some(ecs) => {
+                                let ck = CacheKey {
+                                    name: query_name.clone(),
+                                    rr_type: current_type,
+                                    class: key.class,
+                                    ecs: Some(ecs),
+                                };
+                                let inputs = self
+                                    .inner
+                                    .shared
+                                    .estimator
+                                    .lock()
+                                    .score_inputs(&query_name, now);
+                                cache.insert_negative(&ck, r, soa.clone(), soa_ttl, now, inputs);
+                            }
+                        }
                         break;
                     }
                     let is_prefix = query_name != current_name;
@@ -1667,7 +1928,12 @@ impl Resolver {
                         .score_inputs(&query_name, now);
                     {
                         let mut cache = self.inner.shared.cache.lock();
-                        let ck = CacheKey::plain(query_name.clone(), current_type, key.class);
+                        let ck = CacheKey {
+                            name: query_name.clone(),
+                            rr_type: current_type,
+                            class: key.class,
+                            ecs: crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope),
+                        };
                         cache.insert_negative(&ck, r, soa.clone(), soa_ttl, now, inputs);
                     }
                     if is_prefix {
@@ -1728,6 +1994,48 @@ impl Resolver {
                             }
                         }
                     }
+
+                    // The NXNS gate. A referral that names many servers and
+                    // glues none of them is not a delegation the resolver can
+                    // use; treating it as one is what turns an attacker's zone
+                    // into our bandwidth bill. The gate runs *before* any
+                    // address lookup is attempted, so a refused referral costs
+                    // nothing beyond the response that carried it.
+                    let ns_with_glue = ns_names
+                        .iter()
+                        .filter(|n| glue.iter().any(|g| g.name == **n))
+                        .count() as u32;
+                    let (granted_lookups, admitted_ns, admitted_glue) = match budget.admit_referral(
+                        ns_names.len() as u32,
+                        glue.len() as u32,
+                        ns_with_glue,
+                    ) {
+                        crate::budget::ReferralAdmission::Accept {
+                            ns_names,
+                            glue_addresses,
+                            address_lookups,
+                        } => (address_lookups, ns_names, glue_addresses),
+                        crate::budget::ReferralAdmission::Reject(_) => {
+                            self.inner
+                                .stats
+                                .referrals_refused
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(Error::transport(format!(
+                                "refused an unusable delegation for {new_zone}"
+                            )));
+                        }
+                    };
+                    let _ = (admitted_ns, admitted_glue);
+                    if budget.spend_delegation().is_err() {
+                        self.inner
+                            .stats
+                            .fetch_budget_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(Error::new(
+                            ErrorKind::NoUpstream,
+                            "resolution budget exhausted (delegation depth)",
+                        ));
+                    }
                     zone = new_zone;
                     minimized = None;
 
@@ -1752,7 +2060,13 @@ impl Resolver {
                         }
                     }
                     if endpoints.is_empty() {
-                        endpoints = self.resolve_ns_addresses(&ns_names, ns_depth, deadline)?;
+                        // `granted_lookups` was reserved by the referral gate;
+                        // only the lookups actually attempted are charged, so a
+                        // referral that turns out to be fully glued does not
+                        // consume the budget its NS count would have allowed.
+                        let _ = granted_lookups;
+                        endpoints =
+                            self.resolve_ns_addresses(&ns_names, ns_depth, deadline, budget)?;
                     }
                     dedup_endpoints(&mut endpoints);
                     if endpoints.is_empty() {
@@ -1789,6 +2103,7 @@ impl Resolver {
             ttl,
             from_cache: false,
             stale: false,
+            ecs_scope,
             served_at: now,
         })
     }
@@ -1799,6 +2114,7 @@ impl Resolver {
         ns_names: &[Name],
         ns_depth: usize,
         deadline: Deadline,
+        budget: &mut crate::budget::FetchBudget,
     ) -> Result<Vec<Endpoint>> {
         if ns_depth >= self.inner.config.engine.max_ns_depth {
             return Ok(Vec::new());
@@ -1811,7 +2127,17 @@ impl Resolver {
             if deadline.expired() {
                 break;
             }
-            if let Some(ips) = self.resolve_host_addresses(ns, ns_depth + 1, deadline) {
+            // ...and checking the *count* is what makes the work finite. The
+            // wall clock alone would let a fast attacker start hundreds of
+            // lookups that each time out slowly.
+            if budget.spend_ns_address_lookup(1).is_err() {
+                self.inner
+                    .stats
+                    .fetch_budget_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            if let Some(ips) = self.resolve_host_addresses(ns, ns_depth + 1, deadline, budget) {
                 for ip in ips {
                     endpoints.push(Endpoint::new(
                         ip,
@@ -1850,6 +2176,7 @@ impl Resolver {
         name: &Name,
         ns_depth: usize,
         deadline: Deadline,
+        budget: &mut crate::budget::FetchBudget,
     ) -> Option<Vec<IpAddr>> {
         let hosts = &self.inner.config.dns.hosts;
         if hosts.contains(name) {
@@ -1879,7 +2206,7 @@ impl Resolver {
                 want_dnssec: false,
                 cd: false,
             };
-            if let Ok(res) = self.resolve_inner(&key, ns_depth, deadline) {
+            if let Ok(res) = self.resolve_inner(&key, ns_depth, deadline, budget) {
                 for r in res.answers {
                     match r.rdata {
                         RData::A(ip) => out.push(IpAddr::V4(ip)),
@@ -1901,6 +2228,13 @@ impl Resolver {
 
     /// Send the query to the best-ranked servers until one answers. Returns
     /// the response and the RTT of the exchange that produced it.
+    ///
+    /// The signature is wide on purpose: every one of these is an *input to
+    /// the decision* of which server to try and what to accept, and bundling
+    /// them into a struct would only move the same fields somewhere else
+    /// while hiding that `qname` is the (possibly minimized) name on the
+    /// wire rather than `key.name`.
+    #[allow(clippy::too_many_arguments)]
     fn query_servers(
         &self,
         servers: &[Endpoint],
@@ -1908,6 +2242,7 @@ impl Resolver {
         qtype: RrType,
         key: &QueryKey,
         deadline: Deadline,
+        budget: &mut crate::budget::FetchBudget,
         // Whether a response that carries nothing at all should be treated as
         // "this server did not answer" and the next one tried. True when the
         // query is for the full name, where such a response is useless; false
@@ -1919,9 +2254,23 @@ impl Resolver {
             return Err(Error::new(ErrorKind::NoUpstream, "no servers to query"));
         }
         let now = self.inner.clock.now();
+        // The subject of the affinity lottery is the *question*, not the client
+        // and not the moment. Two resolvers holding the same delegation then
+        // reach the same server for the same name — which is what makes the
+        // choice reproducible — while two different names spread across the
+        // band instead of piling onto whichever server happens to sort first.
+        let subject = affinity_subject(qname, qtype);
         let ranked = {
             let sel = self.inner.shared.selector.lock();
-            sel.sort_by_cost(servers, now, self.inner.config.engine.retransmit_budget)
+            let band = self.inner.config.engine.affinity_band;
+            let budget = self.inner.config.engine.retransmit_budget;
+            if sel.affinity_applies(servers, now, budget, band) {
+                self.inner
+                    .stats
+                    .affinity_lotteries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            sel.rank_with_affinity(servers, now, budget, band, &self.inner.affinity, &subject)
         };
 
         let mut last_err: Option<Error> = None;
@@ -1940,6 +2289,20 @@ impl Resolver {
                 }
                 total_attempts += 1;
                 attempts += 1;
+                // Every upstream message and every byte counts against the
+                // resolution's envelope. This is the counter an NXNS-style
+                // adversary consumes, so exhausting it is a *reported* event,
+                // not a silent slowdown.
+                if budget.spend_subquery().is_err() {
+                    self.inner
+                        .stats
+                        .fetch_budget_exhausted
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(Error::new(
+                        ErrorKind::NoUpstream,
+                        "resolution budget exhausted (sub-queries)",
+                    ));
+                }
                 self.inner
                     .stats
                     .upstream_queries
@@ -1995,6 +2358,19 @@ impl Resolver {
                     }
                 };
                 let rtt_ms = t0.elapsed().as_millis() as u64;
+                if budget
+                    .spend_bytes(q.bytes.len() as u64 + resp_bytes.len() as u64)
+                    .is_err()
+                {
+                    self.inner
+                        .stats
+                        .fetch_budget_exhausted
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(Error::new(
+                        ErrorKind::NoUpstream,
+                        "resolution budget exhausted (bytes)",
+                    ));
+                }
 
                 let msg = match Message::parse(&resp_bytes) {
                     Ok(m) => m,
@@ -2134,10 +2510,18 @@ impl Resolver {
                     }
                 }
             }
-            let ck = CacheKey::plain(name, rr_type, key.class);
+            let ck = CacheKey {
+                name,
+                rr_type,
+                class: key.class,
+                ecs: crate::cache::answer_partition(key.ecs.as_ref(), res.ecs_scope),
+            };
             cache.insert_positive(&ck, set, now, inputs, res.validated);
         }
-        // Negative answers.
+        // Negative answers. The partition rule is the same as for positive
+        // data: only a scope-0 answer may reach the shared NXDOMAIN store,
+        // which is keyed by name alone.
+        let partition = crate::cache::answer_partition(key.ecs.as_ref(), res.ecs_scope);
         if res.rcode.is_nxdomain() {
             let soa_ttl = res
                 .authorities
@@ -2145,16 +2529,23 @@ impl Resolver {
                 .find(|r| r.rr_type == RrType::SOA)
                 .map(negative_ttl)
                 .unwrap_or(0);
-            cache.insert_nxdomain(
-                &res.name,
-                res.rcode,
-                res.authorities
-                    .iter()
-                    .find(|r| r.rr_type == RrType::SOA)
-                    .cloned(),
-                soa_ttl,
-                now,
-            );
+            let soa = res
+                .authorities
+                .iter()
+                .find(|r| r.rr_type == RrType::SOA)
+                .cloned();
+            match partition.as_ref() {
+                None => cache.insert_nxdomain(&res.name, res.rcode, soa, soa_ttl, now),
+                Some(ecs) => {
+                    let ck = CacheKey {
+                        name: res.name.clone(),
+                        rr_type: res.rr_type,
+                        class: res.class,
+                        ecs: Some(ecs.clone()),
+                    };
+                    cache.insert_negative(&ck, res.rcode, soa, soa_ttl, now, inputs);
+                }
+            }
         } else if res.answers.is_empty() {
             let soa_ttl = res
                 .authorities
@@ -2162,7 +2553,12 @@ impl Resolver {
                 .find(|r| r.rr_type == RrType::SOA)
                 .map(negative_ttl)
                 .unwrap_or(0);
-            let ck = CacheKey::plain(res.name.clone(), res.rr_type, res.class);
+            let ck = CacheKey {
+                name: res.name.clone(),
+                rr_type: res.rr_type,
+                class: res.class,
+                ecs: partition,
+            };
             cache.insert_negative(
                 &ck,
                 res.rcode,
@@ -2199,6 +2595,23 @@ impl Resolver {
         }
         if !self.acquire_refresh_slot() {
             self.inner.shared.cache.lock().clear_refreshing(key);
+            return false;
+        }
+        // The refresh budget bounds the *rate at which we may ask upstream*,
+        // a different resource from the risk budget's bound on what we may
+        // tell a client. Charging it at the single point where a refresh is
+        // actually spawned is what makes `sum rho_i <= B_refresh` true by
+        // construction rather than on average — every caller (maintenance
+        // prefetch, serve-stale refresh, dependency propagation) funnels
+        // through here.
+        let now = self.inner.clock.now();
+        if self.inner.refresh_budget.lock().take(1, now) == 0 {
+            self.inner.shared.cache.lock().clear_refreshing(key);
+            self.inner.refreshing.fetch_sub(1, Ordering::AcqRel);
+            self.inner
+                .stats
+                .refresh_budget_denied
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
         self.inner.stats.prefetches.fetch_add(1, Ordering::Relaxed);
@@ -2294,12 +2707,14 @@ impl Resolver {
             want_dnssec: self.inner.config.engine.dnssec,
             cd: false,
         };
+        let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
         let res = self.resolve_inner(
             &qk,
             0,
             // A background refresh is its own query and gets its own budget;
             // it is not a client waiting on a reply.
             Deadline::after(self.inner.config.engine.query_budget_ms),
+            &mut budget,
         )?;
         let now = self.inner.clock.now();
         self.cache_resolution(&qk, &res, now);
@@ -2385,14 +2800,51 @@ impl Resolver {
                 let candidates = {
                     let mut cache = r.inner.shared.cache.lock();
                     let est = r.inner.shared.estimator.lock();
-                    cache.prefetch_candidates(now, |apex, horizon| {
-                        est.probability(apex, now, horizon)
-                    })
+                    let policy = r.inner.config.planner.prefetch_policy();
+                    // The budget goes *into* the scheduler rather than being
+                    // applied as a `take` afterwards, because the per-class
+                    // reservation is stated over the budget: a prefix of an
+                    // un-reserved ranking is precisely the starvation the
+                    // reservation exists to prevent.
+                    //
+                    // `Some(&r.inner.fingerprint)` is not decoration either.
+                    // Equal values are the normal case at the top of a tick —
+                    // entries written at the same instant have identical models
+                    // — and with `None` those ties fall back to the cache's
+                    // iteration order, which is name order, which is the same
+                    // order on every resolver in the fleet and predictable to an
+                    // observer. The switch exists so that the `None` branch is
+                    // reachable and therefore observable; it is not a tuning
+                    // knob and defaults to decorrelated.
+                    let key = if r.inner.config.engine.decorrelate_refresh {
+                        Some(&r.inner.fingerprint)
+                    } else {
+                        None
+                    };
+                    if key.is_none() {
+                        r.inner
+                            .stats
+                            .refresh_undecorrelated
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    cache.refresh_schedule(
+                        &policy,
+                        key,
+                        r.inner.config.max_prefetch_per_tick,
+                        now,
+                        |apex, horizon| crate::cache::RefreshInputs {
+                            query_probability: est.probability(apex, now, horizon),
+                            value_ms: est.est_cost_ms(apex),
+                        },
+                    )
                 };
-                for key in candidates
-                    .into_iter()
-                    .take(r.inner.config.max_prefetch_per_tick)
-                {
+                if !candidates.is_empty() {
+                    r.inner
+                        .stats
+                        .refresh_scheduled
+                        .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+                }
+                for key in candidates {
                     r.refresh_with_dependents(&key, r.inner.config.max_chain_refresh);
                 }
                 #[cfg(feature = "persist")]
@@ -2452,7 +2904,8 @@ impl Resolver {
     /// Resolve the addresses of a name directly (used by tests).
     pub fn resolve_addresses(&self, name: &Name) -> Vec<IpAddr> {
         let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
-        self.resolve_host_addresses(name, 0, deadline)
+        let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
+        self.resolve_host_addresses(name, 0, deadline, &mut budget)
             .unwrap_or_default()
     }
 }
@@ -2567,7 +3020,12 @@ mod tests {
             cd: false,
         };
         let err = r
-            .iterative_resolve(&key, 0, Deadline::after(0))
+            .iterative_resolve(
+                &key,
+                0,
+                Deadline::after(0),
+                &mut crate::budget::FetchBudget::new(crate::budget::FetchLimits::default()),
+            )
             .expect_err("a spent budget must fail the walk");
         assert_eq!(err.kind, ErrorKind::Timeout);
         assert!(
@@ -2914,6 +3372,7 @@ mod tests {
             ttl: 60,
             from_cache: false,
             stale: false,
+            ecs_scope: None,
             served_at: now(),
         };
         // No DO, no AD in the request → no AD in the response, even for
@@ -2922,7 +3381,27 @@ mod tests {
         assert!(!plain.flags.ad);
         let mut asked = q.clone();
         asked.flags.ad = true;
-        assert!(r.build_response(&asked, &res).flags.ad);
+        // A signature-verified answer is *not* enough: this build ships no
+        // trust anchor, so the delegation itself was never proven and the
+        // `AD` bit would overstate what was checked. Advertising it requires
+        // the deployment to have configured an anchor.
+        assert!(
+            !r.build_response(&asked, &res).flags.ad,
+            "AD must not be set without a configured trust anchor"
+        );
+        let mut anchored_cfg = ResolverConfig::default();
+        anchored_cfg.engine.root_servers = vec!["127.0.0.1:1".parse().unwrap()];
+        anchored_cfg.engine.dnssec_anchored = true;
+        let anchored = Resolver::new(anchored_cfg);
+        assert!(anchored.build_response(&asked, &res).flags.ad);
+        // ...and still only when the client asked for it.
+        assert!(!anchored.build_response(&q, &res).flags.ad);
+        // An answer that was not validated never earns AD, anchor or not.
+        let unvalidated = Resolution {
+            validated: false,
+            ..res.clone()
+        };
+        assert!(!anchored.build_response(&asked, &unvalidated).flags.ad);
         // CD is echoed.
         let mut cd = q.clone();
         cd.flags.cd = true;

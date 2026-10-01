@@ -281,16 +281,17 @@ impl DnsTransport for DoqTransport {
                     // ten-second stall and made every deadline above it — the
                     // engine's per-query budget included — meaningless for DoQ.
                     // A caller that wants ten seconds can ask for ten seconds.
-                    let c = quic::QuicConnection::connect(
+                    // `Option::insert` hands back the reference it just stored,
+                    // so there is no "I assigned it, therefore it is there" step
+                    // and no place for the two to disagree.
+                    guard.insert(quic::QuicConnection::connect(
                         endpoint,
                         self.host.as_deref(),
                         self.roots.clone(),
                         self.verify,
                         self.now,
                         timeout_ms,
-                    )?;
-                    *guard = Some(c);
-                    guard.as_mut().unwrap()
+                    )?)
                 }
             };
             match conn.exchange_query(&framed, timeout_ms) {

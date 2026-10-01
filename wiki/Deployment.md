@@ -63,13 +63,24 @@ Two client-facing bounds protect the thread budget:
   `client_burst`), with a bounded bucket table so a spoofed-source flood
   cannot grow memory.
 - **Anti-spoofing**: every upstream response is checked against the query —
-  transaction ID *and* question echo. 0x20 randomization (`use0x20`) adds
-  per-query entropy in the qname, making blind cache poisoning substantially
-  harder.
+  transaction ID *and* question echo — and the ID and the 0x20 casing come from
+  a **ChaCha20 counter-mode CSPRNG**, not from a fast non-cryptographic mixer.
+  RFC 5452 §9.2 is explicit that the guessability of the ID is the security
+  parameter here: a predictable generator makes the 65 536 IDs and the port
+  space decorative. The generator is re-keyed after every 1 MiB of keystream
+  (`DEFAULT_REKEY_BYTES`) — a volume bound rather than a draw-count bound,
+  because a count bounds it only indirectly and differently for 0x20-heavy
+  traffic. Non-cryptographic mixing (SplitMix64) is still used where guessing
+  buys an attacker nothing — eviction sampling and test fixtures — and is
+  documented as such.
 - **Bailiwick discipline**: only in-zone data may be cached from a response.
   Out-of-zone glue is used transiently, never cached as authoritative.
-- **DNSSEC**: with `dnssec` enabled, answers are validated and marked;
-  `Bogus` data is not presented as secure.
+- **DNSSEC**: with `dnssec` enabled, answers are placed on a four-state ladder —
+  `Indeterminate` (no usable anchor or signature), `Insecure` (proven
+  unsigned), `CryptoVerified` (signature checked, DS chain not anchored), and
+  `ChainAnchored` (the chain reaches a configured trust anchor). Only the last
+  state sets `AD`, because only that state is a claim about the delegation chain
+  and not merely about the bytes in this message.
 - **Filtering**: policy `block` rules drop queries under the listed names.
 
 ## Operational notes

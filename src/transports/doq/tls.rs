@@ -637,7 +637,13 @@ impl ClientHandshake {
                         self.verify_certificate_verify(body, &hash_before_cv)?;
                         self.next = hstype::FINISHED;
                     }
-                    _ => unreachable!(),
+                    // Unreachable in this build: the outer arm has already
+                    // restricted `msg_type` to these three. It is an error
+                    // rather than `unreachable!()` because that restriction is
+                    // expressed in a guard clause twelve lines above, which is
+                    // the kind of coupling that does not survive a reordering —
+                    // and a panic here is reachable from a peer's bytes.
+                    _ => return Err(Error::wire("TLS handshake message out of order")),
                 }
                 self.transcript_msgs.push(msg.to_vec());
                 Ok(None)
@@ -649,11 +655,22 @@ impl ClientHandshake {
                 let hash_before_finished = self.transcript_hash();
                 self.verify_server_finished(body, &hash_before_finished)?;
                 self.transcript_msgs.push(msg.to_vec());
-                let client_finished = self.derive_application_secrets();
+                let client_finished = self.derive_application_secrets()?;
                 self.done = true;
+                // `next` reaches FINISHED only through CertificateVerify, and
+                // `suite` is stored before `saw_server_hello` becomes true, so
+                // the suite is always present here. Reported as a handshake
+                // failure rather than an `expect`, because the argument is a
+                // statement about ordering elsewhere in this file and a panic
+                // on remote input is a denial of service, not an assertion.
+                let Some(suite) = self.suite else {
+                    return Err(Error::wire(
+                        "TLS Finished without a negotiated cipher suite",
+                    ));
+                };
                 Ok(Some(Completed {
                     client_finished,
-                    suite: self.suite.expect("suite set before Finished"),
+                    suite,
                 }))
             }
             _ => Err(Error::wire("unexpected TLS handshake message")),
@@ -760,7 +777,18 @@ impl ClientHandshake {
     /// called after the ServerHello is added to the transcript, so the
     /// transcript hash covers `ClientHello..ServerHello`.
     fn derive_handshake_secrets(&mut self) -> Result<()> {
-        let suite = self.suite.expect("suite set before handshake secrets");
+        // Every `Option` in this file that stands for "a later handshake step
+        // fills this in" is reported, not asserted. The state machine's order is
+        // enforced by `next`, but `next` and these fields are two separate
+        // pieces of state, and the peer's bytes choose when each is read. A
+        // panic here would be a remote denial of service; `verify_server_finished`
+        // below already reports the same kind of gap, so this is also the
+        // policy the file had already chosen where it mattered.
+        let Some(suite) = self.suite else {
+            return Err(Error::wire(
+                "TLS handshake secrets requested before a cipher suite was negotiated",
+            ));
+        };
         let h = hash_len(suite);
         let zeros = vec![0u8; h];
         let mut d0 = new_digest(suite);
@@ -837,7 +865,11 @@ impl ClientHandshake {
         content.push(0);
         content.extend_from_slice(hash_before_cv);
 
-        let suite = self.suite.expect("suite set before CertificateVerify");
+        let Some(suite) = self.suite else {
+            return Err(Error::wire(
+                "CertificateVerify before a cipher suite was negotiated",
+            ));
+        };
         let ok = match scheme {
             // rsa_pss_pss_* verifies with the same PSS math as
             // rsa_pss_rsae_*; the scheme only signals how the key's
@@ -934,7 +966,11 @@ impl ClientHandshake {
     }
 
     fn verify_server_finished(&self, body: &[u8], hash_before_finished: &[u8]) -> Result<()> {
-        let suite = self.suite.expect("suite set before Finished");
+        let Some(suite) = self.suite else {
+            return Err(Error::wire(
+                "server Finished before a cipher suite was negotiated",
+            ));
+        };
         let h = hash_len(suite);
         if body.len() != h {
             return Err(Error::wire("server Finished has the wrong length"));
@@ -956,13 +992,25 @@ impl ClientHandshake {
         Ok(())
     }
 
-    fn derive_application_secrets(&mut self) -> Vec<u8> {
-        let suite = self.suite.expect("suite set before application secrets");
+    /// Returns the client Finished message, or an error if the state it needs
+    /// is not yet established.
+    ///
+    /// This used to return the message directly and `expect` its way through
+    /// three `Option`s. It returns a `Result` because all three are populated by
+    /// *earlier handshake steps*, so "they are set" is a claim about the peer's
+    /// message sequence, not about this function — and a claim about remote
+    /// input is answered with an error, not a panic.
+    fn derive_application_secrets(&mut self) -> Result<Vec<u8>> {
+        let Some(suite) = self.suite else {
+            return Err(Error::wire(
+                "application secrets requested before a cipher suite was negotiated",
+            ));
+        };
         let h = hash_len(suite);
         let hs = self
             .handshake_secret
             .as_deref()
-            .expect("handshake secret set");
+            .ok_or_else(|| Error::wire("application secrets before handshake secrets"))?;
         let derived = derive_secret(suite, hs, b"derived", &empty_hash(suite));
         let zeros = vec![0u8; h];
         let mut d = new_digest(suite);
@@ -971,19 +1019,17 @@ impl ClientHandshake {
         let c_ap = derive_secret(suite, &master, b"c ap traffic", &ch_to_sf);
         let s_ap = derive_secret(suite, &master, b"s ap traffic", &ch_to_sf);
         // Client Finished: transcript includes the server Finished.
+        let c_hs = self
+            .c_hs
+            .as_deref()
+            .ok_or_else(|| Error::wire("client handshake secret not derived"))?;
         let mut fd = new_digest(suite);
-        let finished_key = expand_label(
-            fd.as_mut(),
-            self.c_hs.as_deref().unwrap(),
-            b"finished",
-            &[],
-            h,
-        );
+        let finished_key = expand_label(fd.as_mut(), c_hs, b"finished", &[], h);
         let mut md = new_digest(suite);
         let verify_data = hmac(md.as_mut(), &finished_key, &ch_to_sf);
         self.c_ap = Some(c_ap);
         self.s_ap = Some(s_ap);
-        hs_message(hstype::FINISHED, &verify_data)
+        Ok(hs_message(hstype::FINISHED, &verify_data))
     }
 
     fn validate_certificate(&self, leaf: &x509::Certificate) -> Result<()> {

@@ -1,10 +1,10 @@
 # DNSSEC
 
 The `dnssec` feature validates answer chains: RRSIG signatures over canonical
-RRsets, DS digest chains from the trust anchor down, and `Secure` /
-`Insecure` / `Bogus` verdicts. Validation is deliberate and self-contained —
-the allowed dependency set has no general crypto crate, so the RSA
-verification is implemented from scratch.
+RRsets, DS digest chains from the trust anchor down, and a *four-state*
+verification ladder. Validation is deliberate and self-contained — the allowed
+dependency set has no general crypto crate, so the RSA verification is
+implemented from scratch.
 
 ## What is validated
 
@@ -15,10 +15,41 @@ verification is implemented from scratch.
   name + DNSKEY RDATA, and must match a DS record in the parent zone.
 - **Chain walk** — from the zone's DNSKEYs up through the DS chain to the
   trust anchor, with a recursion guard.
+- **Authority section (RFC 4035 §3.2.3)** — for a negative answer, the SOA
+  and NSEC/NSEC3 material must authenticate **as well**; the rule is an "all"
+  rule, and a resolver that checked only the Answer section would label an
+  unsigned denial of existence as signed.
 
-Verdicts: `Secure` (validated), `Insecure` (a confirmed lack of a secure
-chain), `Bogus` (signature or chain failed), `Indeterminate` (could not
-establish).
+## The verification ladder, and why it is not a boolean
+
+"DNSSEC is on" and "this answer is authentic" are different claims, and a
+resolver that collapses them overstates what it checked. `ValidationState`
+records where the chain actually stopped:
+
+| State | Means | `AD` bit? | Trust penalty κ |
+|---|---|---|---|
+| `ChainAnchored` | chained to a **configured** trust anchor, Answer *and* Authority authentic | **yes** | 1 |
+| `CryptoVerified` | signature verified against a key the parent's DS matched; the DS RRset's own chain was not walked to an anchor | no | 2 |
+| `Insecure` | the zone is known not to be signed (or uses an algorithm this build refuses) | no | 5 |
+| `Indeterminate` | nothing could be concluded: unsupported algorithm, missing key, `Bogus`, or a preempted validation slot | no | 10 |
+
+The verdict from the wire-level validator is still one of
+`Secure` / `Insecure` / `Bogus` / `Indeterminate`; `Verdict::state(anchored)`
+maps it to a `ValidationState`, and the mapping is where honesty is enforced.
+
+**This build ships no root trust anchor and `engine.dnssecAnchored` defaults
+to `false`, so `ChainAnchored` is unreachable unless a deployment installs an
+anchor and says so.** Without it the best possible state is
+`CryptoVerified`: "the zone signed this data", which is a real and useful
+claim, and *not* "this delegation is the real one". The `AD` bit is set only
+for `ChainAnchored`, so a merely signature-verified answer is used internally
+— it feeds the risk model — and never advertised. RFC 4035 §3.2.3 does not
+permit the weaker claim to be published as the stronger one.
+
+The ladder is also what the risk model is keyed on: the trust penalty κ
+multiplies the consequence coefficient of a stale decision, so unauthenticated
+data needs a much lower staleness probability to be served at all. See
+[Risk-constrained refresh](Refresh-Theory.md) §V.
 
 ## The RSA implementation
 

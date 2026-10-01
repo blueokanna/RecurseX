@@ -41,7 +41,13 @@ use crate::time::Ts;
 /// Magic identifier for RecurseX cache frames ("RXC" + 0x5e).
 const MAGIC: u32 = 0x5258435e;
 /// Current frame version.
-const VERSION: u32 = 1;
+///
+/// Version 2 replaced the EWMA stability score with the hazard model's
+/// sufficient statistics. The two are not convertible (a decayed score does
+/// not determine a posterior), so an older frame is rejected rather than
+/// mis-read — a silently wrong belief about a zone's volatility is worse
+/// than a cold cache.
+const VERSION: u32 = 2;
 /// Default decode limit: 32 MiB of frame (many thousands of entries).
 const DEFAULT_FRAME_LIMIT: u64 = 32 * 1024 * 1024;
 /// Default per-collection element limit.
@@ -100,6 +106,19 @@ struct EntryDto {
     stability: StabilityDto,
     validated: bool,
     score: f64,
+    /// The estimated resolution cost recorded when the entry was written, in
+    /// milliseconds.
+    ///
+    /// Optional on purpose. It feeds the entry's *behavioural* identity, which
+    /// orders refresh work and never gates it, so an unknown value is a
+    /// scheduling imprecision rather than a correctness problem — and a frame
+    /// written before this field existed is still readable, which is why the
+    /// frame version did not have to move. A missing value is restored as the
+    /// neutral reference cost rather than as zero, because zero is a real cost
+    /// (a cached hit) and a fabricated one would be worse than an admitted
+    /// unknown.
+    #[njson(default)]
+    cost_ms: Option<f64>,
 }
 
 /// The payload of an entry.
@@ -126,19 +145,40 @@ struct EcsDto {
     addr: Vec<u8>,
 }
 
-/// The stability model, reduced to its persistent fields.
+/// The refresh model, reduced to its persistent state.
+///
+/// These are the model's *sufficient statistics*, not a summary of them: a
+/// restored entry is bit-identical to the one that was saved, so a restart
+/// is not silently a learning event. The hazard configuration travels with
+/// the state because a model's meaning depends on it — the same numbers under
+/// a different forgetting constant are a different belief.
 #[derive(Debug, NsonSerialize, NsonDeserialize)]
 struct StabilityDto {
-    samples: u64,
+    prior_ttl_secs: f64,
+    alpha_ev: f64,
+    beta_ev: f64,
+    evidence_secs: f64,
+    lifetime_exposure_secs: f64,
+    observations: u64,
     changes: u64,
-    stability: f64,
-    change_ratio: f64,
+    failures: u64,
+    consecutive_failures: u64,
     ttl_ewma: f64,
     ttl_volatility: f64,
-    consecutive_failures: u64,
-    failures: u64,
-    last_refresh_unix: i64,
+    last_observation_unix: i64,
     last_change_unix: i64,
+    hazard: HazardConfigDto,
+}
+
+/// The hazard configuration, as persisted.
+#[derive(Debug, NsonSerialize, NsonDeserialize)]
+struct HazardConfigDto {
+    prior_shape: f64,
+    confidence: f64,
+    forgetting_secs: f64,
+    min_interval_secs: f64,
+    max_interval_secs: f64,
+    target_freshness: f64,
 }
 
 /// One NXDOMAIN negative entry (shared across types under a name).
@@ -323,33 +363,64 @@ fn unix_to_ts(unix: i64) -> Ts {
 }
 
 fn stability_to_dto(s: &StabilityModel) -> StabilityDto {
+    let state = s.state();
+    let cfg = *s.hazard().config();
     StabilityDto {
-        samples: s.samples,
-        changes: s.changes,
-        stability: s.stability,
-        change_ratio: s.change_ratio,
-        ttl_ewma: s.ttl_ewma,
-        ttl_volatility: s.ttl_volatility,
-        consecutive_failures: s.consecutive_failures,
-        failures: s.failures,
-        last_refresh_unix: ts_to_unix(s.last_refresh),
-        last_change_unix: ts_to_unix(s.last_change),
+        prior_ttl_secs: state.prior_ttl_secs,
+        alpha_ev: state.alpha_ev,
+        beta_ev: state.beta_ev,
+        evidence_secs: state.evidence_secs,
+        lifetime_exposure_secs: state.lifetime_exposure_secs,
+        observations: state.observations,
+        changes: state.changes,
+        failures: state.failures,
+        consecutive_failures: state.consecutive_failures,
+        ttl_ewma: state.ttl_ewma,
+        ttl_volatility: state.ttl_volatility,
+        last_observation_unix: ts_to_unix(state.last_observation),
+        last_change_unix: ts_to_unix(state.last_change),
+        hazard: HazardConfigDto {
+            prior_shape: cfg.prior_shape,
+            confidence: cfg.confidence,
+            forgetting_secs: cfg.forgetting_secs,
+            min_interval_secs: cfg.min_interval_secs,
+            max_interval_secs: cfg.max_interval_secs,
+            target_freshness: cfg.target_freshness,
+        },
     }
 }
 
 fn dto_to_stability(d: &StabilityDto) -> StabilityModel {
-    StabilityModel {
-        samples: d.samples,
-        changes: d.changes,
-        stability: d.stability,
-        change_ratio: d.change_ratio,
-        ttl_ewma: d.ttl_ewma,
-        ttl_volatility: d.ttl_volatility,
-        consecutive_failures: d.consecutive_failures,
-        failures: d.failures,
-        last_refresh: unix_to_ts(d.last_refresh_unix),
-        last_change: unix_to_ts(d.last_change_unix),
-    }
+    let config = crate::hazard::HazardConfig {
+        prior_shape: d.hazard.prior_shape,
+        confidence: d.hazard.confidence,
+        forgetting_secs: d.hazard.forgetting_secs,
+        min_interval_secs: d.hazard.min_interval_secs,
+        max_interval_secs: d.hazard.max_interval_secs,
+        target_freshness: d.hazard.target_freshness,
+    };
+    // A configuration that came out of a corrupt frame is a configuration
+    // that would make the credibility bound meaningless (`α₀ ≤ 0` or
+    // `τ ≤ 0`), so it is checked by the *state* constructor, which
+    // substitutes the field defaults for anything non-finite.
+    StabilityModel::from_state(
+        config,
+        crate::hazard::HazardState {
+            prior_ttl_secs: d.prior_ttl_secs,
+            alpha_ev: d.alpha_ev,
+            beta_ev: d.beta_ev,
+            evidence_secs: d.evidence_secs,
+            lifetime_exposure_secs: d.lifetime_exposure_secs,
+            observations: d.observations,
+            changes: d.changes,
+            failures: d.failures,
+            consecutive_failures: d.consecutive_failures,
+            ttl_ewma: d.ttl_ewma,
+            ttl_volatility: d.ttl_volatility,
+            last_observation: unix_to_ts(d.last_observation_unix),
+            last_change: unix_to_ts(d.last_change_unix),
+        },
+    )
 }
 
 fn entry_to_dto(e: &CacheEntry, tier: Tier) -> Option<EntryDto> {
@@ -397,6 +468,7 @@ fn entry_to_dto(e: &CacheEntry, tier: Tier) -> Option<EntryDto> {
         stability: stability_to_dto(&e.stability),
         validated: e.validated,
         score: e.score,
+        cost_ms: Some(e.cost_ms),
     })
 }
 
@@ -472,6 +544,7 @@ fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEn
         score: d.score,
         tier,
         refreshing: false,
+        cost_ms: d.cost_ms.unwrap_or(crate::cache::score::COST_REF_MS),
     })
 }
 
@@ -554,7 +627,7 @@ mod tests {
                 assert_eq!(set.ttl, 300);
                 assert!(!e.validated);
                 // insert_positive records one stability observation.
-                assert_eq!(e.stability.samples, 1);
+                assert_eq!(e.stability.counts().0, 1);
             }
             _ => panic!("expected fresh positive hit"),
         }

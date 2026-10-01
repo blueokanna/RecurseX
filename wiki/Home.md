@@ -7,10 +7,18 @@ actually work and why they are shaped the way they are.
 ## Contents
 
 - [Architecture](Architecture.md) — the six layers and the data flow.
+- [**Risk-constrained refresh**](Refresh-Theory.md) — the hazard model, the
+  credibility bound, the risk budget and dependency-consistent refresh. This
+  is the design document for the part of the resolver that is not "a careful
+  implementation of known techniques".
+- [**Value of information**](Value-of-Information.md) — what one more
+  observation is worth, and which entries a finite refresh budget should be
+  spent on. The allocation half of the same theory.
 - [PARR — the prediction core](PARR.md) — Query State Estimator, Resolution
-  Planner, stability-aware cache, adaptive resolver.
-- [Cache admission & stability math](Cache-Admission.md) — what `CacheScore`
-  is made of and why stability is measured, not assumed.
+  Planner, the change-rate model, adaptive resolver.
+- [Cache admission and the change-rate model](Cache-Admission.md) — what
+  `CacheScore` is made of, why it is a value function rather than a safety
+gate, and how ECS partitions the key space.
 - [Alias dependency](Alias-Dependency.md) — why a cache needs a second
   structure to keep a CNAME chain servable as a unit.
 - [Upstream selection cost model](Upstream-Selection.md) — why raw RTT is the
@@ -25,6 +33,13 @@ actually work and why they are shaped the way they are.
   clients, rate limiting, spoofing defenses.
 - [Testing & verification](Testing.md) — what the suite covers and how to
   reproduce the live checks.
+- [**Beyond the lookup**](Beyond-The-Lookup.md) — what of the
+  "serverless / behavioural-hash / holographic" proposal is impossible and why,
+  and what part of it is real and is now in the crate: keyed behavioural
+  identity and weighted rendezvous selection.
+- [**The paper**](../paper/RecurseX-risk-constrained-refresh.md) — the same
+  argument written for reviewers: model, theorems, evaluation protocol,
+  limitations, and what it refrains from claiming.
 
 Chinese versions of the core pages are available as `*-zh.md` next to these
 files.
