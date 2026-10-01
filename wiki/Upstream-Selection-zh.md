@@ -35,3 +35,18 @@ failure_penalty = RTO · p_servfail · 1.5
 
 不同协议建立成本不同（`Udp`、`Tcp`、`Tls`/DoT、`DoH`、`DoH3`、`DoQ`）。TCP 和 TLS 要付握手，
 UDP 不付——这也是引擎偏好 UDP、只在截断时回退 TCP 的原因之一。
+
+## 交换级失败策略
+
+上面的成本模型排的是*路径*。当一次交换选中了某个 forwarder、而它直接用失败应答返回时，
+成本模型帮不上忙——等不到试下一个候选就结束了。因此 `Forwarders::exchange_with` 把
+**失败应答**当作“没有回答”：
+
+- `REFUSED`、`SERVFAIL` 以及其他任何非 `NOERROR` 的 rcode，会把该 forwarder 记为本次交换
+  失败（回填 `record_servfail`），随即尝试下一个候选。一个坏上游不再一票否决其余健康上游——
+  名单里只死一个成员就让每次解析都失败的代价，正是这条修掉的。
+- `NXDOMAIN` 不是失败：名字不存在，告知这一点就是答案。它立即终止交换，不再问后面的上游——
+  负回答因此保持廉价。
+- 全部 forwarder 都失败时，调用方拿到最后一个失败（拒答表现为 `ErrorKind::Refused`，
+  其余为 `ErrorKind::Servfail`）以及产生它的端点。绝不以“空答案”收场，上层才能报告
+  *为什么* 解析不出来，而不是靠猜。

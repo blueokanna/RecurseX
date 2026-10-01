@@ -110,7 +110,7 @@ impl NameserverPolicy {
             }
             parsed.push((p, *group));
         }
-        parsed.sort_by(|a, b| specificity(&b.0).cmp(&specificity(&a.0)));
+        parsed.sort_by_key(|entry| core::cmp::Reverse(specificity(&entry.0)));
         Ok(Self { rules: parsed })
     }
 

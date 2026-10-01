@@ -215,7 +215,7 @@ impl DomainPattern {
                 "domain pattern {raw:?} has an empty label"
             )));
         }
-        if !parts.iter().any(|p| *p == "*") {
+        if !parts.contains(&"*") {
             let name = Name::from_ascii(suffix)
                 .map_err(|e| Error::config(alloc::format!("bad domain pattern {raw:?}: {e}")))?;
             if name.is_root() {
@@ -230,9 +230,6 @@ impl DomainPattern {
             });
         }
 
-        // At least one `*` label. Validate every literal label through the
-        // name parser so a pattern and a query name are judged by the same
-        // rules (case folding, the 63-octet label limit, character escapes).
         let mut labels: Vec<Option<Vec<u8>>> = Vec::with_capacity(parts.len());
         for part in &parts {
             if *part == "*" {
