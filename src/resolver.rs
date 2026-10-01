@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::sync::Mutex;
 
 use crate::alias::{AliasConfig, AliasGraph};
-use crate::cache::{CacheConfig, CacheKey, EntryKind, LookupOutcome, SemanticCache};
+use crate::cache::{CacheConfig, CacheEntry, CacheKey, EntryKind, LookupOutcome, SemanticCache};
 use crate::engine::{self, EdnsSpec, ResponseKind};
 use crate::error::{Error, ErrorKind, Result};
 use crate::estimator::QueryEstimator;
@@ -176,6 +176,13 @@ impl Default for EngineConfig {
 #[derive(Clone, Copy, Debug)]
 struct Deadline {
     at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionCachePolicy {
+    Reuse,
+    FreshOnly,
+    Bypass,
 }
 
 impl Deadline {
@@ -859,6 +866,25 @@ impl fmt::Debug for ResolverInner {
     }
 }
 
+fn push_answer_dependency(
+    provenance: &mut crate::provenance::Provenance,
+    entry: &CacheEntry,
+    hop: usize,
+    freshness_lcb: f64,
+) {
+    let role = match entry.rrset().map(|rrset| rrset.rr_type) {
+        Some(RrType::CNAME) => crate::provenance::DependencyRole::Cname,
+        Some(RrType::DNAME) => crate::provenance::DependencyRole::Dname,
+        _ => crate::provenance::DependencyRole::Answer,
+    };
+    provenance.push(crate::provenance::Dependency::new(
+        role,
+        entry.key.clone(),
+        hop.min(u8::MAX as usize) as u8,
+        freshness_lcb,
+    ));
+}
+
 impl Resolver {
     /// A resolver with the given configuration.
     pub fn new(config: ResolverConfig) -> Self {
@@ -1095,7 +1121,8 @@ impl Resolver {
         // to finish.
         let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
         let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
-        let result = self.resolve_inner(key, 0, deadline, &mut budget);
+        let result =
+            self.resolve_inner(key, 0, deadline, &mut budget, ResolutionCachePolicy::Reuse);
         owner.publish(result.clone());
 
         let elapsed = started.elapsed().as_micros() as u64;
@@ -1355,13 +1382,16 @@ impl Resolver {
         ns_depth: usize,
         deadline: Deadline,
         budget: &mut crate::budget::FetchBudget,
+        cache_policy: ResolutionCachePolicy,
     ) -> Result<Resolution> {
         let now = self.inner.clock.now();
 
         // Cache-first path.
-        if let Some(res) = self.resolve_from_cache(key, now) {
-            self.inner.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(res);
+        if cache_policy != ResolutionCachePolicy::Bypass {
+            if let Some(res) = self.resolve_from_cache(key, now, cache_policy) {
+                self.inner.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(res);
+            }
         }
         self.inner
             .stats
@@ -1491,7 +1521,12 @@ impl Resolver {
 
     /// Attempt to satisfy a query purely from cache, walking CNAME chains.
     /// Returns `None` when the chain cannot be completed from cache.
-    fn resolve_from_cache(&self, key: &QueryKey, now: Ts) -> Option<Resolution> {
+    fn resolve_from_cache(
+        &self,
+        key: &QueryKey,
+        now: Ts,
+        cache_policy: ResolutionCachePolicy,
+    ) -> Option<Resolution> {
         let planner = ResolutionPlanner::new(self.inner.config.planner);
         let mut current = key.clone();
         let mut answers: Vec<Record> = Vec::new();
@@ -1502,6 +1537,10 @@ impl Resolver {
         let mut ttl = u32::MAX;
         let mut stale = false;
         let mut refresh_keys: Vec<CacheKey> = Vec::new();
+        let mut stale_entries: Vec<CacheEntry> = Vec::new();
+        let mut provenance = crate::provenance::Provenance::default();
+        let mut worst_consequence = crate::risk::Consequence::Low;
+        let mut max_staleness_secs = 0.0f64;
         let mut depth = 0usize;
 
         loop {
@@ -1513,6 +1552,8 @@ impl Resolver {
             match outcome {
                 LookupOutcome::Fresh(entry) => {
                     validated &= entry.validated;
+                    worst_consequence = worst_consequence.max(entry.answer_consequence());
+                    push_answer_dependency(&mut provenance, &entry, depth, 1.0);
                     ttl = ttl.min(entry.remaining_ttl(now).max(1));
                     match entry.kind {
                         EntryKind::Positive(rrset) => {
@@ -1546,49 +1587,19 @@ impl Resolver {
                     }
                 }
                 LookupOutcome::Stale(entry) => {
-                    // The stale decision is a *risk* decision: the freshness
-                    // bound, the consequence class of the record in its role,
-                    // and how well the answer's authenticity was established.
-                    // Popularity is not consulted — it decides what is worth
-                    // refreshing, not what is safe to return.
-                    //
-                    // Only the entry's own model is used here, and that is
-                    // sound for a chain: the loop walks hop by hop and every
-                    // earlier hop was found `Fresh` to have reached this
-                    // point, so this entry is the weakest link of the answer
-                    // assembled so far.
-                    let value_ms = self
-                        .inner
-                        .shared
-                        .estimator
-                        .lock()
-                        .est_cost_ms(&entry.key.name);
-                    let trust = self.trust_level(entry.validated);
-                    let failure = entry.stability.consecutive_failures();
-                    let ctx =
-                        crate::planner::StaleContext::from_entry(&entry, now, value_ms, trust);
-                    let plan = {
-                        let mut ledger = self.inner.risk.lock();
-                        planner.plan(
-                            &LookupOutcome::Stale(entry.clone()),
-                            now,
-                            Some(&ctx),
-                            &mut ledger,
-                        )
-                    };
-                    if plan == crate::planner::Plan::Resolve {
-                        if failure > 0 {
-                            self.inner
-                                .stats
-                                .stale_refused_after_failure
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        self.inner
-                            .stats
-                            .stale_risk_refused
-                            .fetch_add(1, Ordering::Relaxed);
+                    if cache_policy != ResolutionCachePolicy::Reuse {
                         return None;
                     }
+                    let ctx = crate::planner::StaleContext::from_entry(
+                        &entry,
+                        now,
+                        0.0,
+                        self.trust_level(entry.validated),
+                    );
+                    worst_consequence = worst_consequence.max(entry.answer_consequence());
+                    push_answer_dependency(&mut provenance, &entry, depth, ctx.freshness_lcb);
+                    max_staleness_secs = max_staleness_secs.max(ctx.staleness_secs);
+                    stale_entries.push(entry.clone());
                     stale = true;
                     ttl = ttl.min(self.inner.config.stale_serve_ttl.max(1));
                     validated &= entry.validated;
@@ -1636,6 +1647,8 @@ impl Resolver {
                     match self.inner.shared.cache.lock().lookup(&ck, now) {
                         LookupOutcome::Fresh(e) => {
                             validated &= e.validated;
+                            worst_consequence = worst_consequence.max(e.answer_consequence());
+                            push_answer_dependency(&mut provenance, &e, depth, 1.0);
                             if let EntryKind::Positive(rrset) = e.kind {
                                 if let Some(rec) = rrset.records.first().cloned() {
                                     answers.push(rec);
@@ -1672,6 +1685,49 @@ impl Resolver {
             ttl = 0;
         }
         if stale {
+            let representative = stale_entries.first()?;
+            let value_ms = self.inner.shared.estimator.lock().est_cost_ms(&key.name);
+            let ctx = crate::planner::StaleContext {
+                consequence: worst_consequence,
+                trust: self.trust_level(validated),
+                freshness_lcb: provenance.bound(),
+                staleness_secs: max_staleness_secs,
+                value_ms,
+            };
+            let has_evidence = provenance.permits_stale()
+                && stale_entries.iter().all(|entry| {
+                    entry
+                        .stability
+                        .hazard()
+                        .has_evidence(planner.config().min_evidence_secs)
+                });
+            let plan = if has_evidence {
+                let mut ledger = self.inner.risk.lock();
+                planner.plan(
+                    &LookupOutcome::Stale(representative.clone()),
+                    now,
+                    Some(&ctx),
+                    &mut ledger,
+                )
+            } else {
+                crate::planner::Plan::Resolve
+            };
+            if plan == crate::planner::Plan::Resolve {
+                if stale_entries
+                    .iter()
+                    .any(|entry| entry.stability.consecutive_failures() > 0)
+                {
+                    self.inner
+                        .stats
+                        .stale_refused_after_failure
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner
+                    .stats
+                    .stale_risk_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             for k in refresh_keys {
                 self.refresh_with_dependents(&k, self.inner.config.max_chain_refresh);
             }
@@ -2207,7 +2263,13 @@ impl Resolver {
                 want_dnssec: false,
                 cd: false,
             };
-            if let Ok(res) = self.resolve_inner(&key, ns_depth, deadline, budget) {
+            if let Ok(res) = self.resolve_inner(
+                &key,
+                ns_depth,
+                deadline,
+                budget,
+                ResolutionCachePolicy::FreshOnly,
+            ) {
                 for r in res.answers {
                     match r.rdata {
                         RData::A(ip) => out.push(IpAddr::V4(ip)),
@@ -2716,6 +2778,7 @@ impl Resolver {
             // it is not a client waiting on a reply.
             Deadline::after(self.inner.config.engine.query_budget_ms),
             &mut budget,
+            ResolutionCachePolicy::Bypass,
         )?;
         let now = self.inner.clock.now();
         self.cache_resolution(&qk, &res, now);
@@ -2981,6 +3044,27 @@ mod tests {
         1_700_000_000_000_000_000
     }
 
+    fn insert_well_observed_stale_address(resolver: &Resolver, name: &Name) -> CacheKey {
+        let key = CacheKey::plain(name.clone(), RrType::A, RrClass::IN);
+        let now = resolver.inner.clock.now();
+        let stale_inserted = now - 70_000_000_000;
+        let inputs = crate::cache::score::ScoreInputs::default();
+        let mut cache = resolver.inner.shared.cache.lock();
+        for observation in 0..=40 {
+            let inserted = stale_inserted - (40 - observation) * 60_000_000_000;
+            let mut answer = RrSet::new(name.clone(), RrType::A, RrClass::IN, 60);
+            answer.add_record(Record {
+                name: name.clone(),
+                rr_type: RrType::A,
+                class: RrClass::IN,
+                ttl: 60,
+                rdata: RData::A("192.0.2.7".parse().unwrap()),
+            });
+            cache.insert_positive(&key, answer, inserted, inputs, true);
+        }
+        key
+    }
+
     /// The deadline is the bound that makes the worst case finite, so it has to
     /// shorten an exchange and it has to expire — not just exist.
     #[test]
@@ -3190,6 +3274,162 @@ mod tests {
         // Refreshing the target queues the alias with it.
         r.refresh_with_dependents(&data, 4);
         assert!(r.stats().propagated.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn stale_target_uses_the_consequence_of_its_cname_chain() {
+        let mut cfg = ResolverConfig::default();
+        cfg.planner.risk.refresh_capacity = 0.0;
+        let r = Resolver::new(cfg);
+        let alias_name = Name::from_ascii("a.example.com").unwrap();
+        let target_name = Name::from_ascii("b.example.com").unwrap();
+        let alias_key = CacheKey::plain(alias_name.clone(), RrType::CNAME, RrClass::IN);
+        let target_key = CacheKey::plain(target_name.clone(), RrType::A, RrClass::IN);
+        let inputs = crate::cache::score::ScoreInputs::default();
+        let class = RrClass::IN;
+        let ttl = 60;
+        let stale_inserted = now() - 70_000_000_000;
+
+        let mut alias_set = crate::rrset::RrSet::new(alias_name.clone(), RrType::CNAME, class, ttl);
+        alias_set.add_record(Record {
+            name: alias_name.clone(),
+            rr_type: RrType::CNAME,
+            class,
+            ttl,
+            rdata: RData::Cname(target_name.clone()),
+        });
+
+        let shared = r.shared();
+        let mut cache = shared.cache.lock();
+        cache.insert_positive(&alias_key, alias_set, now() - 30_000_000_000, inputs, true);
+        for observation in 0..=40 {
+            let inserted = stale_inserted - (40 - observation) * 60_000_000_000;
+            let mut answer_set =
+                crate::rrset::RrSet::new(target_name.clone(), RrType::A, class, ttl);
+            answer_set.add_record(Record {
+                name: target_name.clone(),
+                rr_type: RrType::A,
+                class,
+                ttl,
+                rdata: RData::A("192.0.2.7".parse().unwrap()),
+            });
+            cache.insert_positive(&target_key, answer_set, inserted, inputs, true);
+        }
+
+        let target_entry = match cache.lookup(&target_key, now()) {
+            LookupOutcome::Stale(entry) => entry,
+            other => panic!("expected a stale target, got {other:?}"),
+        };
+        let freshness = target_entry.stability.freshness_lcb(10.0);
+        assert!((0.95..0.99).contains(&freshness), "{freshness}");
+        let single_entry = crate::planner::StaleContext::from_entry(
+            &target_entry,
+            now(),
+            50.0,
+            r.trust_level(target_entry.validated),
+        );
+        assert!(
+            crate::planner::ResolutionPlanner::new(r.inner.config.planner)
+                .assess_stale(&single_entry)
+                .allowed,
+            "the target alone clears the ordinary-answer freshness floor"
+        );
+        drop(cache);
+
+        let query = key("a.example.com");
+        assert!(
+            r.resolve_from_cache(&query, now(), ResolutionCachePolicy::Reuse)
+                .is_none(),
+            "the complete answer must use the stricter CNAME consequence class"
+        );
+        assert_eq!(r.inner.risk.lock().debt(), 0.0);
+    }
+
+    #[test]
+    fn internal_ns_address_resolution_never_uses_stale_addresses() {
+        let mut cfg = ResolverConfig::default();
+        cfg.engine.query_budget_ms = 0;
+        let r = Resolver::new(cfg);
+        let name = Name::from_ascii("ns.example.com").unwrap();
+        let key = insert_well_observed_stale_address(&r, &name);
+        let mut budget = crate::budget::FetchBudget::new(r.inner.config.engine.fetch_limits);
+
+        assert!(r
+            .resolve_host_addresses(&name, 0, Deadline::after(0), &mut budget)
+            .is_none());
+        assert!(matches!(
+            r.inner
+                .shared
+                .cache
+                .lock()
+                .lookup(&key, r.inner.clock.now()),
+            LookupOutcome::Stale(_)
+        ));
+    }
+
+    #[test]
+    fn background_refresh_cannot_promote_a_stale_entry_without_upstream() {
+        let mut cfg = ResolverConfig::default();
+        cfg.engine.query_budget_ms = 0;
+        let r = Resolver::new(cfg);
+        let name = Name::from_ascii("ns.example.com").unwrap();
+        let key = insert_well_observed_stale_address(&r, &name);
+        let expires = match r
+            .inner
+            .shared
+            .cache
+            .lock()
+            .lookup(&key, r.inner.clock.now())
+        {
+            LookupOutcome::Stale(entry) => entry.expires,
+            other => panic!("expected stale cache data, got {other:?}"),
+        };
+
+        assert!(r.refresh_key(key.clone()).is_err());
+        assert!(matches!(
+            r.inner
+                .shared
+                .cache
+                .lock()
+                .lookup(&key, r.inner.clock.now()),
+            LookupOutcome::Stale(entry) if entry.expires == expires
+        ));
+    }
+
+    #[test]
+    fn background_refresh_bypasses_even_fresh_cache_entries() {
+        let mut cfg = ResolverConfig::default();
+        cfg.engine.query_budget_ms = 0;
+        let r = Resolver::new(cfg);
+        let name = Name::from_ascii("ns.example.com").unwrap();
+        let key = CacheKey::plain(name.clone(), RrType::A, RrClass::IN);
+        let inserted = r.inner.clock.now();
+        let mut answer = RrSet::new(name.clone(), RrType::A, RrClass::IN, 60);
+        answer.add_record(Record {
+            name,
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::A("192.0.2.7".parse().unwrap()),
+        });
+        r.inner.shared.cache.lock().insert_positive(
+            &key,
+            answer,
+            inserted,
+            crate::cache::score::ScoreInputs::default(),
+            true,
+        );
+        let expires = inserted + 60_000_000_000;
+
+        assert!(r.refresh_key(key.clone()).is_err());
+        assert!(matches!(
+            r.inner
+                .shared
+                .cache
+                .lock()
+                .lookup(&key, r.inner.clock.now()),
+            LookupOutcome::Fresh(entry) if entry.expires == expires
+        ));
     }
 
     /// Join a thread with a deadline, so a broken shutdown fails the test
