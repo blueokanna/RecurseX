@@ -8,16 +8,13 @@
 use crate::sync::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::message::Message;
-<<<<<<< HEAD
 use crate::prng::RandomSource;
-=======
-use crate::prng::SplitMix64;
 use crate::qtype::Rcode;
->>>>>>> adf7fac9ed823e6f5512e36cd2cdcb2d13cbcc12
 use crate::query::response_matches_query;
 use crate::transport::{DnsTransport, Transports};
 use crate::upstream::{Endpoint, Proto};
@@ -96,17 +93,26 @@ impl TransportKey {
     }
 }
 
+fn pooled_transport<T>(
+    cache: &Mutex<BTreeMap<TransportKey, Arc<T>>>,
+    key: TransportKey,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    let mut cache = cache.lock();
+    Arc::clone(cache.entry(key).or_insert_with(|| Arc::new(build())))
+}
+
 /// The set of forwarding upstreams with cached per-endpoint transports.
 pub struct ForwarderSet {
     forwarders: Vec<Forwarder>,
     #[cfg(feature = "dot")]
-    dot: Mutex<BTreeMap<TransportKey, crate::transports::dot::DotTransport>>,
+    dot: Mutex<BTreeMap<TransportKey, Arc<crate::transports::dot::DotTransport>>>,
     #[cfg(feature = "doh")]
-    doh: Mutex<BTreeMap<TransportKey, crate::transports::doh::DohTransport>>,
+    doh: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh::DohTransport>>>,
     #[cfg(feature = "doh3")]
-    doh3: Mutex<BTreeMap<TransportKey, crate::transports::doh3::Doh3Transport>>,
+    doh3: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh3::Doh3Transport>>>,
     #[cfg(feature = "doq")]
-    doq: Mutex<BTreeMap<TransportKey, crate::transports::doq::DoqTransport>>,
+    doq: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doq::DoqTransport>>>,
     plain: Transports,
     roots: courierust::courierust_tls::RootStore,
     verify: bool,
@@ -252,8 +258,7 @@ impl ForwarderSet {
             Proto::Udp | Proto::Tcp => self.plain.exchange(&f.endpoint, query, timeout_ms),
             #[cfg(feature = "dot")]
             Proto::Tls => {
-                let mut cache = self.dot.lock();
-                let t = cache.entry(key).or_insert_with(|| {
+                let transport = pooled_transport(&self.dot, key, || {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::dot::DotTransport::for_host(
                         host,
@@ -262,12 +267,11 @@ impl ForwarderSet {
                         self.now,
                     )
                 });
-                t.exchange(query, &f.endpoint, timeout_ms)
+                transport.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(feature = "doh")]
             Proto::DoH => {
-                let mut cache = self.doh.lock();
-                let t = cache.entry(key).or_insert_with(|| {
+                let transport = pooled_transport(&self.doh, key, || {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     let mut t = crate::transports::doh::DohTransport::for_host(
                         host,
@@ -278,26 +282,16 @@ impl ForwarderSet {
                     t.path = f.doh_path().to_string();
                     t
                 });
-                t.exchange(query, &f.endpoint, timeout_ms)
+                transport.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(feature = "doh3")]
             Proto::DoH3 => {
-                let mut cache = self.doh3.lock();
-                let t = cache.entry(key).or_insert_with(|| {
-                    let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
-                    crate::transports::doh3::Doh3Transport::for_host(
-                        host,
-                        self.roots.clone(),
-                        self.verify,
-                        self.now,
-                    )
-                });
-                t.exchange(query, &f.endpoint, timeout_ms)
+                let transport = pooled_transport(&self.doh3, key, || self.build_doh3_transport(f));
+                transport.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(feature = "doq")]
             Proto::DoQ => {
-                let mut cache = self.doq.lock();
-                let t = cache.entry(key).or_insert_with(|| {
+                let transport = pooled_transport(&self.doq, key, || {
                     let host = f.host.clone().unwrap_or_else(|| f.endpoint.ip.to_string());
                     crate::transports::doq::DoqTransport::for_host(
                         host,
@@ -306,7 +300,7 @@ impl ForwarderSet {
                         self.now,
                     )
                 });
-                t.exchange(query, &f.endpoint, timeout_ms)
+                transport.exchange(query, &f.endpoint, timeout_ms)
             }
             #[cfg(not(feature = "dot"))]
             Proto::Tls => Err(Error::new(
@@ -329,6 +323,25 @@ impl ForwarderSet {
                 "DoQ forwarder not compiled in (enable `doq`)",
             )),
         }
+    }
+
+    #[cfg(feature = "doh3")]
+    fn build_doh3_transport(
+        &self,
+        forwarder: &Forwarder,
+    ) -> crate::transports::doh3::Doh3Transport {
+        let host = forwarder
+            .host
+            .clone()
+            .unwrap_or_else(|| forwarder.endpoint.ip.to_string());
+        let mut transport = crate::transports::doh3::Doh3Transport::for_host(
+            host,
+            self.roots.clone(),
+            self.verify,
+            self.now,
+        );
+        transport.path = forwarder.doh_path().to_string();
+        transport
     }
 }
 
@@ -432,6 +445,46 @@ mod tests {
         set.add(Forwarder::plain(Endpoint::udp("1.1.1.1".parse().unwrap())));
         assert!(set.is_enabled());
         assert_eq!(set.forwarders().len(), 1);
+    }
+
+    #[test]
+    fn pooled_transports_are_reused_without_holding_the_pool_lock() {
+        let pool = Mutex::new(BTreeMap::new());
+        let key = TransportKey {
+            endpoint: Endpoint::udp("192.0.2.1".parse().unwrap()),
+            host: None,
+            path: None,
+        };
+        let mut builds = 0;
+
+        let first = pooled_transport(&pool, key.clone(), || {
+            builds += 1;
+            7
+        });
+        let second = pooled_transport(&pool, key, || {
+            builds += 1;
+            9
+        });
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*first, 7);
+        assert_eq!(builds, 1);
+        assert!(pool.try_lock().is_some());
+    }
+
+    #[cfg(feature = "doh3")]
+    #[test]
+    fn doh3_transport_uses_the_configured_path() {
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), false, 0);
+        let forwarder = Forwarder::encrypted(
+            Endpoint::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 443, Proto::DoH3),
+            "resolver.example",
+        )
+        .with_path("/custom-dns");
+
+        let transport = set.build_doh3_transport(&forwarder);
+
+        assert_eq!(transport.path, "/custom-dns");
     }
 
     /// A loopback upstream that replies to every query with `build`.

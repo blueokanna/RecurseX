@@ -812,7 +812,7 @@ pub struct ResolverInner {
     pub stats: Stats,
     /// The forwarding upstream set.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-    pub forwarder_set: Mutex<crate::forward::ForwarderSet>,
+    pub forwarder_set: Mutex<Arc<crate::forward::ForwarderSet>>,
     inflight: Mutex<Inflight>,
     /// The aggregate risk budget. Every admitted stale answer charges it.
     risk: Mutex<crate::risk::RiskLedger>,
@@ -906,7 +906,7 @@ impl Resolver {
                 transports: Transports::new(),
                 stats: Stats::default(),
                 #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-                forwarder_set: Mutex::new(forwarder_set),
+                forwarder_set: Mutex::new(Arc::new(forwarder_set)),
                 inflight: Mutex::new(Inflight::new(config.max_inflight)),
                 risk: Mutex::new(crate::risk::RiskLedger::new(config.planner.risk, clock_now)),
                 refresh_budget: Mutex::new(crate::risk::RefreshBudget::from_config(
@@ -993,7 +993,7 @@ impl Resolver {
         for f in &self.inner.config.engine.forwarders {
             fs.add(f.clone());
         }
-        *self.inner.forwarder_set.lock() = fs;
+        *self.inner.forwarder_set.lock() = Arc::new(fs);
     }
 
     /// The wall clock this resolver uses.
@@ -1467,7 +1467,8 @@ impl Resolver {
             )
         });
         let bytes = query.to_bytes()?;
-        let resp = self.inner.forwarder_set.lock().exchange_with(
+        let forwarder_set = Arc::clone(&self.inner.forwarder_set.lock());
+        let resp = forwarder_set.exchange_with(
             group,
             &query,
             &bytes,
