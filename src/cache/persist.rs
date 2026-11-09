@@ -533,6 +533,10 @@ fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEn
     // where they were parked at save time.
     let tier = if now >= expires { Tier::Cold } else { tier };
     Some(CacheEntry {
+        generation: 0,
+        next_check_at: 0,
+        refresh_cost: 1.0,
+        served_stale_since_write: false,
         key,
         kind,
         inserted: unix_to_ts(d.inserted_unix),

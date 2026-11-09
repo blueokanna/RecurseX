@@ -253,6 +253,29 @@ impl ForwarderSet {
     }
 
     fn exchange_one(&self, f: &Forwarder, query: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+        if matches!(f.endpoint.proto, Proto::Udp | Proto::Tcp) {
+            return self.exchange_one_unmetered(f, query, timeout_ms);
+        }
+        crate::background::exchange(&f.endpoint, query.len(), timeout_ms, |timeout| {
+            self.exchange_one_unmetered(f, query, timeout)
+        })
+    }
+
+    fn exchange_one_unmetered(
+        &self,
+        f: &Forwarder,
+        query: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>> {
+        if !matches!(f.endpoint.proto, Proto::Udp | Proto::Tcp)
+            && self.verify
+            && (self.roots.is_empty() || f.host.as_deref().map_or(true, str::is_empty))
+        {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "encrypted upstream requires trust roots and a TLS identity",
+            ));
+        }
         let key = TransportKey::of(f);
         match f.endpoint.proto {
             Proto::Udp | Proto::Tcp => self.plain.exchange(&f.endpoint, query, timeout_ms),

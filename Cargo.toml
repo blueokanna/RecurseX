@@ -81,6 +81,10 @@ required-features = ["std"]
 name = "server_demo"
 required-features = ["std"]
 
+[[example]]
+name = "request_replay"
+required-features = ["std"]
+
 [dev-dependencies]
 
 [package.metadata.docs.rs]

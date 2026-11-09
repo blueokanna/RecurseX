@@ -50,7 +50,7 @@ impl Default for DohTransport {
             hostname: "dns.google".into(),
             path: "/dns-query".into(),
             roots: RootStore::new(),
-            verify: false,
+            verify: true,
             now: 0,
             client: Mutex::new(None),
         }
@@ -102,7 +102,10 @@ impl DnsTransport for DohTransport {
         let client = self.client()?;
         let url = format!("https://{}:{}{}", self.hostname, endpoint.port, self.path);
         let resp = client
-            .post(&url, query.to_vec())
+            .request(&url, courierust::courierust_http::Method::POST)
+            .body(query.to_vec())
+            .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
+            .send()
             .map_err(|e| Error::transport(format!("doh request: {e}")))?;
         if resp.status.as_u16() != 200 {
             return Err(Error::transport(format!(
@@ -118,7 +121,6 @@ impl DnsTransport for DohTransport {
         if body.len() > MAX_TCP_MESSAGE {
             return Err(Error::transport("doh response too large"));
         }
-        let _ = timeout_ms;
         Ok(body.to_vec())
     }
 }

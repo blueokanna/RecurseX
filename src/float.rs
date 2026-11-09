@@ -202,7 +202,6 @@ pub fn log2(x: f64) -> f64 {
 /// `⌈x⌉` (IEEE-754 `ceil`), via [`round`]. Non-finite inputs are fixed
 /// points, and magnitudes large enough to be integral already are returned
 /// unchanged.
-
 /// `√x` — a bit-trick seed refined by Newton's iteration.
 ///
 /// The seed halves the exponent field, which is already within ~5 % of the

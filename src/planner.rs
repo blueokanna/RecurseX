@@ -6,8 +6,9 @@
 //! * **Serve stale** — answer from the expired copy and refresh out of band.
 //! * **Serve fresh** — nothing to decide.
 //!
-//! The plan chooses between the first two, and the choice is where the whole
-//! design either holds together or does not.
+//! Stale service defaults to disabled. Failure fallback requires a failed
+//! upstream attempt for this request. Immediate model-based service requires
+//! an explicit experimental opt-in; model coverage has not been established.
 //!
 //! # What the plan must not do
 //!
@@ -86,7 +87,7 @@ pub struct StaleContext {
     pub trust: TrustLevel,
     /// The conservative freshness of the whole answer's provenance DAG.
     ///
-    /// Taken from [`Provenance::bound`] when a provenance set is available
+    /// Taken from [`Provenance::joint_lower_bound`] when a provenance set is available
     /// (the correct source), or from the entry's own model when the answer
     /// has a single dependency.
     pub freshness_lcb: f64,
@@ -113,7 +114,7 @@ impl StaleContext {
     /// The same context, with the freshness and the consequence replaced by
     /// those of a whole provenance set.
     pub fn with_provenance(mut self, provenance: &Provenance) -> Self {
-        self.freshness_lcb = provenance.bound();
+        self.freshness_lcb = provenance.joint_lower_bound();
         if let Some(worst) = provenance.worst_consequence() {
             self.consequence = self.consequence.max(worst);
         }
@@ -121,9 +122,23 @@ impl StaleContext {
     }
 }
 
+/// Policy for expired answers. The observation model alone is experimental.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StalePolicy {
+    /// Never serve expired answers (the production default).
+    #[default]
+    Disabled,
+    /// Consider stale only after this request's upstream refresh failed.
+    OnRefreshFailure,
+    /// Opt in to immediate model-based stale decisions for experiments.
+    ImmediateExperimental,
+}
+
 /// Planner configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlannerConfig {
+    /// Explicit stale policy; predictions remain useful for prefetch in every mode.
+    pub stale_policy: StalePolicy,
     /// The hazard configuration used for entries the cache did not create
     /// with one (diagnostics and tests).
     pub hazard: HazardConfig,
@@ -151,6 +166,7 @@ pub struct PlannerConfig {
 impl Default for PlannerConfig {
     fn default() -> Self {
         Self {
+            stale_policy: StalePolicy::Disabled,
             hazard: HazardConfig::default(),
             risk: RiskConfig::default(),
             min_evidence_secs: 300.0,
@@ -253,9 +269,26 @@ impl ResolutionPlanner {
         ctx: Option<&StaleContext>,
         ledger: &mut RiskLedger,
     ) -> Plan {
+        self.plan_after_refresh(outcome, now, ctx, ledger, false)
+    }
+
+    /// As `plan`, with evidence that this request's refresh just failed.
+    pub fn plan_after_refresh(
+        &self,
+        outcome: &LookupOutcome,
+        now: Ts,
+        ctx: Option<&StaleContext>,
+        ledger: &mut RiskLedger,
+        refresh_failed: bool,
+    ) -> Plan {
         match outcome {
             LookupOutcome::Fresh(_) => Plan::ServeFresh,
             LookupOutcome::Stale(entry) => {
+                match self.config.stale_policy {
+                    StalePolicy::Disabled => return Plan::Resolve,
+                    StalePolicy::OnRefreshFailure if !refresh_failed => return Plan::Resolve,
+                    _ => {}
+                }
                 let derived;
                 let ctx = match ctx {
                     Some(c) => c,
@@ -339,6 +372,10 @@ mod tests {
         expired_secs: Ts,
     ) -> CacheEntry {
         CacheEntry {
+            generation: 0,
+            next_check_at: 0,
+            refresh_cost: 1.0,
+            served_stale_since_write: false,
             key: CacheKey::plain(
                 Name::from_ascii("www.example.com").unwrap(),
                 rr_type,
@@ -368,7 +405,10 @@ mod tests {
 
     #[test]
     fn fresh_outcome_serves_from_cache() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let mut ledger = RiskLedger::new(planner.config().risk, now());
         let e = entry(
             RrType::A,
@@ -383,8 +423,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_policy_requires_an_explicit_opt_in_and_current_failure() {
+        let e = entry(
+            RrType::A,
+            true,
+            well_observed(now() - 60_000 * 1_000_000_000),
+            20,
+        );
+        let ctx = StaleContext {
+            consequence: Consequence::Low,
+            trust: TrustLevel::ChainAnchored,
+            freshness_lcb: 0.999,
+            staleness_secs: 20.0,
+            value_ms: 60.0,
+        };
+        for (policy, failed, allowed) in [
+            (StalePolicy::Disabled, false, false),
+            (StalePolicy::Disabled, true, false),
+            (StalePolicy::OnRefreshFailure, false, false),
+            (StalePolicy::OnRefreshFailure, true, true),
+            (StalePolicy::ImmediateExperimental, false, true),
+        ] {
+            let planner = ResolutionPlanner::new(PlannerConfig {
+                stale_policy: policy,
+                ..PlannerConfig::default()
+            });
+            let mut ledger = RiskLedger::new(planner.config().risk, now());
+            let plan = planner.plan_after_refresh(
+                &LookupOutcome::Stale(e.clone()),
+                now(),
+                Some(&ctx),
+                &mut ledger,
+                failed,
+            );
+            assert_eq!(matches!(plan, Plan::ServeStale { .. }), allowed);
+            if !allowed {
+                assert_eq!(ledger.debt(), 0.0);
+            }
+        }
+        assert_eq!(PlannerConfig::default().stale_policy, StalePolicy::Disabled);
+    }
+
+    #[test]
     fn a_young_entry_is_never_predicted_about() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let mut ledger = RiskLedger::new(planner.config().risk, now());
         let e = entry(RrType::A, true, StabilityModel::new(now()), 10);
         let ctx = StaleContext::from_entry(&e, now(), 50.0, TrustLevel::ChainAnchored);
@@ -397,7 +482,10 @@ mod tests {
 
     #[test]
     fn a_well_observed_low_risk_entry_may_serve_stale() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let mut ledger = RiskLedger::new(planner.config().risk, now());
         let ctx = StaleContext {
             consequence: Consequence::Low,
@@ -421,7 +509,10 @@ mod tests {
     /// an A record must not buy it for key material.
     #[test]
     fn key_material_is_never_served_stale() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let mut ledger = RiskLedger::new(planner.config().risk, now());
         let ctx = StaleContext {
             consequence: Consequence::Absolute,
@@ -455,7 +546,10 @@ mod tests {
                 budget_capacity: 1.5,
                 ..RiskConfig::default()
             },
-            ..PlannerConfig::default()
+            ..PlannerConfig {
+                stale_policy: StalePolicy::ImmediateExperimental,
+                ..PlannerConfig::default()
+            }
         };
         let planner = ResolutionPlanner::new(cfg);
         let mut ledger = RiskLedger::new(*planner.risk_config(), now());
@@ -485,7 +579,10 @@ mod tests {
 
     #[test]
     fn prefetch_follows_the_model_not_a_ttl_fraction() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let mut durable = StabilityModel::new(now() - 200_000 * 1_000_000_000);
         for i in 1..=400 {
             durable.observe(
@@ -551,7 +648,10 @@ mod tests {
     /// has to delete it deliberately.
     #[test]
     fn estimator_population_is_not_required_for_safety() {
-        let planner = ResolutionPlanner::new(PlannerConfig::default());
+        let planner = ResolutionPlanner::new(PlannerConfig {
+            stale_policy: StalePolicy::ImmediateExperimental,
+            ..PlannerConfig::default()
+        });
         let est = QueryEstimator::new(64);
         let mut ledger = RiskLedger::new(planner.config().risk, now());
         let e = entry(

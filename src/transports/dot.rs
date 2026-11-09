@@ -16,7 +16,7 @@ use crate::upstream::{Endpoint, Proto};
 pub struct DotTransport {
     /// SNI + certificate verification name.
     pub hostname: String,
-    /// Trust roots. Empty = no verification.
+    /// Trust roots. An empty store fails certificate verification.
     pub roots: RootStore,
     /// Whether to verify the server certificate.
     pub verify: bool,
@@ -43,7 +43,7 @@ impl Default for DotTransport {
         Self {
             hostname: "localhost".into(),
             roots: RootStore::new(),
-            verify: false,
+            verify: true,
             now: 0,
             connect_timeout_ms: 5000,
         }
@@ -82,7 +82,7 @@ impl DnsTransport for DotTransport {
         if query.len() > MAX_TCP_MESSAGE {
             return Err(Error::transport("query too large for DoT"));
         }
-        let timeout = Duration::from_millis(timeout_ms.max(self.connect_timeout_ms));
+        let timeout = Duration::from_millis(timeout_ms.min(self.connect_timeout_ms).max(1));
         let addr = SocketAddr::new(endpoint.ip, endpoint.port);
         let stream = TcpStream::connect_timeout(&addr, timeout)
             .map_err(|e| Error::io(format!("dot connect {}: {e}", endpoint.addr_str())))?;

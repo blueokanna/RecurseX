@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use nextjson::{NsonDeserialize, NsonSerialize};
 
 use crate::cache::CacheConfig;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::planner::PlannerConfig;
 use crate::policy::{BlockRule, PolicyConfig};
 use crate::qtype::RrType;
@@ -609,6 +609,12 @@ impl PersistJson {
 #[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
 #[njson(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
+    /// PEM trust bundle for encrypted upstreams (required for strict TLS).
+    #[njson(default)]
+    pub forwarder_ca_file: Option<String>,
+    /// disabled (default), on-refresh-failure, or immediate-experimental.
+    #[njson(default)]
+    pub stale_policy: Option<String>,
     /// Listen addresses for the server mode.
     #[njson(default)]
     pub listen: Vec<ListenConfig>,
@@ -643,6 +649,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            forwarder_ca_file: None,
+            stale_policy: None,
             listen: vec![ListenConfig::default()],
             cache: CacheJson::default(),
             engine: EngineJson::default(),
@@ -884,11 +892,51 @@ impl Config {
         let client_qps = self
             .client_qps
             .unwrap_or(d.rate_limit.client_refill_per_sec);
+        let stale_policy = match self.stale_policy.as_deref().unwrap_or("disabled") {
+            "disabled" => crate::planner::StalePolicy::Disabled,
+            "on-refresh-failure" => crate::planner::StalePolicy::OnRefreshFailure,
+            "immediate-experimental" => crate::planner::StalePolicy::ImmediateExperimental,
+            _ => return Err(Error::new(ErrorKind::Config, "unknown stalePolicy")),
+        };
+        let dns_policy = self.build_dns_policy()?;
+        #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+        {
+            if let Some(path) = &self.forwarder_ca_file {
+                ec.forwarder_roots.add_pem_file(path).map_err(|e| {
+                    Error::new(ErrorKind::Config, format!("forwarder trust roots: {e}"))
+                })?;
+                for root in ec.forwarder_roots.roots() {
+                    courierust::courierust_tls::x509::parse_certificate(&root.der).map_err(
+                        |e| {
+                            Error::new(
+                                ErrorKind::Config,
+                                format!("invalid forwarder trust certificate: {e}"),
+                            )
+                        },
+                    )?;
+                }
+            }
+            if dns_policy
+                .upstreams
+                .all()
+                .iter()
+                .any(|f| !matches!(f.endpoint.proto, Proto::Udp | Proto::Tcp))
+                && ec.forwarder_roots.is_empty()
+            {
+                return Err(Error::new(
+                    ErrorKind::Config,
+                    "encrypted upstreams require forwarderCaFile",
+                ));
+            }
+        }
         Ok(ResolverConfig {
             cache: self.cache.into_cache(),
-            planner: PlannerConfig::default(),
+            planner: PlannerConfig {
+                stale_policy,
+                ..PlannerConfig::default()
+            },
             policy: self.policy.into_policy(),
-            dns: self.build_dns_policy()?,
+            dns: dns_policy,
             engine: ec,
             rate_limit: RateLimitConfig {
                 client_capacity: client_burst.max(1.0),
@@ -950,6 +998,57 @@ pub fn parse_rr_type(s: &str) -> Option<RrType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    #[test]
+    fn encrypted_configuration_requires_trust_roots() {
+        let json = r#"{"dns":{"nameservers":["tls://127.0.0.1#localhost"]}}"#;
+        let config = Config::from_json_str(json).unwrap();
+        assert!(config
+            .into_resolver_config()
+            .unwrap_err()
+            .msg
+            .contains("forwarderCaFile"));
+        let mut config = Config::from_json_str(json).unwrap();
+        config.forwarder_ca_file = Some("tests/fixtures/localhost.pem".into());
+        assert_eq!(
+            config
+                .into_resolver_config()
+                .unwrap()
+                .engine
+                .forwarder_roots
+                .len(),
+            1
+        );
+        let mut config = Config::from_json_str(json).unwrap();
+        config.forwarder_ca_file = Some("tests/fixtures/does-not-exist.pem".into());
+        assert!(config.into_resolver_config().is_err());
+    }
+
+    #[test]
+    fn stale_policy_is_explicit_and_invalid_spelling_fails() {
+        assert_eq!(
+            Config::default()
+                .into_resolver_config()
+                .unwrap()
+                .planner
+                .stale_policy,
+            crate::planner::StalePolicy::Disabled
+        );
+        assert_eq!(
+            Config::from_json_str(r#"{"stalePolicy":"on-refresh-failure"}"#)
+                .unwrap()
+                .into_resolver_config()
+                .unwrap()
+                .planner
+                .stale_policy,
+            crate::planner::StalePolicy::OnRefreshFailure
+        );
+        assert!(Config::from_json_str(r#"{"stalePolicy":"typo"}"#)
+            .unwrap()
+            .into_resolver_config()
+            .is_err());
+    }
 
     #[test]
     fn json_roundtrip() {
@@ -1125,7 +1224,7 @@ mod tests {
         fn clash_kebab_and_snake_keys_are_accepted() {
             for key in ["nameserver-policy", "nameserver_policy", "nameserverPolicy"] {
                 let json = format!(
-                    r#"{{"dns": {{"{key}": {{"+.node.example": ["tls://10.0.0.53#dns.example"]}}}}}}"#
+                    r#"{{"forwarderCaFile":"tests/fixtures/localhost.pem","dns": {{"{key}": {{"+.node.example": ["tls://10.0.0.53#dns.example"]}}}}}}"#
                 );
                 let rc = Config::from_json_str(&json)
                     .unwrap_or_else(|e| panic!("{key} should parse: {e}"))
@@ -1412,6 +1511,7 @@ mod tests {
         fn nameserver_policy_and_filter_are_wired() {
             let rc = Config::from_json_str(
                 r#"{
+                    "forwarderCaFile":"tests/fixtures/localhost.pem",
                     "dns": {
                         "nameservers": ["tls://1.1.1.1#one.one.one.one"],
                         "fallback": ["tls://8.8.8.8#dns.google"],

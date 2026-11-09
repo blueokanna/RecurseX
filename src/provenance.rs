@@ -1,69 +1,13 @@
-//! Answer provenance: what one final answer depends on.
+//! Answer dependencies and bounded safety summaries.
 //!
-//! # The gap a per-entry model leaves
+//! `bound()` reports the weakest marginal prediction for diagnostics only.
+//! The joint lower bound is `max(0, 1 - sum(1 - p_i))`, without assuming
+//! independence. It is conditional on valid marginal lower bounds; the
+//! approximate observation model does not itself establish their coverage.
 //!
-//! [`crate::hazard`] answers "is *this* RRset still correct?". A resolver
-//! never serves one RRset, though: it serves a *final answer*, assembled
-//! from several cache entries that were each resolved at a different time
-//! and each have their own freshness. For `www.example.com` that can be a
-//! CNAME, the target's A RRset, the delegation that made the target
-//! resolvable, the address of the nameserver that answered, and the DNSSEC
-//! proof that binds them. The answer is correct only if *all* of them are
-//! correct, and the resolver's per-entry view cannot say that.
-//!
-//! # The bound
-//!
-//! For an answer `A` with dependency set `D(A)`:
-//!
-//! ```text
-//! P(A servable) ≤ min      P_LCB(v fresh)
-//!                 v ∈ D(A)
-//! ```
-//!
-//! The minimum is the *only* sound combination without an independence
-//! assumption, and the independence assumption is usually false: an
-//! authoritative republish can change a CNAME and its target in the same
-//! zone at the same instant, so multiplying the probabilities would
-//! understate the risk. The product
-//! ([`Provenance::independent_bound`]) is therefore offered as a diagnostic
-//! and never as the decision input.
-//!
-//! # Why this changes the refresh decision
-//!
-//! Sorting the dependencies by freshness gives an immediate and slightly
-//! uncomfortable result: **refreshing anything except a bottleneck cannot
-//! raise the answer's bound at all.** A resolver that prefetches every
-//! expiring member of the chain spends the whole refresh budget and improves
-//! the weakest-link bound by exactly zero whenever the same member remains
-//! the weakest. [`Provenance::refresh_plan`] consequently returns the
-//! dependencies in ascending freshness order — the bottleneck first, then the
-//! next one, up to a bound — and [`Provenance::risk_reduction`] reports what
-//! each would actually buy, so a caller can stop when the marginal refresh
-//! stops mattering.
-//!
-//! This is also why [`crate::alias`] and this module coexist rather than
-//! duplicating: the alias graph answers "what becomes invalid when this entry
-//! changes" (a global reverse index, needed for invalidation), and this
-//! module answers "what must be true for *this* answer to be serveable"
-//! (a per-answer forward set, needed for the decision). Neither can be
-//! derived cheaply from the other.
-//!
-//! # Bounds
-//!
-//! A dependency set is capped at [`ProvenanceConfig::max_dependencies`]. The
-//! obvious implementation — keep the members you might want to refresh and
-//! discard the rest — is a safety bug: `bound()` is a *minimum*, so dropping
-//! a member can only raise it, and raising it is exactly the optimistic
-//! error the bound exists to prevent. The implementation instead retains the
-//! **weakest** `cap` dependencies and folds the minimum of everything
-//! discarded into a residual floor ([`Provenance::residual`]). The reported
-//! bound is then `min(retained ∪ {residual})`, which is *identical* to the
-//! bound of the untrimmed set. Trimming costs memory, not soundness.
-//!
-//! The residual is also why [`Provenance::risk_reduction`] can return `0.0`
-//! even for the bottleneck: if the floor comes from a dependency that is no
-//! longer retained, no refresh of a retained member can lift the bound past
-//! it, and the plan should say so rather than promise an improvement.
+//! Every dependency obeys the configured capacity. Dropped dependencies keep
+//! their failure mass, worst consequence and stale prohibition in a fixed-size
+//! summary. Refresh plans rank the improvement in the joint lower bound.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -164,7 +108,7 @@ impl Dependency {
             role,
             key,
             hop,
-            freshness_lcb: if freshness_lcb.is_nan() {
+            freshness_lcb: if !freshness_lcb.is_finite() {
                 0.0
             } else {
                 freshness_lcb.clamp(0.0, 1.0)
@@ -187,6 +131,10 @@ pub struct Provenance {
     /// The minimum freshness among dependencies that were discarded by the
     /// cap. Keeps the bound identical to the untrimmed one.
     residual: f64,
+    residual_failure_sum: f64,
+    residual_worst_consequence: Option<Consequence>,
+    residual_forbids_stale: bool,
+    has_dependencies: bool,
 }
 
 impl Default for Provenance {
@@ -202,78 +150,54 @@ impl Provenance {
             config,
             deps: Vec::new(),
             residual: 1.0,
+            residual_failure_sum: 0.0,
+            residual_worst_consequence: None,
+            residual_forbids_stale: false,
+            has_dependencies: false,
         }
     }
 
-    /// Build from a dependency list, applying the cap.
-    ///
-    /// Trimming keeps the **weakest** `cap` dependencies — the ones whose
-    /// refresh could matter — and records the minimum of the discarded ones
-    /// as a residual floor, so the reported bound is unchanged. Every
-    /// [`DependencyRole::DnssecProof`] is retained regardless, because a
-    /// proof that has been discarded is an answer that can no longer be
-    /// shown to be stale-eligible at all.
-    pub fn from_dependencies(config: ProvenanceConfig, mut deps: Vec<Dependency>) -> Self {
-        let cap = config.max_dependencies.max(1);
-        let mut residual = 1.0f64;
-        if deps.len() > cap {
-            // Ascending freshness: the weakest sort first.
-            deps.sort_by(|a, b| {
-                a.freshness_lcb
-                    .partial_cmp(&b.freshness_lcb)
-                    .unwrap_or(core::cmp::Ordering::Equal)
-                    .then_with(|| a.role.cmp(&b.role))
-                    .then_with(|| a.key.cmp(&b.key))
-            });
-            let proofs: usize = deps
-                .iter()
-                .filter(|d| d.role == DependencyRole::DnssecProof)
-                .count();
-            // Room left for non-proof dependencies once the proofs are in.
-            let room = cap.saturating_sub(proofs);
-            let mut kept: Vec<Dependency> = Vec::with_capacity(cap.max(proofs));
-            let mut others_kept = 0usize;
-            for d in deps.drain(..) {
-                if d.role == DependencyRole::DnssecProof || others_kept < room {
-                    if d.role != DependencyRole::DnssecProof {
-                        others_kept += 1;
-                    }
-                    kept.push(d);
-                } else {
-                    residual = residual.min(d.freshness_lcb);
+    /// Build from a dependency list using the same bounded rule as `push`.
+    pub fn from_dependencies(config: ProvenanceConfig, deps: Vec<Dependency>) -> Self {
+        let mut result = Self::new(config);
+        for dep in deps {
+            result.push(dep);
+        }
+        result
+    }
+
+    /// Retain at most the configured number of nodes, summarizing every
+    /// discarded restriction. Even a zero capacity and proof-only set obey it.
+    pub fn push(&mut self, mut dep: Dependency) {
+        // Public fields may bypass Dependency::new: validate at ingestion too.
+        dep.freshness_lcb = if dep.freshness_lcb.is_finite() {
+            dep.freshness_lcb.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.has_dependencies = true;
+        if self.deps.len() < self.config.max_dependencies {
+            self.deps.push(dep);
+            return;
+        }
+        if let Some((index, strongest)) = self.deps.iter().enumerate().max_by(|(_, a), (_, b)| {
+            a.freshness_lcb
+                .total_cmp(&b.freshness_lcb)
+                .then_with(|| a.role.cmp(&b.role))
+                .then_with(|| a.key.cmp(&b.key))
+        }) {
+            if dep.freshness_lcb < strongest.freshness_lcb {
+                if let Some(retained) = self.deps.get_mut(index) {
+                    dep = core::mem::replace(retained, dep);
                 }
             }
-            deps = kept;
         }
-        Self {
-            config,
-            deps,
-            residual,
-        }
-    }
-
-    /// Add a dependency, honouring the cap by dropping the strongest
-    /// non-proof member (dropping the weakest would raise the bound).
-    pub fn push(&mut self, dep: Dependency) {
-        self.deps.push(dep);
-        let cap = self.config.max_dependencies.max(1);
-        if self.deps.len() > cap {
-            if let Some(idx) = self
-                .deps
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| d.role != DependencyRole::DnssecProof)
-                .max_by(|(_, a), (_, b)| {
-                    a.freshness_lcb
-                        .partial_cmp(&b.freshness_lcb)
-                        .unwrap_or(core::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-            {
-                let dropped = self.deps.remove(idx);
-                self.residual = self.residual.min(dropped.freshness_lcb);
-            }
-        }
+        self.residual = self.residual.min(dep.freshness_lcb);
+        self.residual_failure_sum = (self.residual_failure_sum + 1.0 - dep.freshness_lcb).min(1.0);
+        self.residual_worst_consequence = self
+            .residual_worst_consequence
+            .max(Some(dep.role.consequence()));
+        self.residual_forbids_stale |= !dep.permits_stale();
     }
 
     /// The dependencies, in insertion order.
@@ -292,7 +216,7 @@ impl Provenance {
 
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
-        self.deps.is_empty()
+        !self.has_dependencies
     }
 
     /// The number of retained dependencies.
@@ -300,7 +224,7 @@ impl Provenance {
         self.deps.len()
     }
 
-    /// The conservative serviceability bound: the weakest link, including
+    /// Diagnostic weakest marginal prediction, including
     /// the residual floor.
     ///
     /// An empty set has no dependencies to be wrong, so it is `1.0`; callers
@@ -334,37 +258,39 @@ impl Provenance {
         p.clamp(0.0, 1.0)
     }
 
-    /// The weakest retained dependency — the only one whose refresh can
-    /// raise [`Provenance::bound`] in this moment.
-    pub fn bottleneck(&self) -> Option<&Dependency> {
-        self.deps.iter().min_by(|a, b| {
-            a.freshness_lcb
-                .partial_cmp(&b.freshness_lcb)
-                .unwrap_or(core::cmp::Ordering::Equal)
-        })
+    /// Joint lower bound, conditional on valid marginal bounds. No
+    /// independence assumption is made. Trimming cannot raise this value.
+    pub fn joint_lower_bound(&self) -> f64 {
+        let failure_sum = self
+            .deps
+            .iter()
+            .fold(self.residual_failure_sum, |sum, dep| {
+                (sum + (1.0 - dep.freshness_lcb)).min(1.0)
+            });
+        (1.0 - failure_sum).clamp(0.0, 1.0)
     }
 
-    /// The increase in [`Provenance::bound`] obtainable by refreshing the
-    /// retained dependency at `index` and nothing else.
-    ///
-    /// Refreshing anything but the bottleneck yields `0.0`: the bound is a
-    /// minimum, so it moves only when the minimiser moves. Making that
-    /// explicit is the point — a refresh scheduler that ignores it spends
-    /// its budget without improving the guarantee.
+    /// The weakest retained marginal prediction (diagnostic only).
+    pub fn bottleneck(&self) -> Option<&Dependency> {
+        self.deps
+            .iter()
+            .min_by(|a, b| a.freshness_lcb.total_cmp(&b.freshness_lcb))
+    }
+
+    /// Joint-bound improvement if one retained dependency becomes fresh.
     pub fn risk_reduction_at(&self, index: usize) -> f64 {
-        if self.deps.get(index).is_none() {
+        if index >= self.deps.len() {
             return 0.0;
         }
-        let others = self
+        let remaining = self
             .deps
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != index)
-            .map(|(_, d)| d.freshness_lcb)
-            .fold(f64::INFINITY, f64::min)
-            .min(self.residual)
-            .min(1.0);
-        (others - self.bound()).max(0.0)
+            .fold(self.residual_failure_sum, |sum, (_, d)| {
+                (sum + 1.0 - d.freshness_lcb).min(1.0)
+            });
+        ((1.0 - remaining) - self.joint_lower_bound()).max(0.0)
     }
 
     /// The same as [`Provenance::risk_reduction_at`], locating the
@@ -377,40 +303,48 @@ impl Provenance {
         }
     }
 
-    /// The dependencies to refresh, bottleneck first, at most `max` of them.
+    /// Rank retained dependencies by joint-bound improvement, at most `max`.
     ///
     /// Ties are ordered by role then key so the plan is deterministic, which
     /// makes it reproducible in an experiment.
     pub fn refresh_plan(&self, max: usize) -> Vec<CacheKey> {
-        let mut ordered: Vec<&Dependency> = self.deps.iter().collect();
-        ordered.sort_by(|a, b| {
-            a.freshness_lcb
-                .partial_cmp(&b.freshness_lcb)
-                .unwrap_or(core::cmp::Ordering::Equal)
+        let mut ordered: Vec<_> = self
+            .deps
+            .iter()
+            .enumerate()
+            .map(|(index, dep)| (dep, self.risk_reduction_at(index)))
+            .collect();
+        ordered.sort_by(|(a, gain_a), (b, gain_b)| {
+            gain_b
+                .total_cmp(gain_a)
                 .then_with(|| a.role.cmp(&b.role))
                 .then_with(|| a.key.cmp(&b.key))
         });
         ordered
             .into_iter()
-            .take(max.max(1))
-            .map(|d| d.key.clone())
+            .take(max)
+            .map(|(dep, _)| dep.key.clone())
             .collect()
     }
 
     /// Whether every dependency permits stale service at all.
     pub fn permits_stale(&self) -> bool {
-        self.deps.iter().all(|d| d.permits_stale())
+        !self.residual_forbids_stale && self.deps.iter().all(|d| d.permits_stale())
     }
 
     /// The strictest consequence class present in the set.
     pub fn worst_consequence(&self) -> Option<Consequence> {
-        self.deps.iter().map(|d| d.role.consequence()).max()
+        self.deps
+            .iter()
+            .map(|d| d.role.consequence())
+            .max()
+            .max(self.residual_worst_consequence)
     }
 
     /// Whether the answer's bound clears `threshold` *and* every dependency
     /// is stale-eligible.
     pub fn can_serve_stale(&self, threshold: f64) -> bool {
-        !self.is_empty() && self.permits_stale() && self.bound() >= threshold
+        !self.is_empty() && self.permits_stale() && self.joint_lower_bound() >= threshold
     }
 }
 
@@ -515,6 +449,138 @@ mod tests {
     }
 
     #[test]
+    fn regression_joint_gate_does_not_use_minimum() {
+        let p = Provenance::from_dependencies(
+            ProvenanceConfig::default(),
+            vec![
+                dep(DependencyRole::Answer, "a.example", 0.99),
+                dep(DependencyRole::Cname, "b.example", 0.99),
+            ],
+        );
+        assert!(!p.can_serve_stale(0.99));
+    }
+
+    #[test]
+    fn regression_proofs_obey_capacity() {
+        let mut p = Provenance::new(ProvenanceConfig {
+            max_dependencies: 1,
+        });
+        for i in 0..10 {
+            p.push(dep(
+                DependencyRole::DnssecProof,
+                &alloc::format!("p{i}.example"),
+                1.0,
+            ));
+        }
+        assert_eq!(p.len(), 1);
+        assert!(!p.permits_stale());
+    }
+
+    #[test]
+    fn regression_trim_preserves_consequence() {
+        let p = Provenance::from_dependencies(
+            ProvenanceConfig {
+                max_dependencies: 1,
+            },
+            vec![
+                dep(DependencyRole::Answer, "a.example", 0.5),
+                dep(DependencyRole::Delegation, "b.example", 1.0),
+            ],
+        );
+        assert_eq!(p.worst_consequence(), Some(Consequence::Critical));
+    }
+
+    #[test]
+    fn regression_joint_bound_saturates_and_empty_is_one() {
+        assert_eq!(Provenance::default().joint_lower_bound(), 1.0);
+        let p = Provenance::from_dependencies(
+            ProvenanceConfig::default(),
+            vec![
+                dep(DependencyRole::Answer, "a.example", 0.2),
+                dep(DependencyRole::Answer, "b.example", 0.3),
+            ],
+        );
+        assert_eq!(p.joint_lower_bound(), 0.0);
+    }
+
+    #[test]
+    fn regression_trimming_is_safety_equivalent_including_zero_capacity() {
+        let deps = vec![
+            dep(DependencyRole::Answer, "a.example", 0.99),
+            dep(DependencyRole::Delegation, "b.example", 0.98),
+            dep(DependencyRole::DnssecProof, "c.example", 0.97),
+        ];
+        let full = Provenance::from_dependencies(ProvenanceConfig::default(), deps.clone());
+        for cap in 0..=deps.len() {
+            let config = ProvenanceConfig {
+                max_dependencies: cap,
+            };
+            let bulk = Provenance::from_dependencies(config, deps.clone());
+            let mut pushed = Provenance::new(config);
+            for dep in deps.iter().rev() {
+                pushed.push(dep.clone());
+            }
+            for p in [bulk, pushed] {
+                assert!(p.len() <= cap);
+                assert!(!p.is_empty());
+                assert!((p.joint_lower_bound() - full.joint_lower_bound()).abs() < 1e-12);
+                assert_eq!(p.bound(), full.bound());
+                assert_eq!(p.worst_consequence(), full.worst_consequence());
+                assert_eq!(p.permits_stale(), full.permits_stale());
+            }
+        }
+    }
+
+    #[test]
+    fn regression_public_dependency_fields_are_validated() {
+        for probability in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut d = dep(DependencyRole::Answer, "a.example", 1.0);
+            d.freshness_lcb = probability;
+            let p = Provenance::from_dependencies(ProvenanceConfig::default(), vec![d]);
+            assert_eq!(p.joint_lower_bound(), 0.0);
+        }
+    }
+
+    #[test]
+    fn regression_joint_risk_refresh_gain_accounts_for_residual() {
+        let p = Provenance::from_dependencies(
+            ProvenanceConfig {
+                max_dependencies: 1,
+            },
+            vec![
+                dep(DependencyRole::Answer, "a.example", 0.8),
+                dep(DependencyRole::Answer, "b.example", 0.9),
+            ],
+        );
+        assert!((p.joint_lower_bound() - 0.7).abs() < 1e-12);
+        assert!((p.risk_reduction_at(0) - 0.2).abs() < 1e-12);
+        assert!(p.refresh_plan(0).is_empty());
+    }
+
+    #[test]
+    fn regression_planner_uses_joint_probability_and_trimmed_restrictions() {
+        let p = Provenance::from_dependencies(
+            ProvenanceConfig {
+                max_dependencies: 1,
+            },
+            vec![
+                dep(DependencyRole::Answer, "a.example", 0.99),
+                dep(DependencyRole::Delegation, "b.example", 0.99),
+            ],
+        );
+        let ctx = crate::planner::StaleContext {
+            consequence: Consequence::Low,
+            trust: crate::risk::TrustLevel::Unverified,
+            freshness_lcb: 1.0,
+            staleness_secs: 1.0,
+            value_ms: 50.0,
+        }
+        .with_provenance(&p);
+        assert!((ctx.freshness_lcb - 0.98).abs() < 1e-12);
+        assert_eq!(ctx.consequence, Consequence::Critical);
+    }
+
+    #[test]
     fn bound_is_the_minimum_not_the_product() {
         let p = Provenance::from_dependencies(
             ProvenanceConfig::default(),
@@ -528,17 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_bottleneck_refresh_moves_the_bound() {
+    fn every_dependency_refresh_can_reduce_joint_risk() {
         let weak = dep(DependencyRole::Cname, "b.example.com", 0.50);
         let strong = dep(DependencyRole::Answer, "a.example.com", 0.99);
         let p = Provenance::from_dependencies(
             ProvenanceConfig::default(),
             vec![weak.clone(), strong.clone()],
         );
-        assert!((p.risk_reduction(&strong) - 0.0).abs() < 1e-12);
-        // Refreshing the bottleneck perfectly raises the bound to the next
-        // weakest.
-        assert!((p.risk_reduction(&weak) - 0.49).abs() < 1e-12);
+        assert!((p.risk_reduction(&strong) - 0.01).abs() < 1e-12);
+        // Each refreshed marginal removes its own failure mass.
+        assert!((p.risk_reduction(&weak) - 0.50).abs() < 1e-12);
     }
 
     #[test]

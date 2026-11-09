@@ -42,60 +42,38 @@ ten hours produced the same number), and it could not be conservative (an EWMA
 moving away from a neutral `0.5` makes a barely-observed name look *more*
 trustworthy the less it has been watched).
 
-What replaced it is a **posterior over the change rate**, and a **one-sided
-credibility bound** on it:
+The current model is an **approximate Gamma rate model for observed content
+changes**. It remains useful for refresh ranking, but its output has not been
+validated as a data-authenticity guarantee.
 
 ```
-Pr(Y = 1 | λ, h) = 1 − e^(−λh)        observations: an exposure h and an outcome Y
-Pr(Y = 0 | λ, h) = e^(−λh)            λ | data  ~ Gamma(α, β),  α = α₀ + Σ w·Y,  β = α₀T + Σ w·h
-
-P_LCB(fresh, Δ) = e^(−λ_hi·Δ)         λ_hi = the exact Chernoff bound on Gamma(α, β)
+Pr(Y = 1 | lambda, h) = 1 - exp(-lambda*h)
+Pr(Y = 0 | lambda, h) = exp(-lambda*h)
+approximate update: alpha += w*Y; beta += w*h
 ```
 
-Read that last line as a sentence: *even taking the most pessimistic change
-rate still consistent with what we have observed, the probability this data is
-correct `Δ` seconds from now is at least this.* That is a claim a safety
-argument can be built on, and it is what every stale decision consumes.
+A binary interval observation is not an exact Poisson event count. This update
+is not an exact Gamma posterior for that binary likelihood. Even that
+likelihood assumes changes cannot disappear between observations: identical
+samples cannot rule out A -> B -> A. The Gamma Chernoff calculation is a bound
+within the approximate model, not established coverage for real DNS content.
+Forgetting and trust weights limit accumulated evidence; they do not establish
+resistance to fabricated observations.
 
-Three consequences are worth naming:
+Predictions continue to order prefetches. `PlannerConfig::stale_policy` defaults
+to `Disabled`; `OnRefreshFailure` first attempts upstream resolution for the
+current request and only then considers the existing consequence, evidence,
+joint-risk and risk-budget gates. `ImmediateExperimental` explicitly opts in
+to immediate model-based stale service. JSON uses `stalePolicy` with values
+`disabled`, `on-refresh-failure`, or `immediate-experimental`. Stale responses
+use a positive TTL (30 seconds by default) and never assert AD.
 
-- **Irregular sampling is modelled, not averaged away.** The likelihood
-  conditions on each observation's own exposure, so a resolver that looks
-  often and a resolver that looks rarely draw different inferences from the
-  same zone — which is correct — instead of the same unitless number, which
-  is not.
-- **`Y = 0` does not mean "nothing happened".** It means no visible
-difference was found at that sample; a change that came and went between two
-samples is invisible. That is why the output is a distribution and why the
-model keeps no "change count" in its state at all.
-- **A failed refresh is not evidence of stability.** Recording a timeout as
-  "unchanged" would make an unreachable upstream masquerade as a stable zone,
-  and the resolver *more* willing to answer from memory the worse the network
-  got. Failures age the evidence and teach the model nothing.
-
-### Forgetting is also an anti-forgery bound
-
-Evidence is exponentially forgotten with a time constant `τ` (one day by
-default), because DNS data is not stationary. That has a second effect worth
-stating plainly: forgetting puts a **hard ceiling** on accumulated evidence
-(`b → wτ`). No quantity of refreshes — honest or forged — can drive the
-change rate to zero, so the credibility bound never closes and `P_LCB` is
-strictly below 1 for every entry that has ever existed. An attacker in a
-position to answer our refreshes cannot manufacture unbounded confidence that
-a name never changes, because the model never accumulates unbounded
-confidence in anything. It is a property of the update rule, not a check
-bolted on afterwards.
-
-The second half of the same defence: an answer accepted on the strength of
-ID, port and 0x20 case alone is worth half an authenticated one in the
-statistics, and because the weight scales the *ceiling* as well as the rate,
-an unauthenticated channel can never buy the same confidence however long it
-is observed.
-
-**The measured history never touches the TTL you serve.** If the authority
-says 300, the client gets 300. The model only moves internal timing: when to
-refresh, whether stale may be served, which tier to admit to, what to evict.
-That separation is a hard rule in this codebase, not a guideline.
+Successful positive-cache replacements record the prediction **before** the
+model update and the subsequently observed content equality in
+`SemanticCache::content_calibration()`. This measures observed-content
+calibration, including selection bias from the refresh policy; it cannot
+certify continuous truth between observations. Failed refreshes are not
+recorded as unchanged content.
 
 ### Value and safety are different questions
 
@@ -128,32 +106,48 @@ the constraints hold by construction rather than on average, and both export
 their denial counts — because "the policy is the constraint" and "the network
 is the constraint" need opposite fixes.
 
-### A refresh is only useful at the bottleneck
+### Combine dependency risks without assuming independence
 
-An answer is assembled from several entries — a CNAME, its target, a
-delegation, a nameserver address, a DNSSEC proof — and it is correct only if
-all of them are. The conservative bound is therefore the **minimum** over
-them, not their product: one authoritative republish changes a CNAME and its
-target in the same instant, so an independence assumption would understate the
-risk.
+`Provenance::bound()` retains the weakest marginal prediction as a diagnostic.
+The stale decision uses `joint_lower_bound()` instead:
 
-The minimum has a consequence that changes the scheduler: **refreshing
-anything except the weakest link cannot raise the bound at all.** A prefetcher
-that refreshes every expiring member of a chain spends its whole budget and
-improves the guarantee by exactly zero whenever the same member stays weakest.
-So the refresh plan is ordered bottleneck-first, and every entry reports what a
-refresh of it would actually buy, letting a caller stop when the marginal
-refresh stops mattering.
+```
+P(all dependencies fresh) >= max(0, 1 - sum(1 - p_i))
+```
+
+This inequality is conditional on valid marginal lower bounds; it does not
+validate the approximate per-entry model. Two 0.99 marginals yield a 0.98
+joint lower bound, not 0.99. Refresh plans rank the joint-bound improvement
+from refreshing each retained dependency, rather than asserting that only
+the weakest node has value.
+
+Every node, including proof material, obeys `max_dependencies` (zero is
+supported). Discarded nodes retain their capped failure sum, strictest
+consequence and stale prohibition in a fixed-size summary. Trimming cannot
+raise the joint bound or erase a proof's stale prohibition.
 
 ## Where the refresh budget goes
 
-The bottleneck argument says *which* entry to refresh. It does not say which
-entry to refresh **next**, and the maintenance loop holds a finite budget —
-`RefreshBudget` mints tokens at a fixed rate — so that second question is the one
-that decides the outcome. The answer used to be "the entry with the lowest
-`P_LCB`", and that is a threshold, not an allocation. A threshold can only say
-"look at this too"; it is blind to how much an observation would *teach*, to how
-much the answer is *worth*, and to how much harm the record's class can do.
+The refresh token bucket limits task starts. The scheduler ranks a finite
+batch by `(expected service benefit + expected risk reduction) / expected
+refresh work`, using observed exchanges plus DNS bytes / 4096 as cost units.
+This is a resource-allocation heuristic, not a globally optimal algorithm.
+
+Each tier maintains an updateable ordered index with one due node per entry.
+Maintenance reads at most 256 candidates per tick by default, copies only
+keys, versions and scheduling state, then releases the cache lock before
+reading estimator signals or computing VoI. A short commit validates the
+version, expiry and refresh ownership. A fixed pool bounds queued plus
+running tasks to `max_concurrent_refreshes` (default 8); rejected, failed,
+cancelled and unwinding tasks release ownership. A separate active-key set
+prevents duplicate refreshes even across content replacement.
+
+Background transport dispatch also checks a shared exchange/byte budget,
+per-server-IP rate and concurrency limits, and a task envelope before sending.
+Response bytes are reserved before dispatch; failed exchanges retain their
+reservation. Accounting covers DNS payloads, not transport framing or
+unsolicited packets. DoH keeps its existing pooled client. Trace tools and
+validation limits are documented in [refresh validation](docs/refresh-validation.md).
 
 All three are visible to the risk functional the rest of the system already
 uses, so the scheduler prices an observation by the **expected reduction in
@@ -168,9 +162,9 @@ with both sides evaluated at the horizon, and the expectation over the two
 outcomes an observation can have — the data changed, or it did not — weighted by
 the model's own predictive probability `p₀ = (β / (β + age))^α`.
 
-What makes the number trustworthy is how the "after" state is obtained: by
+The simulation stays consistent with the implemented model because of how the "after" state is obtained: by
 cloning the hazard model and calling **the same `observe` the real refresh path
-calls**. Not a re-derivation of the conjugate update — a second source of truth
+calls**. Not a second implementation of the approximate update — a second source of truth
 whose failure mode would be silent, ranking by an update the model never
 performs.
 
@@ -414,7 +408,9 @@ the parts that do not.
 | upstream paths | 4 096 endpoints | NS-set floods from hostile delegations |
 | client buckets | 65 536 clients | spoofed-source floods (see the honest note below) |
 | in-flight queries | 4 096 keys | coalescing table |
-| concurrent refreshes | 8 threads | serve-stale hits queue refreshes from the request path |
+| background refresh tasks | 8 queued + running, fixed worker pool | every submission shares the same admission path |
+| refresh candidates per tick | 256 | independent of cache size |
+| scheduling index | one node per cache entry | updated and removed with the entry |
 | alias edges | 100 000 | CNAME chains |
 | sections in a message | 4 096 records, 16 questions | parse cost is linear in message size |
 | names | 255 octets, 127 labels, 128 pointer hops | wire format, with a proof that 128 hops cannot reject a valid name |
@@ -606,8 +602,17 @@ iterative resolution, because the two have different answers to "who sees this
 query" — a deployment forwarding to a filtering resolver must not bypass it.
 Encrypted forwarders require their `host` (the TLS identity used for SNI and
 certificate verification); a document that omits it is rejected at load time
-instead of running without an identity. Secure them with trust anchors through
-`Resolver::set_forwarder_roots`.
+instead of running without an identity. JSON configuration additionally requires
+`forwarderCaFile` pointing to a PEM CA bundle. Library users may supply
+`EngineConfig::forwarder_roots` before construction or call
+`Resolver::set_forwarder_roots(roots, true)`. The default verifies certificates;
+empty roots fail closed. Explicit `verify = false` is an insecure testing
+opt-out, never a strict-privacy configuration. Wrong identity is not retried
+via plaintext iterative resolution.
+
+`dnssec_anchored` is retained for source compatibility but ignored. No caller
+boolean can produce `ChainAnchored`, and this build does not set AD until an
+actual complete chain validator exists.
 
 ### Examples
 

@@ -1,132 +1,20 @@
-//! The observable-change hazard model.
+//! Approximate rate model for observable RRset content changes.
 //!
-//! # The problem this module exists to solve
+//! For non-reverting Poisson changes, a binary interval observation has
+//! `P(Y=1 | lambda,h) = 1-exp(-lambda*h)`. It is not an exact event count;
+//! updating Gamma parameters with `alpha += w*Y; beta += w*h` is an
+//! approximation, not its conjugate posterior. Forgetting and trust weights
+//! further make this a working predictive model rather than exact inference.
 //!
-//! A recursive resolver that wants to *predict* — rather than merely obey a
-//! TTL — has to answer one question repeatedly:
+//! The Chernoff calculation below is valid for the chosen Gamma law. It does
+//! not establish real-world marginal coverage or authenticity. In particular,
+//! identical endpoint samples cannot exclude an intervening A -> B -> A.
+//! Predictions are used for refresh ranking; immediate stale service is an
+//! explicit experiment, and production defaults disable stale service.
 //!
-//! > What is the probability that the RRset I am about to answer from
-//! > memory is still correct?
-//!
-//! The naive answers are all wrong in the same way: they claim to know
-//! something nobody measured.
-//!
-//! * **"The TTL has not expired, so it is correct."** A TTL is what the
-//!   *authoritative server* claims, not a measurement of how often the zone
-//!   actually publishes a new RRset. Zones routinely publish a 300 s TTL for
-//!   data that changes hourly, and a 86 400 s TTL for data that changes
-//!   every second behind a CDN.
-//! * **"It has been unchanged N times in a row, so it is stable."** `N` is
-//!   not a property of the zone; it is a property of *our sampling*. Two
-//!   resolvers with different refresh cadences will report different `N` for
-//!   the same zone, and neither number is a stability.
-//! * **"The EWMA stability is 0.93."** A unitless score with hand-tuned
-//!   weights. It cannot be calibrated (nothing to compare against), it
-//!   cannot be combined across entries, and it silently encodes the tuning
-//!   set it was fitted on.
-//!
-//! # The model
-//!
-//! Assume changes to an RRset arrive as a Poisson process with an unknown
-//! rate `λ > 0` (changes per second). An observation is a pair — the
-//! *exposure* `h` since we last looked, and the *outcome*
-//! `Y ∈ {0, 1}` (did the data differ when we looked again?). The likelihood
-//! of one observation is
-//!
-//! ```text
-//! Pr(Y = 1 | λ, h) = 1 − e^(−λh)          Pr(Y = 0 | λ, h) = e^(−λh)
-//! ```
-//!
-//! so the likelihood of a whole history is
-//!
-//! ```text
-//! L(λ) = Π_k (1 − e^(−λ h_k))^(Y_k) · (e^(−λ h_k))^(1 − Y_k)
-//! ```
-//!
-//! Note what this does *and does not* assume: it does **not** assume the
-//! observation intervals are equal (they never are — they depend on cache
-//! pressure, client traffic and the scheduler), and it does **not** treat
-//! `Y = 0` as proof that nothing happened. `Y = 0` means "no *observable*
-//! difference was found at that sample"; a change that came and went between
-//! two samples is invisible, which is precisely why the inference is
-//! probabilistic rather than a counter.
-//!
-//! # Why the posterior is a Gamma and why that is not a coincidence
-//!
-//! `λ` is a rate, so its conjugate prior is `Gamma(α, β)`. With the
-//! `e^(−λh)` factors above, the *exact* conjugate update needs the
-//! exponential-integral family — but the small-`λh` regime that a resolver
-//! actually operates in (`λh ≪ 1`: the data changes on a scale of hours, we
-//! sample on a scale of minutes) has `1 − e^(−λh) ≈ λh`, so the
-//! per-observation information about `λ` is, to first order, `h` units of
-//! exposure for `Y = 1` and none for `Y = 0`. The Gamma update
-//!
-//! ```text
-//! α ← α + Y            β ← β + h
-//! ```
-//!
-//! is therefore the *first-order-correct* rule, and it is honest about the
-//! regime it is valid in. That is documented at [`HazardModel::observe`].
-//! The consequence of the approximation is conservative in the direction
-//! that matters: an unchanged sample still grows `β` (evidence of
-//! durability), but a *changed* sample grows `α`, which moves the rate
-//! estimate up hard.
-//!
-//! # Non-stationarity, and the accidental anti-forgery bound
-//!
-//! DNS data is not stationary: a zone is republished, a CDN moves, a
-//! delegation changes. Evidence from a week ago should not weigh the same as
-//! evidence from a minute ago. So the *evidence* — not the prior — is
-//! exponentially forgotten with time constant
-//! [`HazardConfig::forgetting_secs`]:
-//!
-//! ```text
-//! γ = e^(−h/τ),   a ← γa + w·Y,   b ← γb + w·h
-//! ```
-//!
-//! This has a property that matters for security and that is worth stating
-//! plainly: **forgetting puts a ceiling on accumulated evidence.** With a
-//! fixed sampling interval `h`, `b → w·h/(1 − γ) ≈ w·τ`, so no amount of
-//! refreshes — honest or forged — can drive the model past `τ` seconds of
-//! effective exposure, and hence `λ` can never be driven to zero. An
-//! attacker who can answer our refreshes (a cache-poisoning position) cannot
-//! manufacture unbounded confidence that a name never changes, because the
-//! model never accumulates unbounded confidence in anything. The credible
-//! interval stays open, and [`HazardModel::freshness_lcb`] therefore stays
-//! strictly below 1. This is a *structural* defence, not a check bolted on.
-//!
-//! # From a posterior to a decision
-//!
-//! The decision layer must never use the posterior mean. It uses a
-//! one-sided upper credibility bound on `λ` at level `1 − δ`
-//! ([`HazardModel::hazard_upper_bound`]) and evaluates the survival
-//! probability at that worst-case rate:
-//!
-//! ```text
-//! P_LCB(fresh, Δ) = inf        e^(−λΔ) = e^(−λ_hi · Δ)
-//!                   λ∈CI_(1−δ)
-//! ```
-//!
-//! In words: *"even taking the most pessimistic change rate still
-//! consistent with what we have observed, the probability that this data is
-//! still correct `Δ` seconds from now is at least `P_LCB`."* That is a
-//! statement a safety argument can be built on; "the stability score is
-//! 0.93" is not.
-//!
-//! The bound is the exact Chernoff bound on a `Gamma(α, β)` law,
-//! `Pr(Λ ≥ x) ≤ e^(α − βx)·(βx/α)^α` for `x > α/β`, solved for `x`. It is
-//! valid for every `α > 0` (in particular for `α < 1`, i.e. the low-evidence
-//! regime), and it returns `+∞` — hence `P_LCB = 0`, hence "never serve
-//! stale" — when there is no information at all. Small samples *must* be
-//! conservative, and here they are, by construction rather than by a
-//! threshold someone picked.
-//!
-//! # What is deliberately absent
-//!
-//! No "change count", no "true stability", no per-entry score. The model
-//! reports a distribution over a rate, and a probability, and both are
-//! falsifiable against observed outcomes — which is what makes
-//! [`crate::calibration`] meaningful.
+//! Calibrate against observed content equality before and after refresh,
+//! separately from any DNSSEC authentication claim. Failures age the evidence
+//! and must never be counted as unchanged observations.
 
 use core::fmt;
 
@@ -421,13 +309,11 @@ impl HazardModel {
         exp_nonpos(-lambda * delta_secs).clamp(0.0, 1.0)
     }
 
-    /// The exact Bayesian posterior-predictive probability of no change over
+    /// Predictive probability under the approximate Gamma model over
     /// `delta_secs`, `(β / (β + Δ))^α`.
     ///
-    /// Reported alongside [`HazardModel::freshness_lcb`] because the gap
-    /// between the two *is* the price of the guarantee: the LCB is what the
-    /// decision uses, the predictive mean is what a calibration study
-    /// measures against reality.
+    /// This is exact for the fitted Gamma law, not for the binary interval
+    /// likelihood or real-world content authenticity.
     pub fn freshness_predictive(&self, delta_secs: f64) -> f64 {
         if delta_secs <= 0.0 {
             return 1.0;
@@ -541,18 +427,10 @@ impl HazardModel {
     ///   This is where authenticity enters the statistics instead of being
     ///   bolted on as a separate gate.
     ///
-    /// # The first-order approximation, stated honestly
-    ///
-    /// The exact likelihood of an unchanged sample is `e^(−λh)`, whose
-    /// information about `λ` is `O(h²)` — second order. The Gamma update used
-    /// here adds `h` to `β` for *every* sample, `Y = 0` included. That
-    /// over-states the information in an unchanged sample when `λh` is not
-    /// small. Two things bound the damage: `β` saturates at `τ` (see the
-    /// module documentation), and the bias is in the direction of *more*
-    /// confidence, which is why the decision layer uses the upper bound
-    /// rather than the mean. A set whose true `λh` is not small is, by
-    /// definition, one that changes between samples — i.e. one whose
-    /// observations are mostly `Y = 1`, where the approximation is exact.
+    /// This Gamma update treats a binary changed observation as one event.
+    /// For Y=0, exp(-lambda*h) contributes exposure. For Y=1, the correct
+    /// factor is 1-exp(-lambda*h), not lambda*h*exp(-lambda*h). No exact
+    /// conjugacy or conservative coverage follows from this approximation.
     pub fn observe(
         &mut self,
         interval_secs: f64,

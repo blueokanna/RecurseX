@@ -79,13 +79,8 @@ pub struct EngineConfig {
     pub edns_udp_size: u16,
     /// Whether to request and validate DNSSEC.
     pub dnssec: bool,
-    /// Whether a DNSSEC trust anchor is configured.
-    ///
-    /// This is the difference between `CryptoVerified` and `ChainAnchored`
-    /// in [`crate::risk::TrustLevel`], and it defaults to `false` because
-    /// this build ships **no** root trust anchor. Claiming `ChainAnchored`
-    /// without one is exactly the over-claim the honest DNSSEC ladder exists
-    /// to prevent, so the flag cannot be inferred from `dnssec`.
+    /// Legacy compatibility flag. Ignored: only a completed chain validator
+    /// may establish root-anchored authentication, which is not implemented.
     pub dnssec_anchored: bool,
     /// The per-resolution work envelope.
     ///
@@ -123,6 +118,9 @@ pub struct EngineConfig {
     pub decorrelate_refresh: bool,
     /// Maximum total wire attempts per query (bounds worst-case latency).
     pub max_total_attempts: u32,
+    /// Trust roots for encrypted upstreams. Empty means fail closed.
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    pub forwarder_roots: courierust::courierust_tls::RootStore,
     /// Forwarding upstreams (when set, queries go through these instead of
     /// iterative resolution).
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
@@ -153,6 +151,8 @@ impl Default for EngineConfig {
             affinity_band: crate::rendezvous::CostBand::default(),
             decorrelate_refresh: true,
             #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+            forwarder_roots: courierust::courierust_tls::RootStore::new(),
+            #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
             forwarders: Vec::new(),
         }
     }
@@ -182,6 +182,7 @@ struct Deadline {
 enum ResolutionCachePolicy {
     Reuse,
     FreshOnly,
+    AfterRefreshFailure,
     Bypass,
 }
 
@@ -354,11 +355,15 @@ pub struct ResolverConfig {
     pub maintenance_interval_ms: u64,
     /// Maximum prefetches spawned per maintenance tick.
     pub max_prefetch_per_tick: usize,
+    /// Maximum entries checked per maintenance tick, independent of cache size.
+    pub max_refresh_candidates_per_tick: usize,
     /// Maximum concurrent background refreshes across the whole resolver.
     /// Serve-stale hits queue refreshes from the request path, so this is
     /// the bound that keeps a stale-heavy query stream from spawning an
     /// unbounded number of threads.
     pub max_concurrent_refreshes: usize,
+    /// Actual DNS exchange and payload budgets shared by background tasks.
+    pub background_limits: crate::background::BackgroundLimits,
     /// Maximum alias entries refreshed alongside one target (see
     /// [`Resolver::refresh_with_dependents`]).
     pub max_chain_refresh: usize,
@@ -387,7 +392,9 @@ impl Default for ResolverConfig {
             max_inflight: 4096,
             maintenance_interval_ms: 1000,
             max_prefetch_per_tick: 64,
+            max_refresh_candidates_per_tick: 256,
             max_concurrent_refreshes: 8,
+            background_limits: crate::background::BackgroundLimits::default(),
             max_chain_refresh: 4,
             stale_serve_ttl: 30,
             #[cfg(feature = "persist")]
@@ -596,13 +603,26 @@ impl SharedState {
     }
 }
 
-/// Holds one background-refresh slot for as long as the refresh thread
-/// lives; releases it on drop, including when that thread unwinds.
-struct RefreshSlot(Resolver);
+/// A task owns both admission and cleanup, including queue rejection/unwind.
+struct RefreshTask {
+    resolver: Resolver,
+    key: CacheKey,
+    generation: u64,
+    queued_at: Instant,
+    failed: bool,
+}
 
-impl Drop for RefreshSlot {
+impl Drop for RefreshTask {
     fn drop(&mut self) {
-        self.0.inner.refreshing.fetch_sub(1, Ordering::AcqRel);
+        let inner = &self.resolver.inner;
+        inner.shared.cache.lock().finish_refresh(
+            &self.key,
+            self.generation,
+            self.failed,
+            inner.clock.now(),
+        );
+        inner.refresh_keys.lock().remove(&self.key);
+        inner.refreshing.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -675,6 +695,27 @@ impl Slot {
                 return r.clone();
             }
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn read_until(&self, deadline: Instant) -> Result<Resolution> {
+        let mut guard = self.result.lock();
+        loop {
+            if let Some(result) = guard.as_ref() {
+                return result.clone();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::new(
+                    ErrorKind::Timeout,
+                    "coalesced background task deadline",
+                ));
+            }
+            guard = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
         }
     }
 }
@@ -828,6 +869,10 @@ pub struct ResolverInner {
     refresh_budget: Mutex<crate::risk::RefreshBudget>,
     /// Live background refreshes (bounded by `max_concurrent_refreshes`).
     refreshing: std::sync::atomic::AtomicU64,
+    exchange_counters: Arc<crate::background::ExchangeCounters>,
+    background_work: Arc<crate::background::BackgroundBudget>,
+    refresh_keys: Mutex<alloc::collections::BTreeSet<CacheKey>>,
+    refresh_sender: Mutex<Option<std::sync::mpsc::SyncSender<RefreshTask>>>,
     /// Set by [`Resolver::shutdown`]: background loops exit at their next
     /// tick instead of running until the process dies.
     shutting_down: std::sync::atomic::AtomicBool,
@@ -910,8 +955,8 @@ impl Resolver {
             .unwrap_or(0);
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let mut forwarder_set = crate::forward::ForwarderSet::new(
-            courierust::courierust_tls::RootStore::new(),
-            false,
+            config.engine.forwarder_roots.clone(),
+            true,
             now_secs,
         );
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
@@ -940,6 +985,12 @@ impl Resolver {
                     clock_now,
                 )),
                 refreshing: std::sync::atomic::AtomicU64::new(0),
+                exchange_counters: Arc::new(crate::background::ExchangeCounters::default()),
+                background_work: Arc::new(crate::background::BackgroundBudget::new(
+                    config.background_limits,
+                )),
+                refresh_keys: Mutex::new(alloc::collections::BTreeSet::new()),
+                refresh_sender: Mutex::new(None),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 rng: Mutex::new(rng),
                 rng_rekeys: std::sync::atomic::AtomicU64::new(0),
@@ -969,24 +1020,13 @@ impl Resolver {
         self.inner.rng_rekeys.load(Ordering::Relaxed)
     }
 
-    /// The honest DNSSEC trust level of an answer, given whether it was
-    /// validated.
-    ///
-    /// `validated == true` is **not** the same as `ChainAnchored`: this build
-    /// ships no root trust anchor, so a verified signature is
-    /// `CryptoVerified` — "the signature verified against a key the parent's
-    /// DS matched" — and only a deployment that installs an anchor can claim
-    /// the answer is chained to the IANA root. Collapsing the two would let
-    /// the `AD` bit and the risk model overstate what was checked.
+    /// Local signature verification never implies a root-anchored chain.
+    /// The legacy configuration boolean has no authority to elevate trust.
     #[cfg(feature = "dnssec")]
     fn trust_level(&self, validated: bool) -> crate::risk::TrustLevel {
         use crate::dnssec::ValidationState;
         let state = if validated {
-            if self.inner.config.engine.dnssec_anchored {
-                ValidationState::ChainAnchored
-            } else {
-                ValidationState::CryptoVerified
-            }
+            ValidationState::CryptoVerified
         } else {
             ValidationState::Insecure
         };
@@ -1000,12 +1040,9 @@ impl Resolver {
         crate::risk::TrustLevel::Unverified
     }
 
-    /// Replace the trust roots used for encrypted forwarders
-    /// (DoT/DoH/DoH3/DoQ). By default encrypted forwarders run with
-    /// certificate verification disabled (an empty root store plus
-    /// `verify: true` would reject every server). To enable real
-    /// verification, supply trust anchors **and** set `verify: true`;
-    /// the hostname and chain are then validated against them.
+    /// Replace encrypted-forwarder trust roots. The default verifies
+    /// certificates and fails closed with no configured roots. Passing
+    /// `verify = false` is an explicit insecure test-only opt-out.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub fn set_forwarder_roots(&self, roots: courierust::courierust_tls::RootStore, verify: bool) {
         let now = std::time::SystemTime::now()
@@ -1081,6 +1118,8 @@ impl Resolver {
 
     /// Resolve a query key.
     pub fn resolve_key(&self, key: &QueryKey) -> Result<Resolution> {
+        let _exchange_scope =
+            crate::background::ExchangeScope::enter(self.inner.exchange_counters.clone());
         let started = Instant::now();
         let now = self.inner.clock.now();
         self.inner.stats.queries.fetch_add(1, Ordering::Relaxed);
@@ -1109,7 +1148,10 @@ impl Resolver {
         let owner = match claim {
             Claim::Waiter(slot) => {
                 self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
-                return slot.read();
+                return match crate::background::task_deadline() {
+                    Some(deadline) => slot.read_until(deadline),
+                    None => slot.read(),
+                };
             }
             Claim::Owner(owner) => owner,
         };
@@ -1326,16 +1368,9 @@ impl Resolver {
             qr: true,
             rd: query.flags.rd,
             ra: true,
-            // The `AD` bit is a *public assertion* that the answer is
-            // authentic, and it is set only for a chain anchored in a
-            // configured trust anchor. A signature-verified answer without
-            // an anchor is reported internally as authenticated (it feeds
-            // the risk model) but not advertised: telling a client `AD` when
-            // the delegation itself was never proven would overstate what
-            // the resolver checked, and RFC 4035 §3.2.3 does not permit it.
-            ad: res.validated
-                && self.inner.config.engine.dnssec_anchored
-                && (want_dnssec || query.flags.ad),
+            // No complete root-to-answer validator exists yet. Neither a
+            // public bool nor a local signature check authenticates the chain.
+            ad: false,
             cd: query.flags.cd,
             rcode: res.rcode,
             ..HeaderFlags::default()
@@ -1399,13 +1434,38 @@ impl Resolver {
             .fetch_add(1, Ordering::Relaxed);
 
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-        let mut res = if self.forward_route(key).is_some() {
-            self.forward_resolve(key)?
+        let upstream = if self.forward_route(key).is_some() {
+            self.forward_resolve(key)
         } else {
-            self.iterative_resolve(key, ns_depth, deadline, budget)?
+            self.iterative_resolve(key, ns_depth, deadline, budget)
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
-        let mut res = self.iterative_resolve(key, ns_depth, deadline, budget)?;
+        let upstream = self.iterative_resolve(key, ns_depth, deadline, budget);
+        let mut res = match upstream {
+            Ok(res) => res,
+            Err(error) => {
+                if cache_policy == ResolutionCachePolicy::Reuse
+                    && self.inner.config.planner.stale_policy
+                        == crate::planner::StalePolicy::OnRefreshFailure
+                    && matches!(
+                        error.kind,
+                        ErrorKind::Timeout
+                            | ErrorKind::Io
+                            | ErrorKind::NoUpstream
+                            | ErrorKind::Servfail
+                    )
+                {
+                    if let Some(res) = self.resolve_from_cache(
+                        key,
+                        self.inner.clock.now(),
+                        ResolutionCachePolicy::AfterRefreshFailure,
+                    ) {
+                        return Ok(res);
+                    }
+                }
+                return Err(error);
+            }
+        };
         res.served_at = now;
 
         #[cfg(feature = "dnssec")]
@@ -1442,6 +1502,9 @@ impl Resolver {
         match ruled {
             Some(g) if !g.is_empty() => Some(g),
             _ if !groups.default.is_empty() => Some(groups.default.as_slice()),
+            _ if !self.inner.config.engine.forwarders.is_empty() => {
+                Some(self.inner.config.engine.forwarders.as_slice())
+            }
             _ => None,
         }
     }
@@ -1587,7 +1650,15 @@ impl Resolver {
                     }
                 }
                 LookupOutcome::Stale(entry) => {
-                    if cache_policy != ResolutionCachePolicy::Reuse {
+                    if !matches!(
+                        cache_policy,
+                        ResolutionCachePolicy::Reuse | ResolutionCachePolicy::AfterRefreshFailure
+                    ) || self.inner.config.planner.stale_policy
+                        == crate::planner::StalePolicy::Disabled
+                        || (self.inner.config.planner.stale_policy
+                            == crate::planner::StalePolicy::OnRefreshFailure
+                            && cache_policy != ResolutionCachePolicy::AfterRefreshFailure)
+                    {
                         return None;
                     }
                     let ctx = crate::planner::StaleContext::from_entry(
@@ -1690,7 +1761,7 @@ impl Resolver {
             let ctx = crate::planner::StaleContext {
                 consequence: worst_consequence,
                 trust: self.trust_level(validated),
-                freshness_lcb: provenance.bound(),
+                freshness_lcb: provenance.joint_lower_bound(),
                 staleness_secs: max_staleness_secs,
                 value_ms,
             };
@@ -1703,11 +1774,12 @@ impl Resolver {
                 });
             let plan = if has_evidence {
                 let mut ledger = self.inner.risk.lock();
-                planner.plan(
+                planner.plan_after_refresh(
                     &LookupOutcome::Stale(representative.clone()),
                     now,
                     Some(&ctx),
                     &mut ledger,
+                    cache_policy == ResolutionCachePolicy::AfterRefreshFailure,
                 )
             } else {
                 crate::planner::Plan::Resolve
@@ -1727,6 +1799,16 @@ impl Resolver {
                     .stale_risk_refused
                     .fetch_add(1, Ordering::Relaxed);
                 return None;
+            }
+            self.inner
+                .stats
+                .served_stale
+                .fetch_add(1, Ordering::Relaxed);
+            {
+                let mut cache = self.inner.shared.cache.lock();
+                for entry in &stale_entries {
+                    cache.record_stale_service(&entry.key, entry.generation);
+                }
             }
             for k in refresh_keys {
                 self.refresh_with_dependents(&k, self.inner.config.max_chain_refresh);
@@ -2650,58 +2732,131 @@ impl Resolver {
     /// mark and records the failure, so one bad refresh does not disable
     /// prefetch for that entry forever.
     pub fn queue_background_refresh(&self, key: &CacheKey) -> bool {
+        let generation = self.inner.shared.cache.lock().generation(key);
+        generation.is_some_and(|generation| self.queue_refresh_version(key, generation))
+    }
+
+    fn queue_refresh_version(&self, key: &CacheKey, generation: u64) -> bool {
+        if self.inner.refresh_keys.lock().contains(key) {
+            self.inner
+                .stats
+                .refresh_duplicate_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.inner.shutting_down.load(Ordering::Acquire) || !self.acquire_refresh_slot() {
+            return false;
+        }
+        // This set also prevents duplicates if an entry is replaced while its
+        // earlier generation is still resolving. Cache refreshing alone cannot.
+        if !self.inner.refresh_keys.lock().insert(key.clone()) {
+            self.inner
+                .stats
+                .refresh_duplicate_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner.refreshing.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        let task = RefreshTask {
+            resolver: self.clone(),
+            key: key.clone(),
+            generation,
+            queued_at: Instant::now(),
+            failed: false,
+        };
         {
             let mut cache = self.inner.shared.cache.lock();
-            if !cache.mark_refreshing(key) {
+            if !cache.refresh_version_is_live(key, generation, self.inner.clock.now())
+                || !cache.mark_refreshing_generation(key, generation)
+            {
                 return false;
             }
         }
-        if !self.acquire_refresh_slot() {
-            self.inner.shared.cache.lock().clear_refreshing(key);
-            return false;
-        }
-        // The refresh budget bounds the *rate at which we may ask upstream*,
-        // a different resource from the risk budget's bound on what we may
-        // tell a client. Charging it at the single point where a refresh is
-        // actually spawned is what makes `sum rho_i <= B_refresh` true by
-        // construction rather than on average — every caller (maintenance
-        // prefetch, serve-stale refresh, dependency propagation) funnels
-        // through here.
-        let now = self.inner.clock.now();
-        if self.inner.refresh_budget.lock().take(1, now) == 0 {
-            self.inner.shared.cache.lock().clear_refreshing(key);
-            self.inner.refreshing.fetch_sub(1, Ordering::AcqRel);
+        if self
+            .inner
+            .refresh_budget
+            .lock()
+            .take(1, self.inner.clock.now())
+            == 0
+        {
             self.inner
                 .stats
                 .refresh_budget_denied
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        self.inner.stats.prefetches.fetch_add(1, Ordering::Relaxed);
-        let this = self.clone();
-        let key = key.clone();
-        let _ = std::thread::Builder::new()
-            .name("dns-refresh".into())
-            .spawn(move || {
-                let _slot = RefreshSlot(this.clone());
-                match this.refresh_key(key.clone()) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        let now = this.inner.clock.now();
-                        this.inner
-                            .shared
-                            .cache
-                            .lock()
-                            .record_refresh_failure(&key, now);
-                    }
-                }
-            });
-        true
+        let sender = self.refresh_sender();
+        let Some(sender) = sender else {
+            return false;
+        };
+        match sender.try_send(task) {
+            Ok(()) => {
+                self.inner.stats.prefetches.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false, // Dropping the task clears its mark and slot.
+        }
+    }
+
+    /// Lazily create a fixed pool. Idle workers hold no Resolver Arc, so
+    /// dropping the last resolver closes the queue and terminates the pool.
+    fn refresh_sender(&self) -> Option<std::sync::mpsc::SyncSender<RefreshTask>> {
+        let mut sender = self.inner.refresh_sender.lock();
+        if let Some(existing) = sender.as_ref() {
+            return Some(existing.clone());
+        }
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        let count = self.inner.config.max_concurrent_refreshes;
+        if count == 0 {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RefreshTask>(count);
+        let receiver = Arc::new(std::sync::Mutex::new(rx));
+        let mut workers = 0;
+        for index in 0..count {
+            let receiver = receiver.clone();
+            let result = std::thread::Builder::new()
+                .name(format!("dns-refresh-{index}"))
+                .spawn(move || loop {
+                    let task = receiver.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    let Ok(mut task) = task else {
+                        break;
+                    };
+                    // Catch task panics so one bad refresh does not kill the pool.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let resolver = task.resolver.clone();
+                        if resolver.inner.shutting_down.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if resolver.inner.shared.cache.lock().generation(&task.key)
+                            != Some(task.generation)
+                        {
+                            return;
+                        }
+                        resolver.inner.stats.refresh_queue_ns.fetch_add(
+                            task.queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                            Ordering::Relaxed,
+                        );
+                        task.failed = true;
+                        task.failed = resolver.refresh_key(task.key.clone()).is_err();
+                    }));
+                });
+            if result.is_ok() {
+                workers += 1;
+            }
+        }
+        if workers == 0 {
+            return None;
+        }
+        *sender = Some(tx.clone());
+        Some(tx)
     }
 
     /// Take one of the `max_concurrent_refreshes` slots, if any is free.
     fn acquire_refresh_slot(&self) -> bool {
-        let max = self.inner.config.max_concurrent_refreshes.max(1) as u64;
+        let max = self.inner.config.max_concurrent_refreshes as u64;
         let mut cur = self.inner.refreshing.load(Ordering::Relaxed);
         loop {
             if cur >= max {
@@ -2713,10 +2868,27 @@ impl Resolver {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    self.inner
+                        .stats
+                        .refresh_peak
+                        .fetch_max(cur + 1, Ordering::Relaxed);
+                    return true;
+                }
                 Err(seen) => cur = seen,
             }
         }
+    }
+
+    /// All upstream exchange attempts and known DNS payload bytes, including
+    /// forwarding, retries, TCP fallback and background work.
+    pub fn exchange_work(&self) -> (u64, u64) {
+        self.inner.exchange_counters.snapshot()
+    }
+
+    /// Actual background DNS work and sends denied before dispatch.
+    pub fn background_work(&self) -> (crate::budget::Work, u64) {
+        self.inner.background_work.snapshot()
     }
 
     /// Live background refreshes (diagnostics).
@@ -2743,7 +2915,12 @@ impl Resolver {
     /// the same bounded, de-duplicated refresh path.
     pub fn refresh_with_dependents(&self, key: &CacheKey, max_dependents: usize) {
         self.queue_background_refresh(key);
-        let dependents = self.inner.shared.aliases.lock().dependents(key);
+        let dependents = self
+            .inner
+            .shared
+            .aliases
+            .lock()
+            .dependents_bounded(key, max_dependents);
         let mut queued = 0usize;
         for dep_key in dependents {
             if queued >= max_dependents {
@@ -2762,6 +2939,13 @@ impl Resolver {
     }
 
     fn refresh_key(&self, key: CacheKey) -> Result<()> {
+        let _exchange_scope =
+            crate::background::ExchangeScope::enter(self.inner.exchange_counters.clone());
+        let scope = crate::background::TaskScope::enter(
+            self.inner.background_work.clone(),
+            self.inner.config.engine.fetch_limits,
+            self.inner.config.engine.query_budget_ms,
+        );
         let qk = QueryKey {
             name: key.name.clone(),
             rr_type: key.rr_type,
@@ -2770,8 +2954,18 @@ impl Resolver {
             want_dnssec: self.inner.config.engine.dnssec,
             cd: false,
         };
+        let claim = self.inner.inflight.lock().claim(&qk, &self.inner);
+        let owner = match claim {
+            Claim::Waiter(slot) => {
+                self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
+                return slot
+                    .read_until(crate::background::task_deadline().unwrap_or_else(Instant::now))
+                    .map(|_| ());
+            }
+            Claim::Owner(owner) => owner,
+        };
         let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
-        let res = self.resolve_inner(
+        let result = self.resolve_inner(
             &qk,
             0,
             // A background refresh is its own query and gets its own budget;
@@ -2779,10 +2973,17 @@ impl Resolver {
             Deadline::after(self.inner.config.engine.query_budget_ms),
             &mut budget,
             ResolutionCachePolicy::Bypass,
-        )?;
-        let now = self.inner.clock.now();
-        self.cache_resolution(&qk, &res, now);
-        Ok(())
+        );
+        let work = scope.work();
+        owner.publish(result.clone());
+        if work.subqueries > 0 {
+            self.inner
+                .shared
+                .cache
+                .lock()
+                .record_refresh_cost(&key, work.subqueries as f64 + work.bytes as f64 / 4096.0);
+        }
+        result.map(|_| ())
     }
 
     fn root_endpoints(&self) -> Vec<Endpoint> {
@@ -2801,6 +3002,102 @@ impl Resolver {
     // -----------------------------------------------------------------
     // Maintenance
     // -----------------------------------------------------------------
+
+    /// One bounded maintenance pass. Cache and estimator locks are never nested.
+    pub fn schedule_refresh_tick(&self, now: Ts) -> usize {
+        let config = &self.inner.config;
+        let wait = Instant::now();
+        let mut cache = self.inner.shared.cache.lock();
+        self.inner.stats.refresh_cache_wait_ns.fetch_add(
+            wait.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        let held = Instant::now();
+        let snapshots = cache.refresh_snapshots(
+            now,
+            config.max_refresh_candidates_per_tick,
+            config
+                .maintenance_interval_ms
+                .max(1)
+                .saturating_mul(1_000_000) as Ts,
+        );
+        self.inner
+            .stats
+            .refresh_index_len
+            .store(cache.refresh_index_len() as u64, Ordering::Relaxed);
+        drop(cache);
+        self.inner.stats.refresh_cache_hold_ns.fetch_add(
+            held.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        self.inner
+            .stats
+            .refresh_candidates
+            .fetch_add(snapshots.len() as u64, Ordering::Relaxed);
+        if config.max_prefetch_per_tick == 0 {
+            return 0;
+        }
+        let policy = config.planner.prefetch_policy();
+        let supplied: Vec<_> = {
+            let est = self.inner.shared.estimator.lock();
+            snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    let apex = snapshot.key.name.apex();
+                    let inputs = crate::cache::RefreshInputs {
+                        query_probability: est.probability(&apex, now, policy.horizon_secs),
+                        value_ms: est.est_cost_ms(&apex),
+                    };
+                    (snapshot, inputs)
+                })
+                .collect()
+        };
+        let fingerprint = if config.engine.decorrelate_refresh {
+            Some(&self.inner.fingerprint)
+        } else {
+            self.inner
+                .stats
+                .refresh_undecorrelated
+                .fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let candidates = crate::cache::rank_refresh_snapshots(
+            supplied,
+            &policy,
+            config.cache.refresh_scheduling,
+            fingerprint,
+            config.max_prefetch_per_tick,
+            now,
+        );
+        let mut queued = 0;
+        for candidate in candidates {
+            if queued >= config.max_prefetch_per_tick {
+                break;
+            }
+            if self.queue_refresh_version(&candidate.key, candidate.generation) {
+                queued += 1;
+                let dependents = self
+                    .inner
+                    .shared
+                    .aliases
+                    .lock()
+                    .dependents_bounded(&candidate.key, config.max_chain_refresh);
+                for dependent in dependents {
+                    if queued >= config.max_prefetch_per_tick {
+                        break;
+                    }
+                    if self.queue_background_refresh(&dependent) {
+                        queued += 1;
+                    }
+                }
+            }
+        }
+        self.inner
+            .stats
+            .refresh_scheduled
+            .fetch_add(queued as u64, Ordering::Relaxed);
+        queued
+    }
 
     /// Spawn the background maintenance task (cache sweep, graph prune,
     /// predictive prefetch). Returns the thread handle.
@@ -2831,7 +3128,11 @@ impl Resolver {
                 slept = 0;
                 let r = &this;
                 let now = r.inner.clock.now();
-                r.inner.shared.cache.lock().sweep(now);
+                r.inner
+                    .shared
+                    .cache
+                    .lock()
+                    .sweep_negative_bounded(now, r.inner.config.max_refresh_candidates_per_tick);
                 {
                     let mut aliases = r.inner.shared.aliases.lock();
                     aliases.prune(now, 0);
@@ -2861,56 +3162,7 @@ impl Resolver {
                             .store(pool.evicted(), Ordering::Relaxed);
                     }
                 }
-                let candidates = {
-                    let mut cache = r.inner.shared.cache.lock();
-                    let est = r.inner.shared.estimator.lock();
-                    let policy = r.inner.config.planner.prefetch_policy();
-                    // The budget goes *into* the scheduler rather than being
-                    // applied as a `take` afterwards, because the per-class
-                    // reservation is stated over the budget: a prefix of an
-                    // un-reserved ranking is precisely the starvation the
-                    // reservation exists to prevent.
-                    //
-                    // `Some(&r.inner.fingerprint)` is not decoration either.
-                    // Equal values are the normal case at the top of a tick —
-                    // entries written at the same instant have identical models
-                    // — and with `None` those ties fall back to the cache's
-                    // iteration order, which is name order, which is the same
-                    // order on every resolver in the fleet and predictable to an
-                    // observer. The switch exists so that the `None` branch is
-                    // reachable and therefore observable; it is not a tuning
-                    // knob and defaults to decorrelated.
-                    let key = if r.inner.config.engine.decorrelate_refresh {
-                        Some(&r.inner.fingerprint)
-                    } else {
-                        None
-                    };
-                    if key.is_none() {
-                        r.inner
-                            .stats
-                            .refresh_undecorrelated
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    cache.refresh_schedule(
-                        &policy,
-                        key,
-                        r.inner.config.max_prefetch_per_tick,
-                        now,
-                        |apex, horizon| crate::cache::RefreshInputs {
-                            query_probability: est.probability(apex, now, horizon),
-                            value_ms: est.est_cost_ms(apex),
-                        },
-                    )
-                };
-                if !candidates.is_empty() {
-                    r.inner
-                        .stats
-                        .refresh_scheduled
-                        .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-                }
-                for key in candidates {
-                    r.refresh_with_dependents(&key, r.inner.config.max_chain_refresh);
-                }
+                r.schedule_refresh_tick(now);
                 #[cfg(feature = "persist")]
                 if save_interval > 0 && last_save.elapsed().as_millis() as u64 >= save_interval {
                     let _ = r.persist_cache();
@@ -2937,6 +3189,7 @@ impl Resolver {
     /// they finish and then the process can exit.
     pub fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
+        self.inner.refresh_sender.lock().take();
     }
 
     /// Whether a shutdown has been requested.
@@ -3063,6 +3316,198 @@ mod tests {
             cache.insert_positive(&key, answer, inserted, inputs, true);
         }
         key
+    }
+
+    fn wait_for_refreshes(resolver: &Resolver) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while resolver.refreshes_in_flight() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(resolver.refreshes_in_flight(), 0);
+    }
+
+    #[test]
+    fn refresh_pool_deduplicates_across_replacement_and_shutdown() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut cfg = ResolverConfig::default();
+        cfg.engine.root_servers = vec![socket.local_addr().unwrap()];
+        cfg.engine.timeout_ms = 100;
+        cfg.engine.query_budget_ms = 200;
+        cfg.max_concurrent_refreshes = 1;
+        let resolver = Resolver::new(cfg);
+        let name = Name::from_ascii("pool.example").unwrap();
+        let key = insert_well_observed_stale_address(&resolver, &name);
+        assert!(resolver.queue_background_refresh(&key));
+        socket.recv_from(&mut [0; 512]).unwrap();
+        assert!(!resolver.queue_background_refresh(&key));
+        resolver.shared().cache.lock().insert_positive(
+            &key,
+            RrSet::a("pool.example", "192.0.2.9", 60),
+            resolver.now(),
+            crate::cache::score::ScoreInputs::default(),
+            false,
+        );
+        assert!(
+            !resolver.queue_background_refresh(&key),
+            "replacement must not permit overlapping refreshes"
+        );
+        resolver.shutdown();
+        wait_for_refreshes(&resolver);
+        assert!(!resolver.queue_background_refresh(&key));
+        assert!(
+            !resolver
+                .shared()
+                .cache
+                .lock()
+                .iter_entries()
+                .find(|e| e.key == key)
+                .unwrap()
+                .refreshing
+        );
+    }
+
+    #[test]
+    fn disconnected_refresh_queue_clears_ownership() {
+        let resolver = offline_resolver();
+        let key = insert_well_observed_stale_address(
+            &resolver,
+            &Name::from_ascii("queue.example").unwrap(),
+        );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        *resolver.inner.refresh_sender.lock() = Some(sender);
+        assert!(!resolver.queue_background_refresh(&key));
+        assert_eq!(resolver.refreshes_in_flight(), 0);
+        assert!(resolver.inner.refresh_keys.lock().is_empty());
+        assert!(resolver.shared().cache.lock().mark_refreshing(&key));
+    }
+
+    #[test]
+    fn task_unwind_releases_its_version_and_slot() {
+        let resolver = offline_resolver();
+        let key = insert_well_observed_stale_address(
+            &resolver,
+            &Name::from_ascii("unwind.example").unwrap(),
+        );
+        let generation = resolver.shared().cache.lock().generation(&key).unwrap();
+        assert!(resolver.acquire_refresh_slot());
+        resolver.inner.refresh_keys.lock().insert(key.clone());
+        resolver.shared().cache.lock().mark_refreshing(&key);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _task = RefreshTask {
+                resolver: resolver.clone(),
+                key: key.clone(),
+                generation,
+                queued_at: Instant::now(),
+                failed: true,
+            };
+            panic!("injected worker failure");
+        }));
+        assert_eq!(resolver.refreshes_in_flight(), 0);
+        assert!(resolver.inner.refresh_keys.lock().is_empty());
+        assert!(resolver.shared().cache.lock().mark_refreshing(&key));
+    }
+
+    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    #[test]
+    fn background_work_budget_covers_forwarder_retries_on_the_wire() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut buf = [0; 4096];
+            let (n, source) = socket.recv_from(&mut buf).unwrap();
+            let query = Message::parse(&buf[..n]).unwrap();
+            let mut response = Message::new(query.id);
+            response.flags.qr = true;
+            response.flags.rcode = Rcode::SERVFAIL;
+            response.questions = query.questions;
+            socket
+                .send_to(&response.to_bytes().unwrap(), source)
+                .unwrap();
+            assert!(
+                socket.recv_from(&mut buf).is_err(),
+                "budget must stop the retry before sending"
+            );
+        });
+        let mut cfg = ResolverConfig::default();
+        let forwarder =
+            crate::forward::Forwarder::plain(Endpoint::new(addr.ip(), addr.port(), Proto::Udp));
+        cfg.engine.forwarders = vec![forwarder.clone(), forwarder];
+        cfg.engine.timeout_ms = 100;
+        cfg.background_limits.exchanges_per_second = 1;
+        let resolver = Resolver::new(cfg);
+        let key = insert_well_observed_stale_address(
+            &resolver,
+            &Name::from_ascii("budget.example").unwrap(),
+        );
+        assert!(resolver.refresh_key(key).is_err());
+        assert_eq!(resolver.background_work().0.subqueries, 1);
+        assert_eq!(resolver.exchange_work().0, 1);
+        assert_eq!(resolver.background_work().1, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn coalesced_refresh_wait_obeys_its_deadline() {
+        let slot = Slot::new();
+        assert_eq!(
+            slot.read_until(Instant::now()).unwrap_err().kind,
+            ErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn stale_defaults_off_and_failure_mode_waits_for_current_attempt() {
+        for mode in [
+            crate::planner::StalePolicy::Disabled,
+            crate::planner::StalePolicy::OnRefreshFailure,
+        ] {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut cfg = ResolverConfig::default();
+            cfg.engine.root_servers = vec![socket.local_addr().unwrap()];
+            cfg.engine.timeout_ms = 5;
+            cfg.engine.query_budget_ms = 10;
+            cfg.max_concurrent_refreshes = 0;
+            cfg.planner.stale_policy = mode;
+            cfg.planner.risk.base_min_freshness = 0.0;
+            let resolver = Resolver::new(cfg);
+            let name = Name::from_ascii("stale.example").unwrap();
+            let key = insert_well_observed_stale_address(&resolver, &name);
+            let query = QueryKey {
+                name: name.clone(),
+                rr_type: RrType::A,
+                class: RrClass::IN,
+                ecs: None,
+                want_dnssec: false,
+                cd: false,
+            };
+            assert!(resolver
+                .resolve_from_cache(&query, resolver.now(), ResolutionCachePolicy::Reuse)
+                .is_none());
+            assert_eq!(resolver.stats_snapshot().served_stale, 0);
+            let result = resolver.resolve(&name, RrType::A);
+            if mode == crate::planner::StalePolicy::Disabled {
+                assert!(result.is_err());
+            } else {
+                let result = result.unwrap();
+                assert!(result.stale);
+                assert_eq!(result.ttl, 30);
+                assert!(
+                    !resolver
+                        .build_response(&Message::query(1, name, RrType::A, true), &result)
+                        .flags
+                        .ad
+                );
+                assert_eq!(resolver.stats_snapshot().served_stale, 1);
+            }
+            assert!(!resolver.queue_background_refresh(&key)); // zero workers disables submissions
+        }
     }
 
     /// The deadline is the bound that makes the worst case finite, so it has to
@@ -3279,6 +3724,7 @@ mod tests {
     #[test]
     fn stale_target_uses_the_consequence_of_its_cname_chain() {
         let mut cfg = ResolverConfig::default();
+        cfg.planner.stale_policy = crate::planner::StalePolicy::ImmediateExperimental;
         cfg.planner.risk.refresh_capacity = 0.0;
         let r = Resolver::new(cfg);
         let alias_name = Name::from_ascii("a.example.com").unwrap();
@@ -3634,7 +4080,7 @@ mod tests {
         anchored_cfg.engine.root_servers = vec!["127.0.0.1:1".parse().unwrap()];
         anchored_cfg.engine.dnssec_anchored = true;
         let anchored = Resolver::new(anchored_cfg);
-        assert!(anchored.build_response(&asked, &res).flags.ad);
+        assert!(!anchored.build_response(&asked, &res).flags.ad);
         // ...and still only when the client asked for it.
         assert!(!anchored.build_response(&q, &res).flags.ad);
         // An answer that was not validated never earns AD, anchor or not.

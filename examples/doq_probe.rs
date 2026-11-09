@@ -2,6 +2,7 @@
 //! RFC 9250 server and prints every error verbatim. Used to debug the
 //! built-in QUIC client without the resolver's fallback logic.
 //!
+//! Set RECURSEX_CA_FILE to a PEM trust bundle before running.
 //! Run: `cargo run --example doq_probe [name]`
 
 use recurse_x::transport::DnsTransport;
@@ -24,12 +25,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = Message::query((std::process::id() & 0xffff) as u16, name, RrType::A, true);
     let bytes = query.to_bytes()?;
     let ep = Endpoint::new(server.parse()?, 853, Proto::DoQ);
-    let t = DoqTransport::for_host(
-        server_name,
-        courierust::courierust_tls::RootStore::new(),
-        false,
-        0,
-    );
+    let mut roots = courierust::courierust_tls::RootStore::new();
+    roots
+        .add_pem_file(
+            std::env::var("RECURSEX_CA_FILE")
+                .map_err(|_| "set RECURSEX_CA_FILE to a PEM trust bundle")?,
+        )
+        .map_err(|e| format!("trust roots: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let t = DoqTransport::for_host(server_name, roots, true, now);
     let started = std::time::Instant::now();
     match t.exchange(&bytes, &ep, 10_000) {
         Ok(resp) => {

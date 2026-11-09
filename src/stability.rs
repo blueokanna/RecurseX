@@ -1,42 +1,9 @@
-//! The per-RRset refresh model.
+//! Per-RRset state for the approximate observable-content change model.
 //!
-//! # What this used to be, and why it changed
-//!
-//! This module used to hold an EWMA "stability score" in `0..1`, built from
-//! a count of refreshes and a count of changes. It had three defects that no
-//! amount of weight tuning fixes, and they are worth naming because they are
-//! why the replacement is a different kind of object:
-//!
-//! 1. **It was not a probability.** Nothing could be said about what `0.93`
-//!    meant, so the thresholds compared against it were arbitrary, and they
-//!    silently encoded the traffic the weights had been fitted on.
-//! 2. **It ignored the sampling cadence.** Ten looks at a name spaced two
-//!    seconds apart and ten looks spread over ten hours produced the same
-//!    score. They are not the same evidence.
-//! 3. **It could not be conservative.** An EWMA starts from a neutral `0.5`
-//!    and moves toward what it has seen, so a name observed twice and never
-//!    changed looked *more* trustworthy the less it had been watched.
-//!
-//! The replacement is [`crate::hazard`]: a posterior over the *rate* at
-//! which the RRset changes, and a one-sided credibility bound on that rate.
-//! Everything in this module exists to hold one of those per cache entry and
-//! to answer the questions the cache and the decision layer ask, in the
-//! units they need:
-//!
-//! * "Is the data I hold still correct, conservatively?" →
-//!   [`StabilityModel::freshness_lcb`].
-//! * "When should I look again?" → [`StabilityModel::next_interval_secs`].
-//! * "How durable is this, for ranking?" →
-//!   [`StabilityModel::durability_score`], which is explicitly *not* a
-//!   decision input.
-//!
-//! # Nothing here is a "stability"
-//!
-//! The word survives in the type name only because renaming it would churn
-//! every call site for no semantic gain. There is no stability scalar: there
-//! is a rate, a bound on the rate, and probabilities derived from them. A
-//! count of changes is a *sampling* statistic — [`StabilityModel::changes`]
-//! — and is kept for diagnostics, never for decisions.
+//! See [`crate::hazard`] for the likelihood mismatch and coverage limitations.
+//! Freshness predictions schedule work; they do not certify authenticity or
+//! rule out changes that revert between samples. The legacy `StabilityModel`
+//! name is retained for API compatibility.
 
 use crate::hazard::{HazardConfig, HazardModel};
 use crate::time::Ts;

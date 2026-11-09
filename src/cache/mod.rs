@@ -18,7 +18,7 @@
 pub mod persist;
 pub mod score;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -68,6 +68,105 @@ pub struct RefreshInputs {
     /// scheduler from spending the same effort on a record whose absence would
     /// cost nothing as on one whose absence costs a second of latency.
     pub value_ms: f64,
+}
+
+/// A scheduling snapshot contains no records or signature material.
+#[derive(Clone, Debug)]
+pub struct RefreshSnapshot {
+    /// Cache identity.
+    pub key: CacheKey,
+    /// Version to validate before committing work.
+    pub generation: u64,
+    /// Expiry of the observed content.
+    pub expires: Ts,
+    stability: StabilityModel,
+    ttl_secs: u32,
+    consequence: Consequence,
+    trust: TrustLevel,
+    cost_ms: f64,
+    refresh_cost: f64,
+}
+
+impl RefreshSnapshot {
+    fn from_entry(entry: &CacheEntry) -> Self {
+        Self {
+            key: entry.key.clone(),
+            generation: entry.generation,
+            expires: entry.expires,
+            stability: entry.stability.clone(),
+            ttl_secs: entry.ttl_secs(),
+            consequence: entry.answer_consequence(),
+            trust: entry.trust_level(),
+            cost_ms: entry.cost_ms,
+            refresh_cost: entry.refresh_cost,
+        }
+    }
+}
+
+/// Pure, lock-free ranking of a bounded candidate batch. Priority is a
+/// resource-allocation heuristic, not a global optimality or safety claim.
+pub fn rank_refresh_snapshots(
+    snapshots: impl IntoIterator<Item = (RefreshSnapshot, RefreshInputs)>,
+    policy: &PrefetchPolicy,
+    scheduling: RefreshScheduling,
+    fingerprint: Option<&crate::behavior::FingerprintKey>,
+    budget: usize,
+    now: Ts,
+) -> Vec<RefreshSnapshot> {
+    let mut candidates = Vec::new();
+    for (entry, supplied) in snapshots {
+        if !policy.wants_refresh(&entry.stability, supplied.query_probability) {
+            continue;
+        }
+        let cfg = crate::voi::VoiConfig {
+            horizon_secs: policy.horizon_secs as f64,
+            ttl_secs: entry.ttl_secs,
+            tail_probability: entry.stability.hazard().config().tail_probability(),
+            observation_weight: if entry.trust == TrustLevel::Unverified {
+                UNVERIFIED_OBSERVATION_TRUST
+            } else {
+                1.0
+            },
+            min_value: scheduling.min_value,
+            reservation_per_class: scheduling.reservation_per_class,
+        };
+        let risk_gain = crate::voi::observation_value(
+            &entry.stability,
+            entry.consequence,
+            entry.trust,
+            supplied.value_ms,
+            now,
+            &cfg,
+        );
+        let service_gain = supplied.query_probability
+            * supplied.value_ms
+            * (1.0 - entry.stability.freshness_lcb(policy.horizon_secs as f64));
+        let value = (service_gain + risk_gain) / entry.refresh_cost.max(1.0);
+        let class = crate::behavior::BehaviorClass::from_model(
+            &entry.stability,
+            entry.consequence,
+            entry.trust,
+            entry.cost_ms,
+        );
+        let tie_break = fingerprint.map_or(0, |key| {
+            crate::behavior::fingerprint_of(key, class, &entry.key.name).as_u128()
+        });
+        candidates.push(crate::voi::Candidate {
+            payload: entry,
+            class,
+            value,
+            tie_break,
+        });
+    }
+    crate::voi::schedule(
+        candidates,
+        budget,
+        &crate::voi::VoiConfig {
+            min_value: scheduling.min_value,
+            reservation_per_class: scheduling.reservation_per_class,
+            ..crate::voi::VoiConfig::default()
+        },
+    )
 }
 
 /// Which policy drives the refresh budget, and how it may be traded.
@@ -291,6 +390,14 @@ pub enum EntryKind {
 pub struct CacheEntry {
     /// The key this entry is stored under.
     pub key: CacheKey,
+    /// Monotonic cache-local write version (never reused after eviction).
+    pub generation: u64,
+    /// Next bounded maintenance check; updated in place in the due index.
+    pub next_check_at: Ts,
+    /// Observed refresh work, in exchanges plus DNS payload bytes / 4096.
+    pub refresh_cost: f64,
+    /// Whether this content version was actually served after expiry.
+    pub served_stale_since_write: bool,
     /// What the entry holds (positive RRset or negative answer).
     pub kind: EntryKind,
     /// When the entry was inserted (or last refreshed).
@@ -577,6 +684,8 @@ pub struct CacheStats {
     pub misses: u64,
     /// Stale entries served (RFC 8767).
     pub stale_served: u64,
+    /// Previously stale-served versions whose next observation differed.
+    pub stale_later_changed: u64,
     /// Entries admitted.
     pub inserts: u64,
     /// Entries evicted.
@@ -599,6 +708,7 @@ pub struct CacheStats {
 struct TierMap {
     map: BTreeMap<CacheKey, CacheEntry>,
     rank: BTreeMap<(u64, CacheKey), ()>,
+    due: BTreeSet<(Ts, CacheKey)>,
     capacity: usize,
 }
 
@@ -607,6 +717,7 @@ impl TierMap {
         Self {
             map: BTreeMap::new(),
             rank: BTreeMap::new(),
+            due: BTreeSet::new(),
             capacity,
         }
     }
@@ -636,6 +747,9 @@ impl TierMap {
     /// Insert (or replace) an entry. When the tier is full and the key is
     /// new, the lowest-scored entry is evicted and returned.
     fn insert(&mut self, entry: CacheEntry) -> Option<CacheEntry> {
+        if self.capacity == 0 {
+            return Some(entry);
+        }
         let victim = if self.capacity > 0
             && !self.map.contains_key(&entry.key)
             && self.map.len() >= self.capacity
@@ -645,17 +759,19 @@ impl TierMap {
             None
         };
         let key = entry.key.clone();
-        if let Some(old) = self.map.remove(&key) {
+        if let Some(old) = self.remove(&key) {
             self.rank.remove(&(score::rank_of(old.score), key.clone()));
         }
         self.rank
             .insert((score::rank_of(entry.score), key.clone()), ());
+        self.due.insert((entry.next_check_at, key.clone()));
         self.map.insert(key, entry);
         victim
     }
 
     fn remove(&mut self, key: &CacheKey) -> Option<CacheEntry> {
         let entry = self.map.remove(key)?;
+        self.due.remove(&(entry.next_check_at, key.clone()));
         self.rank
             .remove(&(score::rank_of(entry.score), key.clone()));
         Some(entry)
@@ -664,7 +780,7 @@ impl TierMap {
     /// Remove and return the lowest-scored entry in the tier.
     fn pop_lowest(&mut self) -> Option<CacheEntry> {
         while let Some(((rank, key), _)) = self.rank.pop_first() {
-            if let Some(entry) = self.map.remove(&key) {
+            if let Some(entry) = self.remove(&key) {
                 debug_assert_eq!(score::rank_of(entry.score), rank);
                 return Some(entry);
             }
@@ -697,6 +813,9 @@ pub struct SemanticCache {
     /// NXDOMAIN store: one entry per name, shared across types.
     nx: BTreeMap<Name, NegativeEntry>,
     stats: CacheStats,
+    next_generation: u64,
+    content_calibration: crate::calibration::Calibration,
+    nx_sweep_cursor: Option<Name>,
 }
 
 /// Sizes only: an entry dump would be megabytes of records and tells a log
@@ -723,6 +842,9 @@ impl SemanticCache {
             cold: TierMap::new(config.cold_capacity),
             nx: BTreeMap::new(),
             stats: CacheStats::default(),
+            next_generation: 0,
+            content_calibration: crate::calibration::Calibration::new(),
+            nx_sweep_cursor: None,
             config,
         }
     }
@@ -845,7 +967,6 @@ impl SemanticCache {
                 return Some(outcome);
             } else if entry.is_stale_servable(now, self.config.stale_window_secs) {
                 self.stats.hits += 1;
-                self.stats.stale_served += 1;
                 let outcome = LookupOutcome::Stale(entry.clone());
                 // Park the expired entry in the cold tier, whose whole job
                 // is to keep stale-servable data around.
@@ -1003,6 +1124,7 @@ impl SemanticCache {
         inputs: score::ScoreInputs,
         validated: bool,
     ) {
+        let generation = self.allocate_generation();
         rrset.ttl = rrset.ttl.min(self.config.max_ttl_cap);
         let expires = now.saturating_add(rrset.ttl as Ts * 1_000_000_000);
         let hazard_cfg = self.config.hazard;
@@ -1018,9 +1140,21 @@ impl SemanticCache {
                 EntryKind::Positive(old) => !old.same_data(&rrset),
                 _ => true,
             };
+            if changed && entry.served_stale_since_write {
+                self.stats.stale_later_changed += 1;
+            }
+            entry.served_stale_since_write = false;
+            let interval =
+                now.saturating_sub(entry.stability.hazard().last_observation()) as f64 / 1e9;
+            if interval > 0.0 {
+                let predicted = entry.stability.hazard().freshness_predictive(interval);
+                self.content_calibration.observe(predicted, !changed);
+            }
             entry
                 .stability
                 .observe_weighted(rrset.ttl, changed, now, trust);
+            entry.generation = generation;
+            entry.next_check_at = now;
             entry.inserted = now;
             entry.expires = expires;
             // A CD=1 (checking disabled) resolution arrives unvalidated, but
@@ -1037,6 +1171,10 @@ impl SemanticCache {
         let entry_ttl = rrset.ttl;
         let mut entry = CacheEntry {
             key: key.clone(),
+            generation,
+            next_check_at: now,
+            refresh_cost: 1.0,
+            served_stale_since_write: false,
             kind: EntryKind::Positive(rrset),
             inserted: now,
             expires,
@@ -1067,13 +1205,20 @@ impl SemanticCache {
         now: Ts,
         inputs: score::ScoreInputs,
     ) {
+        let generation = self.allocate_generation();
         let ttl = authoritative_ttl.min(self.config.negative_ttl_cap);
         let expires = now.saturating_add(ttl as Ts * 1_000_000_000);
         let hazard_cfg = self.config.hazard;
         if let Some(existing) = self.take_entry_any(key) {
             let mut entry = existing;
+            entry.generation = generation;
+            entry.next_check_at = now;
             entry.inserted = now;
             entry.expires = expires;
+            if entry.served_stale_since_write {
+                self.stats.stale_later_changed += 1;
+            }
+            entry.served_stale_since_write = false;
             entry.stability.observe(ttl, true, now); // replacing data counts as a change
             entry.kind = EntryKind::Negative {
                 rcode,
@@ -1087,6 +1232,10 @@ impl SemanticCache {
         }
         let mut entry = CacheEntry {
             key: key.clone(),
+            generation,
+            next_check_at: now,
+            refresh_cost: 1.0,
+            served_stale_since_write: false,
             kind: EntryKind::Negative {
                 rcode,
                 soa,
@@ -1114,7 +1263,11 @@ impl SemanticCache {
     /// insert: a snapshot cannot overflow the tiers, and an entry that was
     /// already expired when it was loaded is parked in the cold tier
     /// (serve-stale), where it belongs.
-    pub fn restore_entry(&mut self, entry: CacheEntry, now: Ts) {
+    pub fn restore_entry(&mut self, mut entry: CacheEntry, now: Ts) {
+        self.take_entry_any(&entry.key);
+        entry.generation = self.allocate_generation();
+        entry.next_check_at = now;
+        entry.refreshing = false;
         if entry.expires <= now {
             self.park(entry);
         } else {
@@ -1218,12 +1371,14 @@ impl SemanticCache {
     /// refresh could never be prefetched again — the entry would sit in the
     /// cache, unreachable by the prefetcher, until it was evicted.
     pub fn record_refresh_failure(&mut self, key: &CacheKey, now: Ts) {
+        let generation = self.allocate_generation();
         if let Some(e) = self
             .hot
             .get_mut(key)
             .or_else(|| self.warm.get_mut(key))
             .or_else(|| self.cold.get_mut(key))
         {
+            e.generation = generation;
             e.stability.record_failure(now);
             e.refreshing = false;
         }
@@ -1260,6 +1415,152 @@ impl SemanticCache {
         }
     }
 
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("cache generation exhausted");
+        self.next_generation
+    }
+
+    /// Read a version without copying any RRset.
+    pub fn generation(&self, key: &CacheKey) -> Option<u64> {
+        [Tier::Hot, Tier::Warm, Tier::Cold]
+            .iter()
+            .find_map(|&tier| self.tier_map(tier).map.get(key).map(|e| e.generation))
+    }
+
+    /// Commit an evaluated snapshot only if its content/model is unchanged.
+    pub fn mark_refreshing_generation(&mut self, key: &CacheKey, generation: u64) -> bool {
+        self.generation(key) == Some(generation) && self.mark_refreshing(key)
+    }
+
+    /// Release only the version this task owns; newer writes are untouched.
+    pub fn finish_refresh(&mut self, key: &CacheKey, generation: u64, failed: bool, now: Ts) {
+        if self.generation(key) != Some(generation) {
+            return;
+        }
+        if failed {
+            self.record_refresh_failure(key, now);
+        } else {
+            self.clear_refreshing(key);
+        }
+    }
+
+    /// Fixed-size monitoring of predicted unchanged content versus observed
+    /// unchanged content. It cannot detect an unobserved A -> B -> A change.
+    pub fn content_calibration(&self) -> &crate::calibration::Calibration {
+        &self.content_calibration
+    }
+
+    /// Mark actual stale service only after the answer passed every gate.
+    pub fn record_stale_service(&mut self, key: &CacheKey, generation: u64) {
+        for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
+            if let Some(entry) = self.tier_map_mut(tier).get_mut(key) {
+                if entry.generation == generation {
+                    entry.served_stale_since_write = true;
+                    self.stats.stale_served += 1;
+                }
+                break;
+            }
+        }
+    }
+
+    /// Revalidate immutable scheduling inputs and expiry before submission.
+    pub fn refresh_version_is_live(&self, key: &CacheKey, generation: u64, now: Ts) -> bool {
+        [Tier::Hot, Tier::Warm, Tier::Cold].iter().any(|&tier| {
+            self.tier_map(tier).map.get(key).is_some_and(|entry| {
+                entry.generation == generation
+                    && !entry.refreshing
+                    && entry
+                        .expires
+                        .saturating_add(self.config.stale_window_secs as Ts * 1_000_000_000)
+                        > now
+            })
+        })
+    }
+
+    /// Store observed refresh work for subsequent cost-normalized ranking.
+    pub fn record_refresh_cost(&mut self, key: &CacheKey, work: f64) {
+        for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
+            if let Some(e) = self.tier_map_mut(tier).get_mut(key) {
+                if work.is_finite() {
+                    e.refresh_cost = work.max(1.0);
+                }
+                break;
+            }
+        }
+    }
+
+    /// One index node per cached entry, never a heap of obsolete versions.
+    pub fn refresh_index_len(&self) -> usize {
+        self.hot.due.len() + self.warm.due.len() + self.cold.due.len()
+    }
+
+    /// Remove/check at most `limit` due entries, copying only scheduling state.
+    /// Model evaluation and estimator access belong outside the cache lock.
+    pub fn refresh_snapshots(
+        &mut self,
+        now: Ts,
+        limit: usize,
+        recheck_ns: Ts,
+    ) -> Vec<RefreshSnapshot> {
+        let mut result = Vec::new();
+        for _ in 0..limit {
+            let next = [Tier::Hot, Tier::Warm, Tier::Cold]
+                .into_iter()
+                .filter_map(|tier| {
+                    self.tier_map(tier)
+                        .due
+                        .first()
+                        .map(|(at, key)| (*at, key.clone(), tier))
+                })
+                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let Some((at, key, tier)) = next else {
+                break;
+            };
+            if at > now {
+                break;
+            }
+            let stale_window = self.config.stale_window_secs as Ts * 1_000_000_000;
+            let map = self.tier_map_mut(tier);
+            map.due.remove(&(at, key.clone()));
+            let entry = map.map.get_mut(&key).expect("due index matches cache");
+            if entry.expires.saturating_add(stale_window) <= now {
+                map.remove(&key);
+                continue;
+            }
+            entry.next_check_at = now.saturating_add(recheck_ns.max(1));
+            map.due.insert((entry.next_check_at, key));
+            if matches!(entry.kind, EntryKind::Positive(_)) && !entry.refreshing {
+                result.push(RefreshSnapshot::from_entry(entry));
+            }
+        }
+        result
+    }
+
+    /// Bounded round-robin expiry maintenance for the separate NXDOMAIN store.
+    pub fn sweep_negative_bounded(&mut self, now: Ts, limit: usize) {
+        use core::ops::Bound::{Excluded, Unbounded};
+        let keys: Vec<Name> = match &self.nx_sweep_cursor {
+            Some(cursor) => self
+                .nx
+                .range((Excluded(cursor.clone()), Unbounded))
+                .take(limit)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            None => self.nx.keys().take(limit).cloned().collect(),
+        };
+        self.nx_sweep_cursor = keys.last().cloned();
+        for key in keys {
+            if self.nx.get(&key).is_some_and(|entry| entry.expires <= now) {
+                self.nx.remove(&key);
+            }
+        }
+    }
+
+    /// Compatibility/offline full-scan API. Production maintenance uses
+    /// `refresh_snapshots` and lock-free `rank_refresh_snapshots` instead.
     /// The observations to spend this tick's refresh budget on, best value
     /// first.
     ///
@@ -1310,69 +1611,27 @@ impl SemanticCache {
     where
         F: Fn(&Name, u32) -> RefreshInputs,
     {
-        let scheduling = self.config.refresh_scheduling;
-        let horizon_secs = policy.horizon_secs as f64;
-        let mut candidates: Vec<crate::voi::Candidate<CacheKey>> = Vec::new();
-        for map in [&self.hot, &self.warm] {
-            for entry in map.values() {
-                if !matches!(entry.kind, EntryKind::Positive(_)) {
-                    continue;
-                }
-                if entry.refreshing {
-                    continue;
-                }
-                let apex = entry.key.name.apex();
-                let supplied = inputs(&apex, policy.horizon_secs);
-                if !policy.wants_refresh(&entry.stability, supplied.query_probability) {
-                    continue;
-                }
-                // The horizon and the tail probability come from the policy and
-                // the model rather than from a second copy of the same setting:
-                // an admissibility gate and a value that disagreed about the
-                // horizon would be pricing a different question than the one
-                // they both admitted the entry for.
-                let cfg = crate::voi::VoiConfig {
-                    horizon_secs,
-                    ttl_secs: entry.ttl_secs(),
-                    tail_probability: entry.stability.hazard().config().tail_probability(),
-                    observation_weight: if entry.validated {
-                        1.0
-                    } else {
-                        UNVERIFIED_OBSERVATION_TRUST
-                    },
-                    min_value: scheduling.min_value,
-                    reservation_per_class: scheduling.reservation_per_class,
-                };
-                let value = crate::voi::observation_value(
-                    &entry.stability,
-                    entry.answer_consequence(),
-                    entry.trust_level(),
-                    supplied.value_ms,
-                    now,
-                    &cfg,
-                );
-                let tie_break = match key {
-                    Some(k) => entry.fingerprint(k).as_u128(),
-                    None => 0,
-                };
-                candidates.push(crate::voi::Candidate {
-                    payload: entry.key.clone(),
-                    class: entry.behavior_class(),
-                    value,
-                    tie_break,
-                });
-            }
-        }
-        crate::voi::schedule(
-            candidates,
+        let snapshots: Vec<_> = self
+            .hot
+            .values()
+            .chain(self.warm.values())
+            .filter(|e| matches!(e.kind, EntryKind::Positive(_)) && !e.refreshing)
+            .map(RefreshSnapshot::from_entry)
+            .collect();
+        rank_refresh_snapshots(
+            snapshots.into_iter().map(|snapshot| {
+                let supplied = inputs(&snapshot.key.name.apex(), policy.horizon_secs);
+                (snapshot, supplied)
+            }),
+            policy,
+            self.config.refresh_scheduling,
+            key,
             budget,
-            &crate::voi::VoiConfig {
-                horizon_secs,
-                min_value: scheduling.min_value,
-                reservation_per_class: scheduling.reservation_per_class,
-                ..crate::voi::VoiConfig::default()
-            },
+            now,
         )
+        .into_iter()
+        .map(|s| s.key)
+        .collect()
     }
 
     /// The number of entries across all tiers.
@@ -1425,6 +1684,155 @@ mod tests {
             stale_window_secs: 60,
             ..CacheConfig::default()
         }
+    }
+
+    fn assert_indexes(cache: &SemanticCache) {
+        let count = cache.hot.len() + cache.warm.len() + cache.cold.len();
+        assert_eq!(cache.refresh_index_len(), count);
+        for tier in [&cache.hot, &cache.warm, &cache.cold] {
+            assert_eq!(tier.due.len(), tier.map.len());
+            for (key, entry) in &tier.map {
+                assert!(tier.due.contains(&(entry.next_check_at, key.clone())));
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_index_survives_updates_evictions_moves_and_restore() {
+        let mut cache = SemanticCache::new(cfg());
+        for i in 0..500 {
+            let name = alloc::format!("h{}.example", i % 37);
+            let k = key(&name, RrType::A);
+            cache.insert_positive(
+                &k,
+                RrSet::a(&name, "192.0.2.1", 30),
+                now(),
+                score::ScoreInputs::default(),
+                false,
+            );
+            let _ = cache.lookup(&k, now() + 31_000_000_000);
+            cache.rescore(&k, score::ScoreInputs::default(), now());
+            let restored = cache.iter_entries().next().cloned();
+            if let Some(entry) = restored {
+                cache.restore_entry(entry, now());
+            }
+            assert_indexes(&cache);
+            assert!(cache.len() <= 16);
+        }
+        cache.sweep(now() + 100_000_000_000);
+        assert_indexes(&cache);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn bounded_snapshots_progress_without_rechecking_the_same_keys() {
+        let mut cache = SemanticCache::new(CacheConfig {
+            hot_capacity: 100,
+            warm_capacity: 100,
+            cold_capacity: 100,
+            ..cfg()
+        });
+        for i in 0..50 {
+            let name = alloc::format!("h{i}.example");
+            cache.insert_positive(
+                &key(&name, RrType::A),
+                RrSet::a(&name, "192.0.2.1", 300),
+                now(),
+                score::ScoreInputs::default(),
+                false,
+            );
+        }
+        let mut seen = BTreeSet::new();
+        for _ in 0..8 {
+            let batch = cache.refresh_snapshots(now(), 7, 1_000_000_000);
+            assert!(batch.len() <= 7);
+            for entry in batch {
+                assert!(seen.insert(entry.key));
+            }
+            assert_indexes(&cache);
+        }
+        assert_eq!(seen.len(), 50);
+        assert!(cache.refresh_snapshots(now(), 7, 1_000_000_000).is_empty());
+        assert_eq!(
+            cache
+                .refresh_snapshots(now() + 1_000_000_000, 7, 1_000_000_000)
+                .len(),
+            7
+        );
+        assert!(cache.refresh_snapshots(now(), 0, 1).is_empty());
+    }
+
+    #[test]
+    fn snapshots_and_cleanup_reject_replaced_generations() {
+        let mut cache = SemanticCache::new(cfg());
+        let k = key("generation.example", RrType::A);
+        let write = |cache: &mut SemanticCache| {
+            cache.insert_positive(
+                &k,
+                RrSet::a("generation.example", "192.0.2.1", 30),
+                now(),
+                score::ScoreInputs::default(),
+                false,
+            )
+        };
+        write(&mut cache);
+        let old = cache.generation(&k).unwrap();
+        write(&mut cache); // Even identical data and identical timestamps get a new version.
+        assert!(!cache.mark_refreshing_generation(&k, old));
+        let new = cache.generation(&k).unwrap();
+        assert!(cache.mark_refreshing_generation(&k, new));
+        cache.finish_refresh(&k, old, true, now());
+        assert_eq!(cache.generation(&k), Some(new));
+        assert!(!cache.mark_refreshing_generation(&k, new));
+        cache.finish_refresh(&k, new, false, now());
+        assert!(cache.mark_refreshing_generation(&k, new));
+        cache.sweep(now() + 100_000_000_000);
+        write(&mut cache);
+        assert_ne!(cache.generation(&k), Some(new));
+    }
+
+    #[test]
+    fn calibration_precedes_update_and_stale_counts_only_actual_service() {
+        let mut cache = SemanticCache::new(cfg());
+        let k = key("calibration.example", RrType::A);
+        cache.insert_positive(
+            &k,
+            RrSet::a("calibration.example", "192.0.2.1", 1),
+            now(),
+            score::ScoreInputs::default(),
+            false,
+        );
+        let _ = cache.lookup(&k, now() + 2_000_000_000);
+        assert_eq!(cache.stats().stale_served, 0);
+        cache.record_stale_service(&k, cache.generation(&k).unwrap());
+        cache.insert_positive(
+            &k,
+            RrSet::a("calibration.example", "192.0.2.2", 1),
+            now() + 3_000_000_000,
+            score::ScoreInputs::default(),
+            false,
+        );
+        assert_eq!(cache.content_calibration().samples(), 1);
+        assert_eq!(cache.stats().stale_later_changed, 1);
+    }
+
+    #[test]
+    fn zero_capacity_cold_tier_cannot_park_entries() {
+        let mut cache = SemanticCache::new(CacheConfig {
+            cold_capacity: 0,
+            ..cfg()
+        });
+        let k = key("cold.example", RrType::A);
+        cache.insert_positive(
+            &k,
+            RrSet::a("cold.example", "192.0.2.1", 1),
+            now(),
+            score::ScoreInputs::default(),
+            false,
+        );
+        let _ = cache.lookup(&k, now() + 2_000_000_000);
+        assert_eq!(cache.cold.len(), 0);
+        assert_indexes(&cache);
     }
 
     #[test]

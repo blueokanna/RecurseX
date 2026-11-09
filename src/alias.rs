@@ -115,6 +115,14 @@ impl AliasGraph {
             .unwrap_or_default()
     }
 
+    /// Copy at most `limit` reverse dependencies for bounded refresh work.
+    pub fn dependents_bounded(&self, key: &CacheKey, limit: usize) -> Vec<CacheKey> {
+        self.rev
+            .get(key)
+            .map(|s| s.iter().take(limit).cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// The data `key` needs fresh to be servable (its targets).
     pub fn depends_on(&self, key: &CacheKey) -> Vec<CacheKey> {
         self.fwd

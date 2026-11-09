@@ -78,6 +78,8 @@
 extern crate alloc;
 
 pub mod alias;
+#[cfg(feature = "std")]
+pub mod background;
 pub mod behavior;
 pub mod bounded;
 pub mod budget;

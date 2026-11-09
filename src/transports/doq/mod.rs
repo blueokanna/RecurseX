@@ -233,7 +233,7 @@ impl DoqTransport {
         Self {
             host: None,
             roots: RootStore::new(),
-            verify: false,
+            verify: true,
             now: 0,
             provider: Some(provider),
             conn: Mutex::new(None),

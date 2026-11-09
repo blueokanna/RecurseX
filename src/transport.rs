@@ -80,6 +80,17 @@ impl Transports {
 
     /// Exchange a query over the protocol of `endpoint`.
     pub fn exchange(&self, endpoint: &Endpoint, query: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+        crate::background::exchange(endpoint, query.len(), timeout_ms, |timeout| {
+            self.exchange_unmetered(endpoint, query, timeout)
+        })
+    }
+
+    fn exchange_unmetered(
+        &self,
+        endpoint: &Endpoint,
+        query: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>> {
         match endpoint.proto {
             Proto::Udp => self.udp.exchange(query, endpoint, timeout_ms),
             Proto::Tcp => self.tcp.exchange(query, endpoint, timeout_ms),

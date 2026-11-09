@@ -49,6 +49,20 @@ pub struct Stats {
     /// in turn means the estimator has no cost model for the zone yet. See
     /// [`crate::voi`].
     pub refresh_scheduled: AtomicU64,
+    /// Duplicate background submissions rejected, including across versions.
+    pub refresh_duplicate_rejected: AtomicU64,
+    /// Peak reserved background task slots (queued plus running).
+    pub refresh_peak: AtomicU64,
+    /// Candidate snapshots evaluated outside the cache lock.
+    pub refresh_candidates: AtomicU64,
+    /// Last observed scheduler index length.
+    pub refresh_index_len: AtomicU64,
+    /// Scheduler cache-lock hold time in nanoseconds.
+    pub refresh_cache_hold_ns: AtomicU64,
+    /// Scheduler cache-lock wait time in nanoseconds.
+    pub refresh_cache_wait_ns: AtomicU64,
+    /// Total queue residence time in nanoseconds.
+    pub refresh_queue_ns: AtomicU64,
     /// Maintenance rounds whose refresh order was **not** keyed.
     ///
     /// Non-zero means the deployment is running with
@@ -140,6 +154,20 @@ pub struct StatsSnapshot {
     pub affinity_lotteries: u64,
     /// Background refreshes selected by the value scheduler.
     pub refresh_scheduled: u64,
+    /// Duplicate background submissions rejected, including across versions.
+    pub refresh_duplicate_rejected: u64,
+    /// Peak reserved background task slots (queued plus running).
+    pub refresh_peak: u64,
+    /// Candidate snapshots evaluated outside the cache lock.
+    pub refresh_candidates: u64,
+    /// Last observed scheduler index length.
+    pub refresh_index_len: u64,
+    /// Scheduler cache-lock hold time in nanoseconds.
+    pub refresh_cache_hold_ns: u64,
+    /// Scheduler cache-lock wait time in nanoseconds.
+    pub refresh_cache_wait_ns: u64,
+    /// Total queue residence time in nanoseconds.
+    pub refresh_queue_ns: u64,
     /// Maintenance rounds whose refresh order was not keyed; see the atomic
     /// field of the same name.
     pub refresh_undecorrelated: u64,
@@ -203,6 +231,13 @@ impl Stats {
             referrals_refused: self.referrals_refused.load(Ordering::Relaxed),
             affinity_lotteries: self.affinity_lotteries.load(Ordering::Relaxed),
             refresh_scheduled: self.refresh_scheduled.load(Ordering::Relaxed),
+            refresh_duplicate_rejected: self.refresh_duplicate_rejected.load(Ordering::Relaxed),
+            refresh_peak: self.refresh_peak.load(Ordering::Relaxed),
+            refresh_candidates: self.refresh_candidates.load(Ordering::Relaxed),
+            refresh_index_len: self.refresh_index_len.load(Ordering::Relaxed),
+            refresh_cache_hold_ns: self.refresh_cache_hold_ns.load(Ordering::Relaxed),
+            refresh_cache_wait_ns: self.refresh_cache_wait_ns.load(Ordering::Relaxed),
+            refresh_queue_ns: self.refresh_queue_ns.load(Ordering::Relaxed),
             refresh_undecorrelated: self.refresh_undecorrelated.load(Ordering::Relaxed),
             propagated: self.propagated.load(Ordering::Relaxed),
             alias_edges: self.alias_edges.load(Ordering::Relaxed),

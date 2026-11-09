@@ -27,7 +27,7 @@
 //!   upward.
 //! * Proving the delegation requires an unbroken chain to an anchor the
 //!   operator installed. This build ships **no** root trust anchor, so
-//!   `ChainAnchored` is unreachable unless the deployment installs one.
+//!   `ChainAnchored` is not emitted by this incomplete validator.
 //!
 //! [`ValidationState`] records exactly that, and the `AD` bit is set **only**
 //! for [`ValidationState::ChainAnchored`] — never for a merely
@@ -127,22 +127,11 @@ impl ValidationState {
 }
 
 impl Verdict {
-    /// Map a verdict to a [`ValidationState`], given whether the deployment
-    /// has a trust anchor that the chain reached.
-    ///
-    /// `anchored` is the caller's honest answer to "was the chain walked to
-    /// an anchor?", not "is dnssec enabled?". With no anchor configured the
-    /// best possible state is [`ValidationState::CryptoVerified`], and
-    /// returning `ChainAnchored` would be a fabrication.
-    pub fn state(self, anchored: bool) -> ValidationState {
+    /// Map a local signature verdict. The legacy boolean is ignored:
+    /// a caller promise cannot replace root-to-answer chain validation.
+    pub fn state(self, _anchored: bool) -> ValidationState {
         match self {
-            Verdict::Secure => {
-                if anchored {
-                    ValidationState::ChainAnchored
-                } else {
-                    ValidationState::CryptoVerified
-                }
-            }
+            Verdict::Secure => ValidationState::CryptoVerified,
             Verdict::Insecure => ValidationState::Insecure,
             Verdict::Indeterminate => ValidationState::Indeterminate,
             Verdict::Bogus => ValidationState::Indeterminate,
@@ -490,8 +479,8 @@ impl Drop for ValidationGuard {
 /// Validate a completed [`crate::resolver::Resolution`] and report where the
 /// chain stopped.
 ///
-/// `anchored` is the caller's honest answer to "is a trust anchor
-/// configured?" — see [`Verdict::state`].
+/// The legacy `anchored` argument is ignored. A boolean cannot establish
+/// completion of root-to-answer chain validation.
 pub fn validate_resolution_detailed(
     resolver: &crate::resolver::Resolver,
     res: &crate::resolver::Resolution,
@@ -798,8 +787,8 @@ mod tests {
         );
 
         let s = Verdict::Secure.state(true);
-        assert_eq!(s, ValidationState::ChainAnchored);
-        assert!(s.permits_authentic_data());
+        assert_eq!(s, ValidationState::CryptoVerified);
+        assert!(!s.permits_authentic_data());
     }
 
     #[test]

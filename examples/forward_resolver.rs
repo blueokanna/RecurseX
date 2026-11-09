@@ -1,11 +1,11 @@
 //! A forwarding resolver: every query goes to a configured upstream with
-//! RD=1 (instead of iterating from the root), with automatic fallback to
-//! iterative resolution if the forwarder fails.
+//! RD=1 (instead of iterating from the root), and fails closed if the forwarder fails.
 //!
 //! With the default features (`dot`, `doh`) the example forwards over DNS
 //! over TLS to Cloudflare. Built with only `--features std` it forwards
 //! over plain UDP to 8.8.8.8.
 //!
+//! Set RECURSEX_CA_FILE to a PEM trust bundle before running.
 //! Run: `cargo run --example forward_resolver [name]`
 
 use recurse_x::config::Config;
@@ -34,7 +34,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }}
         }}"#
     );
-    let cfg = Config::from_json_str(&json)?;
+    let mut cfg = Config::from_json_str(&json)?;
+    cfg.forwarder_ca_file = Some(
+        std::env::var("RECURSEX_CA_FILE")
+            .map_err(|_| "set RECURSEX_CA_FILE to a PEM trust bundle")?,
+    );
     let rc = cfg.into_resolver_config()?;
     let resolver = Resolver::new(rc);
 
