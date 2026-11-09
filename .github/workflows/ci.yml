@@ -105,6 +105,15 @@ jobs:
         run: cargo test --locked --all-features
       - name: Test (default features)
         run: cargo test --locked
+      - name: Repeat HTTP DNS loopback regressions (Windows MSRV)
+        if: matrix.toolchain == 'msrv' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          for ($iteration = 1; $iteration -le 3; $iteration++) {
+            Write-Host "HTTP DNS loopback round $iteration/3"
+            cargo test --locked --all-features --test http_dns -- --test-threads=8
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       # The release profile is what ships, and optimized code is where
       # timing assumptions break. One leg is enough for it.
       - name: Test (release, all features)

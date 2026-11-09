@@ -427,9 +427,6 @@ pub struct DnsJson {
 /// the operator supplies both.
 #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
 pub fn parse_upstream(s: &str) -> Result<crate::forward::Forwarder> {
-    // The identity fragment first: it may contain a colon (a port-looking
-    // suffix in a name is legal), so it has to come off before the authority
-    // is split.
     let (rest, name) = match s.split_once('#') {
         Some((a, b)) => (a.trim(), Some(b.trim())),
         None => (s.trim(), None),
@@ -466,8 +463,6 @@ pub fn parse_upstream(s: &str) -> Result<crate::forward::Forwarder> {
         }
     };
 
-    // DoH/DoH3 carry a URI path; the other schemes have none, so a `/` in
-    // them is a typo worth reporting rather than a path to ignore.
     let want_path = matches!(scheme.as_str(), "https" | "h3");
     let (authority, path) = match rest.split_once('/') {
         Some((auth, p)) => {
@@ -520,8 +515,6 @@ pub fn parse_upstream(s: &str) -> Result<crate::forward::Forwarder> {
     })?;
     let f = crate::forward::Forwarder::encrypted(endpoint, name);
     Ok(match path {
-        // An absent path means the RFC 8484 default, which is what every
-        // large public DoH service uses.
         None | Some("") => f,
         Some(p) => f.with_path(format!("/{p}")),
     })
@@ -556,8 +549,6 @@ fn parse_authority(authority: &str) -> Option<(std::net::IpAddr, Option<u16>)> {
     match authority.rsplit_once(':') {
         Some((host, port)) => match (host.parse(), port.parse::<u16>()) {
             (Ok(ip), Ok(p)) => Some((ip, Some(p))),
-            // Not `host:port`. A bare IPv6 literal lands here, because its
-            // last colon separates two hextets rather than a port.
             _ => authority.parse().ok().map(|ip| (ip, None)),
         },
         None => authority.parse().ok().map(|ip| (ip, None)),
@@ -720,9 +711,6 @@ impl Config {
             .trim()
             .to_ascii_lowercase();
         let fake_ip = match mode.as_str() {
-            // `redir-host` is Clash's other enhanced mode: it resolves
-            // normally and lets the proxy use the real address, so there is
-            // nothing to synthesize.
             "" | "normal" | "redir-host" => None,
             "fake-ip" | "fakeip" | "fake_ip" => {
                 let mut s = FakeIpSettings::parse(
@@ -751,9 +739,6 @@ impl Config {
         // --- fallback-filter ------------------------------------------
         let fallback = match &dns.fallback_filter {
             Some(f) => {
-                // `geoipCode` is only ever read by `geoip`, which this build
-                // refuses. Accepting the list quietly would look like
-                // country filtering was configured.
                 if !f.geoip_code.is_empty() {
                     return Err(Error::config(
                         "dns.fallback-filter.geoipCode has no effect: this build embeds no \
@@ -770,7 +755,6 @@ impl Config {
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let (upstreams, policy) = {
             let default = if dns.nameservers.is_empty() {
-                // The legacy spelling, already fully specified as endpoints.
                 self.engine
                     .forwarders
                     .iter()
@@ -788,9 +772,6 @@ impl Config {
                 .map(|s| parse_upstream(s))
                 .collect::<Result<Vec<_>>>()?;
 
-            // Policy groups. `nameserver_policy` is a BTreeMap, so ids are
-            // assigned in a fixed order and a group id means the same thing
-            // on every run.
             let mut rules: Vec<(String, usize)> = Vec::new();
             let mut extra: Vec<Vec<crate::forward::Forwarder>> = Vec::new();
             for (pattern, servers) in &dns.nameserver_policy {
@@ -1383,8 +1364,6 @@ mod tests {
                     .len(),
                 1
             );
-            // A v4-only pin answers AAAA with an empty answer: NODATA by
-            // decision, not a miss.
             assert!(rc
                 .dns
                 .hosts
@@ -1532,19 +1511,13 @@ mod tests {
             .into_resolver_config()
             .unwrap();
             let dns = &rc.dns;
-
-            // Suffix routing: the node domain reaches its own group, a
-            // neighbour does not.
             assert_ne!(dns.policy.route(&n("n1.node.example")), Route::Default);
             assert_eq!(dns.policy.route(&n("other.test")), Route::Default);
-
-            // The forced-fallback list and the pollution blocks are live.
             assert!(dns.fallback.forces_fallback(&n("www.polluted.example")));
             assert!(dns
                 .fallback
                 .looks_poisoned(&["198.18.0.7".parse().unwrap()])
                 .is_some());
-            // The operator's list replaced the built-ins.
             assert!(dns
                 .fallback
                 .looks_poisoned(&["0.0.0.0".parse().unwrap()])

@@ -10,21 +10,59 @@ use recurse_x::upstream::{Endpoint, Proto};
 use recurse_x::{Message, Name, RrType};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 const CERT: &[u8] = include_bytes!("fixtures/loopback-ip.der");
 const KEY: &[u8] = include_bytes!("fixtures/loopback-ip-key.der");
+const REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+// These tests check protocol policy and pooling, not concurrent handshake
+// throughput. Unoptimized cryptography can starve the peer's reactor on a
+// small CI runner, exhausting QUIC retransmits before the request deadline.
+static NETWORK_TEST: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct ResponseGate {
+    released: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl ResponseGate {
+    fn wait(&self) {
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        drop(
+            self.wake
+                .wait_while(released, |released| !*released)
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.wake.notify_all();
+    }
+}
 
 struct Upstream {
     address: SocketAddr,
     server: Option<ServerHandle>,
     calls: Arc<AtomicUsize>,
     stats: Arc<Stats>,
+    response_gate: Arc<ResponseGate>,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Drop for Upstream {
     fn drop(&mut self) {
+        // Also release a blocked handler when a client assertion unwinds.
+        self.response_gate.release();
         if let Some(server) = self.server.take() {
             server.stop();
             let _ = server.join();
@@ -33,7 +71,11 @@ impl Drop for Upstream {
 }
 
 fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream {
+    let serial = NETWORK_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let stats = Stats::new();
+    let io_timeout = Duration::from_millis(REQUEST_TIMEOUT_MS);
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
@@ -41,9 +83,10 @@ fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream
             http3,
             threads: 2,
             event_workers: 1,
-            read_timeout: Some(Duration::from_millis(500)),
-            idle_timeout: Some(Duration::from_millis(500)),
-            h2_idle_timeout: Some(Duration::from_millis(500)),
+            read_timeout: Some(io_timeout),
+            handshake_timeout: Some(io_timeout),
+            idle_timeout: Some(io_timeout),
+            h2_idle_timeout: Some(io_timeout),
             tls: Some(TlsSettings {
                 identity: Identity::from_der(vec![CERT.to_vec()], KEY.to_vec()).unwrap(),
                 alpn: if http3 {
@@ -61,12 +104,10 @@ fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream
     let address = server.local_addr().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
+    let response_gate = Arc::new(ResponseGate::default());
+    let handler_gate = response_gate.clone();
     let handle = server
         .serve_background(move |request: Request<Body>| {
-            observed.fetch_add(1, Ordering::Relaxed);
-            if request.uri.as_str() == "/slow" {
-                std::thread::sleep(Duration::from_millis(300));
-            }
             assert_eq!(
                 request.headers.get("content-type").unwrap().as_bytes(),
                 b"application/dns-message"
@@ -75,14 +116,18 @@ fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream
                 request.headers.get("accept").unwrap().as_bytes(),
                 b"application/dns-message"
             );
+            let bytes = request.body.collect().unwrap();
+            let mut message = Message::parse(&bytes).unwrap();
+            observed.fetch_add(1, Ordering::Relaxed);
+            if request.uri.as_str() == "/slow" {
+                handler_gate.wait();
+            }
             if redirect {
                 return Response::<Body>::with_status(
                     courierust::courierust_http::StatusCode::TEMPORARY_REDIRECT,
                 )
                 .header("location", "http://127.0.0.1:1/leak");
             }
-            let bytes = request.body.collect().unwrap();
-            let mut message = Message::parse(&bytes).unwrap();
             message.flags.qr = true;
             let mut response =
                 Response::<Body>::with_status(courierust::courierust_http::StatusCode::OK)
@@ -96,6 +141,8 @@ fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream
         server: Some(handle),
         calls,
         stats,
+        response_gate,
+        _serial: serial,
     }
 }
 
@@ -142,7 +189,9 @@ fn roundtrip(http3: bool) {
         if http3 { Proto::DoH3 } else { Proto::DoH },
     );
     for _ in 0..2 {
-        let response = transport.exchange(&query(), &endpoint, 2000).unwrap();
+        let response = transport
+            .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+            .unwrap();
         assert!(Message::parse(&response).unwrap().flags.qr);
     }
     assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
@@ -175,7 +224,7 @@ fn doh_rejects_redirects_and_invalid_media_type() {
         let upstream = upstream(false, media_type, redirect);
         let endpoint = Endpoint::new(upstream.address.ip(), upstream.address.port(), Proto::DoH);
         assert!(transport(false, true, 1_800_000_000)
-            .exchange(&query(), &endpoint, 2000)
+            .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
             .is_err());
         assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
     }
@@ -200,9 +249,10 @@ fn certificate_failure(http3: bool) {
         if http3 { Proto::DoH3 } else { Proto::DoH },
     );
     for (trusted, time) in [(false, 1_800_000_000), (true, 2_200_000_000)] {
-        assert!(transport(http3, trusted, time)
-            .exchange(&query(), &endpoint, 500)
-            .is_err());
+        let error = transport(http3, trusted, time)
+            .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+            .unwrap_err();
+        assert_ne!(error.kind, recurse_x::ErrorKind::Timeout, "{error:?}");
     }
     assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
 }
@@ -215,9 +265,14 @@ fn changing_validation_time_cannot_reuse_an_old_client() {
     let mut transport =
         recurse_x::transports::doh::DohTransport::for_host("127.0.0.1", roots, true, 1_800_000_000);
     let endpoint = Endpoint::new(upstream.address.ip(), upstream.address.port(), Proto::DoH);
-    transport.exchange(&query(), &endpoint, 1000).unwrap();
+    transport
+        .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+        .unwrap();
     transport.now = 2_200_000_000;
-    assert!(transport.exchange(&query(), &endpoint, 1000).is_err());
+    let error = transport
+        .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+        .unwrap_err();
+    assert_ne!(error.kind, recurse_x::ErrorKind::Timeout, "{error:?}");
     assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
 }
 
@@ -249,11 +304,19 @@ fn http_timeout_is_reported_as_timeout_for_failure_fallback() {
     transport.path = "/slow".into();
     let endpoint = Endpoint::new(upstream.address.ip(), upstream.address.port(), Proto::DoH);
     let started = std::time::Instant::now();
-    let error = transport.exchange(&query(), &endpoint, 150).unwrap_err();
+    // The handler withholds its response until teardown. Give TLS setup
+    // enough time, then require evidence that DNS reached the handler:
+    // a handshake timeout must not satisfy this regression accidentally.
+    let error = transport.exchange(&query(), &endpoint, 2_000).unwrap_err();
     assert_eq!(
         error.kind,
         recurse_x::ErrorKind::Timeout,
         "{error:?}; elapsed={:?}",
         started.elapsed()
+    );
+    assert_eq!(
+        upstream.calls.load(Ordering::Relaxed),
+        1,
+        "timeout must occur after the server receives DNS, not during TLS setup"
     );
 }
