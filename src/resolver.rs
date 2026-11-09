@@ -1155,11 +1155,6 @@ impl Resolver {
             Claim::Owner(owner) => owner,
         };
 
-        // One budget for this client query and everything it spawns. The
-        // wall clock bounds *how long* the tree may run; the fetch budget
-        // bounds *how much work* it may do, which is what a depth limit
-        // cannot do — an NXNS-style referral is cheap to enter and expensive
-        // to finish.
         let deadline = Deadline::after(self.inner.config.engine.query_budget_ms);
         let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
         let result =
@@ -1403,7 +1398,6 @@ impl Resolver {
     ) -> Result<Resolution> {
         let now = self.inner.clock.now();
 
-        // Cache-first path.
         if cache_policy != ResolutionCachePolicy::Bypass {
             if let Some(res) = self.resolve_from_cache(key, now, cache_policy) {
                 let res = res?;
@@ -1730,8 +1724,6 @@ impl Resolver {
             ttl,
             from_cache: true,
             stale,
-            // A cache hit learned nothing new about the scope: the entry
-            // already sits in the partition it was filed under.
             ecs_scope: None,
             served_at: now,
         };
