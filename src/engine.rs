@@ -248,9 +248,6 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
             soa: soa.cloned(),
         };
     }
-    // A referral is an NS RRset for a zone strictly below the current one.
-    // The NS owner may equal the query name when the query is for the zone
-    // apex itself (the delegating server's referral for `example.com A`).
     let mut referral: Option<(Name, Vec<Record>, Vec<Record>)> = None;
     for rec in &msg.authorities {
         if rec.rr_type == RrType::NS && rec.name.is_strict_subdomain_of(zone) {
@@ -261,7 +258,6 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
                 .filter(|r| r.rr_type == RrType::NS && r.name == zone)
                 .cloned()
                 .collect();
-            // Glue: A/AAAA in the additional section.
             let glue: Vec<Record> = msg
                 .additionals
                 .iter()
@@ -349,7 +345,6 @@ mod tests {
         assert_eq!(m.question().unwrap().qtype, RrType::A);
         assert!(m.edns.is_some());
         assert!(m.edns.as_ref().unwrap().dnssec_ok);
-        // 0x20: the wire name may differ in case from the canonical form.
         assert_eq!(q.qname.canonical(), name);
     }
 
@@ -396,7 +391,6 @@ mod tests {
     fn classify_referral() {
         let mut m = Message::new(1);
         m.flags.qr = true;
-        // Authority: NS for example.com (below root).
         m.authorities.push(Record {
             name: Name::from_ascii("example.com").unwrap(),
             rr_type: RrType::NS,

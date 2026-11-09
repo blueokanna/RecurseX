@@ -255,6 +255,7 @@ impl DnsTransport for DoqTransport {
     }
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
+        let now = super::io::certificate_time(self.now)?;
         if query.len() > MAX_TCP_MESSAGE {
             return Err(Error::transport("query too large for DoQ"));
         }
@@ -265,7 +266,7 @@ impl DnsTransport for DoqTransport {
                 self.host.as_deref(),
                 &self.roots,
                 self.verify,
-                self.now,
+                now,
             )?;
             let r = conn.request(&framed);
             conn.close();
@@ -289,7 +290,7 @@ impl DnsTransport for DoqTransport {
                         self.host.as_deref(),
                         self.roots.clone(),
                         self.verify,
-                        self.now,
+                        now,
                         timeout_ms,
                     )?)
                 }

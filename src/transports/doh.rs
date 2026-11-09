@@ -1,20 +1,18 @@
 //! DNS over HTTPS (RFC 8484) via courierust's HTTP/1.1 + HTTP/2 client.
 
-use crate::sync::Mutex;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_tls::RootStore;
 
-use crate::error::{Error, Result};
-use crate::transport::{DnsTransport, MAX_TCP_MESSAGE};
+use crate::error::Result;
+use crate::transport::DnsTransport;
 use crate::upstream::{Endpoint, Proto};
 
-/// DNS over HTTPS transport. `hostname` is the authority (SNI + Host
-/// header); the endpoint's port selects the TCP port.
+/// DNS over HTTPS to a pinned IP. The current dependency requires the TLS
+/// identity to be that IP literal; a separate hostname is rejected.
 pub struct DohTransport {
-    /// The HTTPS authority hostname.
+    /// The literal IP identity authenticated by the certificate.
     pub hostname: String,
     /// The DoH URI path (default `/dns-query`).
     pub path: String,
@@ -22,10 +20,10 @@ pub struct DohTransport {
     pub roots: RootStore,
     /// Whether to verify the server certificate.
     pub verify: bool,
-    /// Current unix time (seconds) for certificate validity.
+    /// Fixed Unix seconds for replay; zero uses the live system clock.
     pub now: i64,
     /// Lazily created, pooled courierust client (HTTP/1.1 + HTTP/2).
-    client: Mutex<Option<Client>>,
+    client: super::http_dns::HttpDnsClient,
 }
 
 /// Identity and trust settings; the pooled client is deliberately not
@@ -47,12 +45,12 @@ impl core::fmt::Debug for DohTransport {
 impl Default for DohTransport {
     fn default() -> Self {
         Self {
-            hostname: "dns.google".into(),
+            hostname: "8.8.8.8".into(),
             path: "/dns-query".into(),
             roots: RootStore::new(),
             verify: true,
             now: 0,
-            client: Mutex::new(None),
+            client: super::http_dns::HttpDnsClient::default(),
         }
     }
 }
@@ -66,30 +64,8 @@ impl DohTransport {
             roots,
             verify,
             now,
-            client: Mutex::new(None),
+            client: super::http_dns::HttpDnsClient::default(),
         }
-    }
-
-    fn client(&self) -> Result<Client> {
-        let mut guard = self.client.lock();
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let cfg = ClientConfig {
-            http2: true,
-            tls: Some(TlsSettings {
-                roots: self.roots.clone(),
-                verify: self.verify,
-                alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-                now: self.now,
-                ..Default::default()
-            }),
-            max_body: MAX_TCP_MESSAGE,
-            ..Default::default()
-        };
-        let client = Client::with_config(cfg);
-        *guard = Some(client.clone());
-        Ok(client)
     }
 }
 
@@ -99,28 +75,18 @@ impl DnsTransport for DohTransport {
     }
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
-        let client = self.client()?;
-        let url = format!("https://{}:{}{}", self.hostname, endpoint.port, self.path);
-        let resp = client
-            .request(&url, courierust::courierust_http::Method::POST)
-            .body(query.to_vec())
-            .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
-            .send()
-            .map_err(|e| Error::transport(format!("doh request: {e}")))?;
-        if resp.status.as_u16() != 200 {
-            return Err(Error::transport(format!(
-                "doh status {} from {}",
-                resp.status.as_u16(),
-                self.hostname
-            )));
-        }
-        let body = resp
-            .body
-            .collect()
-            .map_err(|e| Error::transport(format!("doh body: {e}")))?;
-        if body.len() > MAX_TCP_MESSAGE {
-            return Err(Error::transport("doh response too large"));
-        }
-        Ok(body.to_vec())
+        self.client.exchange(
+            super::http_dns::Settings {
+                host: &self.hostname,
+                path: &self.path,
+                roots: &self.roots,
+                verify: self.verify,
+                now: self.now,
+                http3: false,
+            },
+            query,
+            endpoint,
+            timeout_ms,
+        )
     }
 }

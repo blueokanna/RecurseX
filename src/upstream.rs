@@ -222,11 +222,9 @@ impl PathModel {
     pub fn record_success(&mut self, rtt_ms: f64, now: Ts) {
         self.successes += 1;
         self.last_seen = now;
-        // EWMA of RTT (α = 0.2).
         self.rtt_var_ms =
             self.rtt_var_ms * 0.8 + crate::float::fabs(rtt_ms - self.rtt_ewma_ms) * 0.2;
         self.rtt_ewma_ms = self.rtt_ewma_ms * 0.8 + rtt_ms * 0.2;
-        // Decay loss slowly on success.
         self.loss_rate *= 0.95;
         self.conn_cost_ms = self.endpoint.proto.setup_rtts() * self.rtt_ewma_ms;
     }
@@ -268,7 +266,6 @@ impl PathModel {
     pub fn expected_cost_ms(&self, retransmit_budget: u32) -> f64 {
         let rto = self.rto_ms();
         let p = self.loss_rate.clamp(0.0, 0.95);
-        // Geometric series of expected retransmission time.
         let retrans_penalty = if p >= 1.0 {
             rto * retransmit_budget as f64
         } else {
@@ -288,7 +285,6 @@ impl PathModel {
 /// The per-authority path model store + selector.
 pub struct UpstreamSelector {
     paths: BTreeMap<Endpoint, PathModel>,
-    /// Cap on tracked paths (defends against NS-flood attacks).
     max_paths: usize,
 }
 
@@ -451,19 +447,6 @@ impl UpstreamSelector {
         let items: Vec<(u64, f64)> = head
             .iter()
             .map(|(ep, cost)| {
-                // The weight *is* the measurement. A band makes servers
-                // comparable; it does not make them identical, and throwing the
-                // cost away inside the band — which is what an equal weight
-                // does — discards the only reason there is a cost model at all.
-                //
-                // `w = cost_min / cost` is the inverse of measured cost, so a
-                // server that is 10 % dearer is picked 10 % less often. It is
-                // bounded above by 1 by construction (nothing in the band is
-                // cheaper than the minimum), so no candidate can be made
-                // arbitrarily dominant by a fluke measurement, and the floor
-                // keeps a pathological cost from suppressing a candidate
-                // entirely — a server that is *in* the band has been declared
-                // usable, and a weight of zero would contradict that.
                 let w = if *cost > 0.0 && min_cost > 0.0 {
                     (min_cost / cost).clamp(1e-3, 1.0)
                 } else {
@@ -608,9 +591,6 @@ mod tests {
 
     #[test]
     fn affinity_spreads_a_fleet_over_indistinguishable_servers() {
-        // The defect being fixed: without affinity the head of the ranking is
-        // the same endpoint for every subject, because the tie is broken by the
-        // input order. With it, all three in-band servers take a real share.
         let (sel, eps) = cluster();
         let key = crate::rendezvous::RendezvousKey::from_words(
             0x1122_3344_5566_7788,

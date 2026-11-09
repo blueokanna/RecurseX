@@ -162,8 +162,6 @@ mod tests {
             m.inner.is_poisoned(),
             "the mutex must actually be poisoned, or this test proves nothing"
         );
-        // The write made before the panic is still there, and the lock is
-        // usable again.
         assert_eq!(*m.lock(), 9);
         *m.lock() = 10;
         assert_eq!(*m.lock(), 10);
@@ -192,11 +190,9 @@ mod tests {
             lock.inner.is_poisoned(),
             "the lock must actually be poisoned, or this test proves nothing"
         );
-        // The write survived, reads still work, and a later write still works.
         assert_eq!(*lock.read(), 9);
         *lock.write() = 10;
         assert_eq!(*lock.read(), 10);
-        // Several readers at once, which is the whole reason this is not a Mutex.
         let a = lock.read();
         let b = lock.read();
         assert_eq!((*a, *b), (10, 10));
@@ -231,8 +227,6 @@ mod tests {
             guard.push(3);
         }
         assert_eq!(*m.lock(), vec![1, 2, 3]);
-        // The crate requires `Debug` on every public type, so the derive has to
-        // reach the guarded value rather than stopping at the wrapper.
         let rendered = std::format!("{m:?}");
         assert!(
             rendered.contains("[1, 2, 3]"),

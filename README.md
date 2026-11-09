@@ -579,6 +579,7 @@ zero a timeout, or empty the cache:
 ```json
 {
   "listen": [{ "addr": "0.0.0.0:53", "proto": "udp" }],
+  "forwarderCaFile": "/etc/ssl/certs/ca-certificates.crt",
   "cache": { "hotCapacity": 2048, "warmCapacity": 131072, "nxCapacity": 65536 },
   "engine": {
     "qnameMinimization": true,
@@ -610,9 +611,34 @@ empty roots fail closed. Explicit `verify = false` is an insecure testing
 opt-out, never a strict-privacy configuration. Wrong identity is not retried
 via plaintext iterative resolution.
 
+DoT and DoQ accept a connection IP and a separate TLS hostname. With the
+published courierust 1.1.1 client, DoH and DoH3 require `host` to be the same
+IP literal as `ip`, and the certificate must authenticate that IP. A hostname
+that would require a separate connection-address override is rejected at
+configuration load. HTTP redirects are disabled; requests and responses use
+`application/dns-message`.
+
+`now = 0` on a transport selects the live certificate clock. DoH/DoH3 reuse
+courierust's pool within a validation-time epoch and rebuild the client when
+that Unix second changes, because this dependency stores a fixed TLS time.
+This trades connection retention for correct validity checks; it is not a
+connection-performance improvement claim.
+
 `dnssec_anchored` is retained for source compatibility but ignored. No caller
 boolean can produce `ChainAnchored`, and this build does not set AD until an
 actual complete chain validator exists.
+
+Detected bogus signatures are rejected before serving or caching an answer,
+including cache hits and stale fallback. Recursion guards apply to the
+current thread; one validation cannot disable checks in another worker.
+Snapshot validation flags are discarded on restore and must be established
+again by the active resolver.
+
+The tested dependency set is courierust 1.1.1, nextjson 0.1.5, tzcraft 0.1.2
+and rustbinary 0.1.10, fetched from crates.io. The `std` feature uses the OS
+entropy provider even when encrypted transports are disabled. RustBinary's
+unused protocol/derive features are disabled. Use the committed lock file
+and `--locked` for repeatable builds; there are no local dependency forks.
 
 ### Examples
 

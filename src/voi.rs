@@ -193,7 +193,6 @@ impl VoiConfig {
 /// quantity in the same units.
 fn survival(lambda: f64, t: f64) -> f64 {
     if !is_positive(lambda) {
-        // No bound at all: nothing may be assumed about the data.
         return 0.0;
     }
     if t <= 0.0 {
@@ -258,22 +257,11 @@ pub fn observation_value(
     let hazard = model.hazard();
     let lambda = hazard.hazard_upper_bound();
     if !lambda.is_finite() {
-        // No credible bound: the data may change at any rate, so an
-        // observation cannot be shown to improve anything. The entry is still
-        // *served* conservatively — that decision is `risk::assess`, and it
-        // does not consult this function.
         return 0.0;
     }
     let age = knowledge_age_secs(model, now);
     let horizon = cfg.horizon_secs.max(0.0);
-
-    // What the guarantee would look like at the end of the horizon having done
-    // nothing: our knowledge is `age + horizon` seconds old.
     let r_without = scale * (1.0 - survival(lambda, age + horizon));
-
-    // What it looks like having observed: the exposure the observation will
-    // report is exactly `age`, and the two outcomes are weighted by the
-    // model's own predictive probability for that exposure.
     let p_unchanged = hazard.freshness_predictive(age).clamp(0.0, 1.0);
     let mut r_with = 0.0;
     for changed in [false, true] {
@@ -526,9 +514,6 @@ mod tests {
 
     #[test]
     fn an_unobserved_entry_is_worth_observing_and_a_watched_one_is_worth_less() {
-        // The property the whole module exists for. A set nobody has watched
-        // has a wide bound, so the risk of not looking is real; a set watched
-        // for hours has a narrow one, so there is little left to buy.
         let fresh = StabilityModel::with_config(HazardConfig::default(), 300, now());
         let watched = observed(300, 60, 40);
         let v_fresh = priced_at(
@@ -554,11 +539,6 @@ mod tests {
 
     #[test]
     fn looking_at_something_we_just_looked_at_buys_nothing() {
-        // The refresh reports the exposure since the previous observation, so
-        // an observation taken zero seconds after the last one carries no
-        // evidence and cannot improve the bound. A value function that priced
-        // it as positive would let the scheduler spend the whole budget
-        // re-observing whatever it had just seen.
         let m = StabilityModel::with_config(HazardConfig::default(), 300, now());
         assert_eq!(
             observation_value(
@@ -575,11 +555,6 @@ mod tests {
 
     #[test]
     fn value_grows_with_how_long_ago_we_last_looked() {
-        // Age is the exposure the next observation would report, so a longer
-        // gap is both more risk carried and more evidence bought. It is the
-        // one input the threshold rule cannot see at all: two entries with the
-        // same `P_LCB` are not equally worth a token if one was confirmed a
-        // minute ago and the other an hour ago.
         let m = StabilityModel::with_config(HazardConfig::default(), 300, now());
         let mut previous = 0.0;
         for age in [30i64, 120, 600, 3600] {

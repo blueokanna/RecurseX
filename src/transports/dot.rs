@@ -1,9 +1,9 @@
 //! DNS over TLS (RFC 7858) via courierust's TLS 1.2/1.3 stack.
 
+use super::io::{network_error, Deadline, DeadlineStream};
 use alloc::string::String;
 use alloc::vec::Vec;
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
 
 use courierust::courierust_tls::{ClientConfig as TlsClientConfig, RootStore, TlsConnector};
 
@@ -20,7 +20,7 @@ pub struct DotTransport {
     pub roots: RootStore,
     /// Whether to verify the server certificate.
     pub verify: bool,
-    /// Current unix time (seconds) for certificate validity.
+    /// Fixed Unix seconds for replay; zero uses the live system clock.
     pub now: i64,
     /// Connect timeout in ms.
     pub connect_timeout_ms: u64,
@@ -62,14 +62,14 @@ impl DotTransport {
         }
     }
 
-    fn connector(&self) -> TlsConnector {
-        TlsConnector::new(TlsClientConfig {
+    fn connector(&self) -> Result<TlsConnector> {
+        Ok(TlsConnector::new(TlsClientConfig {
             roots: self.roots.clone(),
             verify: self.verify,
             alpn: vec![b"dot".to_vec()],
-            now: self.now,
+            now: super::io::certificate_time(self.now)?,
             ..Default::default()
-        })
+        }))
     }
 }
 
@@ -82,25 +82,53 @@ impl DnsTransport for DotTransport {
         if query.len() > MAX_TCP_MESSAGE {
             return Err(Error::transport("query too large for DoT"));
         }
-        let timeout = Duration::from_millis(timeout_ms.min(self.connect_timeout_ms).max(1));
+        let deadline = Deadline::after(timeout_ms)?;
         let addr = SocketAddr::new(endpoint.ip, endpoint.port);
-        let stream = TcpStream::connect_timeout(&addr, timeout)
-            .map_err(|e| Error::io(format!("dot connect {}: {e}", endpoint.addr_str())))?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|_| stream.set_write_timeout(Some(timeout)))
-            .map_err(|e| Error::io(format!("dot timeout setup: {e}")))?;
-
+        let connect_limit = if self.connect_timeout_ms == 0 {
+            timeout_ms
+        } else {
+            timeout_ms.min(self.connect_timeout_ms)
+        };
+        let stream =
+            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(connect_limit))
+                .map_err(|e| network_error("DoT connect", e))?;
         let mut tls = self
-            .connector()
-            .connect(&self.hostname, &stream, &stream)
-            .map_err(|e| Error::transport(format!("dot handshake: {e}")))?;
+            .connector()?
+            .connect(
+                &self.hostname,
+                DeadlineStream {
+                    stream: &stream,
+                    deadline,
+                },
+                DeadlineStream {
+                    stream: &stream,
+                    deadline,
+                },
+            )
+            .map_err(|e| {
+                if deadline.remaining().is_err() {
+                    Error::new(
+                        crate::error::ErrorKind::Timeout,
+                        "DoT handshake deadline exhausted",
+                    )
+                } else {
+                    Error::transport(format!("DoT handshake: {e}"))
+                }
+            })?;
 
         let mut framed = Vec::with_capacity(query.len() + 2);
         framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
         framed.extend_from_slice(query);
-        tls.write_all(&framed)
-            .map_err(|e| Error::io(format!("dot write: {e}")))?;
+        tls.write_all(&framed).map_err(|e| {
+            if deadline.remaining().is_err() {
+                Error::new(
+                    crate::error::ErrorKind::Timeout,
+                    "DoT write deadline exhausted",
+                )
+            } else {
+                tls_error("DoT write", e.into())
+            }
+        })?;
 
         // RFC 7858: responses are length-prefixed DNS messages.
         let mut len_buf = [0u8; 2];
@@ -119,9 +147,7 @@ impl DnsTransport for DotTransport {
 /// not `read_exact`).
 fn read_exact(r: &mut impl courierust::courierust_io::Read, mut buf: &mut [u8]) -> Result<()> {
     while !buf.is_empty() {
-        let n = r
-            .read(buf)
-            .map_err(|e| Error::io(format!("dot read: {e}")))?;
+        let n = r.read(buf).map_err(|e| tls_error("DoT read", e))?;
         if n == 0 {
             return Err(Error::transport("dot connection closed early"));
         }
@@ -130,4 +156,17 @@ fn read_exact(r: &mut impl courierust::courierust_io::Read, mut buf: &mut [u8]) 
         })?;
     }
     Ok(())
+}
+
+fn tls_error(context: &str, error: courierust::courierust_error::Error) -> Error {
+    let kind = if matches!(
+        error.kind,
+        courierust::courierust_error::ErrorKind::Timeout
+            | courierust::courierust_error::ErrorKind::WouldBlock
+    ) {
+        crate::error::ErrorKind::Timeout
+    } else {
+        crate::error::ErrorKind::Transport
+    };
+    Error::new(kind, format!("{context}: {error}"))
 }

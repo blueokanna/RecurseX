@@ -273,8 +273,6 @@ mod tests {
             let s = subject(i);
             assert_eq!(KEY.select(&s, &c), KEY.select(&s, &c));
         }
-        // And a second call site holding a copy of the key agrees, which is the
-        // "no shared state" property: there is nothing to synchronise.
         let key2 = RendezvousKey::from_words(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
         for i in 0..64 {
             let s = subject(i);
@@ -335,9 +333,6 @@ mod tests {
 
     #[test]
     fn removing_a_candidate_moves_exactly_the_keys_it_owned() {
-        // Property (3), asserted *exactly* rather than statistically. This is
-        // the whole reason for highest-random-weight over a modulo: a change to
-        // the candidate set must not be a fleet-wide reshuffle.
         let full = [1u64, 2, 3, 4, 5];
         let reduced = [1u64, 3, 4, 5]; // candidate 2 withdrawn
         const N: usize = 20_000;
@@ -359,8 +354,6 @@ mod tests {
             }
         }
         assert_eq!(moved, owned_by_removed);
-        // And the withdrawn candidate owned a real share, so the test is not
-        // passing because nothing was ever removed.
         assert!(owned_by_removed > N as u64 / 10);
     }
 
@@ -377,7 +370,6 @@ mod tests {
             }
         }
         let share = moved as f64 / N as f64;
-        // Joining a five-way set should take about a fifth.
         assert!(
             (0.15..0.25).contains(&share),
             "joining took {share:.4} of the keys, expected about 0.2"
@@ -428,9 +420,6 @@ mod tests {
 
     #[test]
     fn an_infinite_weight_is_rejected_rather_than_treated_as_certainty() {
-        // `1/0` in a caller's arithmetic must not become "always pick this".
-        // Treating it as ineligible fails closed and leaves the other
-        // candidates to compete.
         let s = subject(11);
         let winner = KEY.select_weighted(&s, [(1u64, f64::INFINITY), (2, 1.0)]);
         assert_eq!(winner, Some(2));
@@ -459,19 +448,10 @@ mod tests {
 
     #[test]
     fn the_band_admits_a_gap_larger_than_either_tolerance_alone() {
-        // 1 ms apart at a 20 ms minimum: the relative term (2 ms) covers it,
-        // and the absolute floor is not what decided.
         let band = CostBand::default();
         assert!(band.admits_more_than_one(&[20.0, 21.0]));
-        // 0.4 ms apart at a 2 ms minimum: the relative term is 0.2 ms, so only
-        // the absolute floor admits it. This is the case a purely relative
-        // band gets wrong, and it is the common one — a set of anycast servers
-        // within one region differ by fractions of a millisecond.
         assert!(band.admits_more_than_one(&[2.0, 2.4]));
-        // 40 ms apart at a 20 ms minimum: outside both.
         assert!(!band.admits_more_than_one(&[20.0, 60.0]));
-        // 3.5x apart at a 2 ms minimum: the absolute floor must not be read as
-        // "anything goes when the base is small".
         assert!(!band.admits_more_than_one(&[2.0, 7.0]));
     }
 
@@ -481,9 +461,6 @@ mod tests {
             percent: f64::NAN,
             absolute_ms: -1.0,
         };
-        // Both tolerances are unusable, so the band is the single cheapest
-        // candidate — a defensible reading, and crucially not one that
-        // produces an empty set or a NaN limit.
         let limit = band.limit(10.0);
         assert_eq!(limit, 10.0);
         assert!(!band.admits_more_than_one(&[10.0, 11.0]));

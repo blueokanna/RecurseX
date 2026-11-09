@@ -58,6 +58,11 @@ fn trusted_identity_can_exchange_dns() {
 }
 
 #[test]
+fn live_certificate_clock_is_selected_by_zero() {
+    assert_eq!(exchange("localhost", true, 0), (true, true));
+}
+
+#[test]
 fn wrong_hostname_never_sends_dns() {
     assert_eq!(
         exchange("wrong.example", true, 1_800_000_000),

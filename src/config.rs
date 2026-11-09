@@ -901,6 +901,9 @@ impl Config {
         let dns_policy = self.build_dns_policy()?;
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         {
+            for forwarder in dns_policy.upstreams.all() {
+                forwarder.validate()?;
+            }
             if let Some(path) = &self.forwarder_ca_file {
                 ec.forwarder_roots.add_pem_file(path).map_err(|e| {
                     Error::new(ErrorKind::Config, format!("forwarder trust roots: {e}"))
@@ -999,7 +1002,7 @@ pub fn parse_rr_type(s: &str) -> Option<RrType> {
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+    #[cfg(feature = "dot")]
     #[test]
     fn encrypted_configuration_requires_trust_roots() {
         let json = r#"{"dns":{"nameservers":["tls://127.0.0.1#localhost"]}}"#;
@@ -1224,7 +1227,7 @@ mod tests {
         fn clash_kebab_and_snake_keys_are_accepted() {
             for key in ["nameserver-policy", "nameserver_policy", "nameserverPolicy"] {
                 let json = format!(
-                    r#"{{"forwarderCaFile":"tests/fixtures/localhost.pem","dns": {{"{key}": {{"+.node.example": ["tls://10.0.0.53#dns.example"]}}}}}}"#
+                    r#"{{"forwarderCaFile":"tests/fixtures/localhost.pem","dns": {{"{key}": {{"+.node.example": ["10.0.0.53"]}}}}}}"#
                 );
                 let rc = Config::from_json_str(&json)
                     .unwrap_or_else(|e| panic!("{key} should parse: {e}"))
@@ -1513,10 +1516,10 @@ mod tests {
                 r#"{
                     "forwarderCaFile":"tests/fixtures/localhost.pem",
                     "dns": {
-                        "nameservers": ["tls://1.1.1.1#one.one.one.one"],
-                        "fallback": ["tls://8.8.8.8#dns.google"],
+                        "nameservers": ["1.1.1.1"],
+                        "fallback": ["8.8.8.8"],
                         "nameserver-policy": {
-                            "+.node.example": ["tls://10.0.0.53#dns.example"]
+                            "+.node.example": ["10.0.0.53"]
                         },
                         "fallback-filter": {
                             "ipcidr": ["198.18.0.0/15"],

@@ -53,11 +53,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (all features, all targets)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Clippy (no_std core, lib only)
-        run: cargo clippy --no-default-features --lib -- -D warnings
+        run: cargo clippy --locked --no-default-features --lib -- -D warnings
       - name: Clippy (std only, all targets)
-        run: cargo clippy --no-default-features --features std --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features std --all-targets -- -D warnings
 
   # ------------------------------------------------------------------
   # Documentation — rustdoc must be warning-free, and the doctests are
@@ -73,11 +73,11 @@ jobs:
         uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       - name: Rustdoc (all features, warnings denied)
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --locked --all-features --no-deps
       - name: Doctests (all features)
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
       - name: Doctests (no_std core)
-        run: cargo test --doc --no-default-features
+        run: cargo test --locked --doc --no-default-features
 
   test:
     name: test (${{ matrix.toolchain }}, ${{ matrix.os }})
@@ -102,14 +102,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test (all features)
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - name: Test (default features)
-        run: cargo test
+        run: cargo test --locked
       # The release profile is what ships, and optimized code is where
       # timing assumptions break. One leg is enough for it.
       - name: Test (release, all features)
         if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo test --release --all-features
+        run: cargo test --locked --release --all-features
   features:
     name: features
     runs-on: ubuntu-latest
@@ -121,25 +121,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build + test (no_std core)
         run: |
-          cargo build --no-default-features
-          cargo test --no-default-features --lib
+          cargo build --locked --no-default-features
+          cargo test --locked --no-default-features --lib
       - name: Build + test (std only)
         run: |
-          cargo build --no-default-features --features std
-          cargo test --no-default-features --features std --lib
+          cargo build --locked --no-default-features --features std
+          cargo test --locked --no-default-features --features std --lib
       - name: Build (each optional feature alone)
         shell: bash
         run: |
           set -euo pipefail
           for f in dot doh doh3 doq dnssec persist; do
             echo "::group::feature $f"
-            cargo build --no-default-features --features "$f"
+            cargo build --locked --no-default-features --features "$f"
             echo "::endgroup::"
           done
       - name: Build + test (all features)
         run: |
-          cargo build --all-features
-          cargo test --all-features --lib
+          cargo build --locked --all-features
+          cargo test --locked --all-features --lib
   release:
     name: release
     runs-on: ubuntu-latest
@@ -150,13 +150,13 @@ jobs:
         uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       - name: Build (release, all features)
-        run: cargo build --release --all-features
+        run: cargo build --locked --release --all-features
       - name: Examples (release, all features)
-        run: cargo build --release --examples --all-features
+        run: cargo build --locked --release --examples --all-features
       # Each example declares the features it needs, so this builds exactly
       # the std-only ones: a missing `required-features` shows up here.
       - name: Examples (debug, std only)
-        run: cargo build --examples --no-default-features --features std
+        run: cargo build --locked --examples --no-default-features --features std
 
   package:
     name: package

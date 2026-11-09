@@ -160,6 +160,18 @@ pub struct Verification {
 }
 
 impl Verification {
+    /// Reject a detected invalid signature before serving or caching data.
+    /// An indeterminate chain still cannot assert root-anchored trust.
+    pub fn checked_signature_state(self) -> crate::error::Result<bool> {
+        if self.verdict == Verdict::Bogus {
+            return Err(crate::error::Error::new(
+                crate::error::ErrorKind::Dnssec,
+                "DNSSEC signature verification failed",
+            ));
+        }
+        Ok(self.state.is_signature_verified())
+    }
+
     /// A report for a chain with no answer data.
     pub fn empty() -> Self {
         Self {
@@ -326,13 +338,16 @@ pub fn verify_rrsig(
     };
     let RData::Dnskey {
         flags,
-        protocol: _,
+        protocol,
         algorithm: key_alg,
         public_key,
     } = &dnskey.rdata
     else {
         return Err("dnskey rdata");
     };
+    if *protocol != 3 || flags & 0x0100 == 0 {
+        return Err("DNSKEY is not a protocol-3 zone key");
+    }
 
     if *algorithm != *key_alg {
         return Ok(false);
@@ -406,10 +421,34 @@ pub fn validate_rrset(
     let rec_refs: Vec<&Record> = records.iter().collect();
     let mut attempted = false;
     for rrsig in rrsigs {
-        if !matches!(rrsig.rdata, RData::Rrsig { .. }) {
+        let RData::Rrsig {
+            algorithm,
+            key_tag: expected_tag,
+            signer,
+            ..
+        } = &rrsig.rdata
+        else {
             continue;
-        }
+        };
         for key in dnskey_records {
+            let RData::Dnskey {
+                flags,
+                protocol,
+                algorithm: key_algorithm,
+                public_key,
+            } = &key.rdata
+            else {
+                continue;
+            };
+            if key.name != *signer
+                || key.class != rrsig.class
+                || *protocol != 3
+                || flags & 0x0100 == 0
+                || key_algorithm != algorithm
+                || key_tag(*flags, *protocol, algorithm.to_u8(), public_key) != *expected_tag
+            {
+                continue;
+            }
             match verify_rrsig(key, rrsig, &rec_refs, now_secs) {
                 Ok(true) => return Verdict::Secure,
                 // The signature is well-formed for a supported algorithm and
@@ -450,11 +489,11 @@ pub fn rrsig_signer(rrsig: &Record) -> Option<&Name> {
 // Resolver integration
 // ---------------------------------------------------------------------
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::Cell;
 
-/// Recursion guard: while the validator runs, sub-resolutions (DNSKEY / DS
-/// fetches) skip their own validation, bounding the recursion depth.
-static VALIDATING: AtomicBool = AtomicBool::new(false);
+// DNSKEY/DS sub-resolutions skip recursive validation on the same thread.
+// Independent worker threads must still validate their own answers.
+thread_local! { static VALIDATING: Cell<bool> = const { Cell::new(false) }; }
 
 /// Holds the single validation slot; releases it on drop, including when the
 /// validation unwinds. Leaving it set would turn every later answer into
@@ -463,7 +502,7 @@ struct ValidationGuard;
 
 impl ValidationGuard {
     fn enter() -> Option<Self> {
-        if VALIDATING.swap(true, Ordering::SeqCst) {
+        if VALIDATING.with(|active| active.replace(true)) {
             return None;
         }
         Some(ValidationGuard)
@@ -472,7 +511,7 @@ impl ValidationGuard {
 
 impl Drop for ValidationGuard {
     fn drop(&mut self) {
-        VALIDATING.store(false, Ordering::SeqCst);
+        VALIDATING.with(|active| active.set(false));
     }
 }
 
@@ -486,7 +525,7 @@ pub fn validate_resolution_detailed(
     res: &crate::resolver::Resolution,
     anchored: bool,
 ) -> Verification {
-    if res.answers.is_empty() {
+    if res.answers.is_empty() && res.authorities.is_empty() {
         return Verification::empty();
     }
     let Some(_guard) = ValidationGuard::enter() else {
@@ -524,7 +563,7 @@ pub fn validate_message_detailed(
     resp: &crate::message::Message,
     anchored: bool,
 ) -> Verification {
-    if resp.answers.is_empty() {
+    if resp.answers.is_empty() && resp.authorities.is_empty() {
         return Verification::empty();
     }
     let Some(_guard) = ValidationGuard::enter() else {
@@ -550,8 +589,7 @@ pub fn validate_message_detailed(
         (data, sigs)
     };
     let (answers, rrsigs) = split(&resp.answers);
-    let (authorities, _) = split(&resp.authorities);
-    verify_chain(resolver, &answers, &rrsigs, &authorities, anchored)
+    verify_chain(resolver, &answers, &rrsigs, &resp.authorities, anchored)
 }
 
 /// Validate a raw forwarder response, returning the bare verdict.
@@ -653,7 +691,7 @@ fn verify_chain(
         let t = resolver.now();
         (t / 1_000_000_000) as u32
     };
-    let (verdict, total, authenticated) = verify_section(resolver, answers, rrsigs, now_secs);
+    let (mut verdict, total, authenticated) = verify_section(resolver, answers, rrsigs, now_secs);
     let authority_authenticated = if authorities.is_empty() {
         None
     } else {
@@ -679,7 +717,11 @@ fn verify_chain(
                 .filter(|r| r.rr_type == RrType::RRSIG)
                 .cloned()
                 .collect();
-            let (_, at, aa) = verify_section(resolver, &relevant, &authority_sigs, now_secs);
+            let (authority_verdict, at, aa) =
+                verify_section(resolver, &relevant, &authority_sigs, now_secs);
+            if authority_verdict == Verdict::Bogus {
+                verdict = Verdict::Bogus;
+            }
             // Authenticated only when every group in it authenticated; a
             // Bogus or Indeterminate authority group cannot be waved
             // through.
@@ -772,6 +814,67 @@ fn key_is_anchored(resolver: &crate::resolver::Resolver, signer: &Name, key: &Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_keys_do_not_turn_an_unsupported_signature_into_bogus() {
+        let name = Name::from_ascii("example.test").unwrap();
+        let class = crate::qtype::RrClass::IN;
+        let answer = Record {
+            name: name.clone(),
+            rr_type: RrType::A,
+            class,
+            ttl: 60,
+            rdata: RData::A("192.0.2.1".parse().unwrap()),
+        };
+        let signature = Record {
+            name: name.clone(),
+            rr_type: RrType::RRSIG,
+            class,
+            ttl: 60,
+            rdata: RData::Rrsig {
+                type_covered: RrType::A,
+                algorithm: DnssecAlgorithm::ECDSAP256SHA256,
+                labels: 2,
+                original_ttl: 60,
+                expiration: u32::MAX,
+                inception: 0,
+                key_tag: 0,
+                signer: name.clone(),
+                signature: vec![0; 64],
+            },
+        };
+        let unrelated = Record {
+            name,
+            rr_type: RrType::DNSKEY,
+            class,
+            ttl: 60,
+            rdata: RData::Dnskey {
+                flags: 256,
+                protocol: 3,
+                algorithm: DnssecAlgorithm::RSASHA256,
+                public_key: vec![1, 3, 1],
+            },
+        };
+        assert_eq!(
+            validate_rrset(&[answer], &[signature], &[unrelated], 1_800_000_000),
+            Verdict::Indeterminate
+        );
+    }
+
+    #[test]
+    fn validation_recursion_guard_does_not_skip_other_threads() {
+        let guard = ValidationGuard::enter().unwrap();
+        assert!(ValidationGuard::enter().is_none());
+        std::thread::spawn(|| assert!(ValidationGuard::enter().is_some()))
+            .join()
+            .unwrap();
+        drop(guard);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = ValidationGuard::enter().unwrap();
+            panic!("injected validation failure");
+        });
+        assert!(ValidationGuard::enter().is_some());
+    }
 
     /// The property that matters more than any single verdict: a
     /// signature-verified answer with **no** configured anchor must never be

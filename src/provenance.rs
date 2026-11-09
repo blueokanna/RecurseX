@@ -395,8 +395,6 @@ where
 {
     let mut deps: Vec<Dependency> = Vec::with_capacity(chain.len() + 2);
     let class = crate::qtype::RrClass::IN;
-    // The chain hops: the first hop's owner is the query name, and each
-    // subsequent hop is owned by the previous hop's target.
     for (i, _target) in chain.iter().enumerate() {
         let owner = if i == 0 {
             qname.clone()
@@ -602,7 +600,6 @@ mod tests {
             vec![weak.clone(), strong.clone()],
         );
         assert!((p.risk_reduction(&strong) - 0.01).abs() < 1e-12);
-        // Each refreshed marginal removes its own failure mass.
         assert!((p.risk_reduction(&weak) - 0.50).abs() < 1e-12);
     }
 
@@ -644,8 +641,6 @@ mod tests {
         let config = ProvenanceConfig {
             max_dependencies: 3,
         };
-        // Five dependencies; the weakest two must survive the trim, and the
-        // resulting bound must not be higher than the untrimmed one.
         let all = vec![
             dep(DependencyRole::Answer, "a.example.com", 0.99),
             dep(DependencyRole::Answer, "b.example.com", 0.98),
@@ -672,7 +667,6 @@ mod tests {
         p.push(dep(DependencyRole::Answer, "strong.example.com", 0.99));
         p.push(dep(DependencyRole::Answer, "mid.example.com", 0.50));
         assert_eq!(p.len(), 2);
-        // The strongest was dropped, so the bound did not rise.
         assert!((p.bound() - 0.10).abs() < 1e-12);
     }
 
@@ -700,7 +694,6 @@ mod tests {
             &chain,
             Some(1.0),
             |k| {
-                // CNAMEs are weaker than the final answer.
                 if k.rr_type == RrType::CNAME {
                     0.6
                 } else {

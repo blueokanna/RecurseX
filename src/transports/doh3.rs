@@ -1,19 +1,17 @@
 //! DNS over HTTP/3 (QUIC) via courierust's HTTP/3 client (ALPN `h3`).
 
-use crate::sync::Mutex;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use courierust::courierust_client::{Client, ClientConfig, TlsSettings};
 use courierust::courierust_tls::RootStore;
 
-use crate::error::{Error, Result};
-use crate::transport::{DnsTransport, MAX_TCP_MESSAGE};
+use crate::error::Result;
+use crate::transport::DnsTransport;
 use crate::upstream::{Endpoint, Proto};
 
 /// DNS over HTTP/3 transport (the QUIC-based variant of DoH).
 pub struct Doh3Transport {
-    /// The HTTPS authority hostname.
+    /// The literal IP identity authenticated by the certificate.
     pub hostname: String,
     /// The DoH URI path (default `/dns-query`).
     pub path: String,
@@ -21,10 +19,10 @@ pub struct Doh3Transport {
     pub roots: RootStore,
     /// Whether to verify the server certificate.
     pub verify: bool,
-    /// Current unix time (seconds) for certificate validity.
+    /// Fixed Unix seconds for replay; zero uses the live system clock.
     pub now: i64,
     /// Lazily created courierust HTTP/3 client (pooled QUIC connection).
-    client: Mutex<Option<Client>>,
+    client: super::http_dns::HttpDnsClient,
 }
 
 /// Identity and trust settings; the pooled client is deliberately not
@@ -45,12 +43,12 @@ impl core::fmt::Debug for Doh3Transport {
 impl Default for Doh3Transport {
     fn default() -> Self {
         Self {
-            hostname: "dns.google".into(),
+            hostname: "8.8.8.8".into(),
             path: "/dns-query".into(),
             roots: RootStore::new(),
             verify: true,
             now: 0,
-            client: Mutex::new(None),
+            client: super::http_dns::HttpDnsClient::default(),
         }
     }
 }
@@ -64,31 +62,8 @@ impl Doh3Transport {
             roots,
             verify,
             now,
-            client: Mutex::new(None),
+            client: super::http_dns::HttpDnsClient::default(),
         }
-    }
-
-    fn client(&self) -> Result<Client> {
-        let mut guard = self.client.lock();
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let cfg = ClientConfig {
-            http3: true,
-            max_connections_per_host: 1,
-            tls: Some(TlsSettings {
-                roots: self.roots.clone(),
-                verify: self.verify,
-                alpn: vec![b"h3".to_vec()],
-                now: self.now,
-                ..Default::default()
-            }),
-            max_body: MAX_TCP_MESSAGE,
-            ..Default::default()
-        };
-        let client = Client::with_config(cfg);
-        *guard = Some(client.clone());
-        Ok(client)
     }
 }
 
@@ -98,28 +73,18 @@ impl DnsTransport for Doh3Transport {
     }
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
-        let client = self.client()?;
-        let url = format!("https://{}:{}{}", self.hostname, endpoint.port, self.path);
-        let resp = client
-            .request(&url, courierust::courierust_http::Method::POST)
-            .body(query.to_vec())
-            .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
-            .send()
-            .map_err(|e| Error::transport(format!("doh3 request: {e}")))?;
-        if resp.status.as_u16() != 200 {
-            return Err(Error::transport(format!(
-                "doh3 status {} from {}",
-                resp.status.as_u16(),
-                self.hostname
-            )));
-        }
-        let body = resp
-            .body
-            .collect()
-            .map_err(|e| Error::transport(format!("doh3 body: {e}")))?;
-        if body.len() > MAX_TCP_MESSAGE {
-            return Err(Error::transport("doh3 response too large"));
-        }
-        Ok(body.to_vec())
+        self.client.exchange(
+            super::http_dns::Settings {
+                host: &self.hostname,
+                path: &self.path,
+                roots: &self.roots,
+                verify: self.verify,
+                now: self.now,
+                http3: true,
+            },
+            query,
+            endpoint,
+            timeout_ms,
+        )
     }
 }

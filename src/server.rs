@@ -294,8 +294,6 @@ fn udp_recv_loop(
         }
         let (n, src) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
-            // Read timeout (and, on Windows, a stray ICMP error reported on
-            // a bound socket): check the flag and try again.
             Err(_) => continue,
         };
         let job = UdpJob {
@@ -312,9 +310,6 @@ fn udp_recv_loop(
 /// Handler loop: answer one queued datagram, send the response.
 fn udp_handler_loop(queue: Arc<WorkQueue<UdpJob>>, resolver: Resolver) {
     while let Some(job) = queue.pop() {
-        // UDP answers are truncated to the client's advertised EDNS payload
-        // size (RFC 6891 §6.2.5), so we never emit an oversized,
-        // fragmenting datagram or amplify past the client's buffer.
         let udp_limit = Message::parse(&job.bytes)
             .ok()
             .and_then(|q| q.edns.map(|e| e.udp_payload_size as usize))
@@ -341,18 +336,45 @@ fn tcp_accept_loop(
         };
         let resolver = resolver.clone();
         let conns = conns.clone();
-        // Bound concurrent connections.
-        if max > 0 && conns.load(Ordering::Relaxed) >= max {
+        let Some(slot) = ConnectionSlot::reserve(conns, max) else {
             continue;
-        }
+        };
         let shutdown = shutdown.clone();
-        conns.fetch_add(1, Ordering::Relaxed);
         let _ = std::thread::Builder::new()
             .name("dns-tcp".into())
             .spawn(move || {
+                let _slot = slot;
                 let _ = tcp_conn(stream, resolver, &shutdown, idle_ms);
-                conns.fetch_sub(1, Ordering::Relaxed);
             });
+    }
+}
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl ConnectionSlot {
+    fn reserve(connections: Arc<AtomicUsize>, maximum: usize) -> Option<Self> {
+        let mut count = connections.load(Ordering::Acquire);
+        loop {
+            if maximum > 0 && count >= maximum {
+                return None;
+            }
+            let next = count.checked_add(1)?;
+            match connections.compare_exchange_weak(
+                count,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(connections)),
+                Err(actual) => count = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -375,8 +397,6 @@ fn read_deadline(
         if shutdown.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        // The loop condition proved `filled < buf.len()`, so the tail exists;
-        // `get_mut` is what says so without a slicing expression.
         let Some(rest) = buf.get_mut(filled..) else {
             return Ok(false);
         };
@@ -389,7 +409,6 @@ fn read_deadline(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                // Socket poll interval; the deadline above is the real bound.
                 continue;
             }
             Err(e) => return Err(e),
@@ -441,7 +460,6 @@ fn tcp_conn(
         )? {
             return Ok(());
         }
-        // TCP carries full responses; no truncation.
         let response = answer(&resolver, &query, client_ip, None);
         let mut framed = Vec::with_capacity(response.len() + 2);
         framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
@@ -473,9 +491,6 @@ fn answer(
             }
         }
         Err(_) => {
-            // Unparseable query: FORMERR, but echo the 16-bit ID and the RD
-            // bit straight out of the header so a client can still match the
-            // response to its request.
             let mut m = Message::new(query_id(query_bytes));
             m.flags.qr = true;
             m.flags.ra = true;
@@ -497,6 +512,28 @@ fn query_id(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_slots_survive_rejection_and_unwind() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let slot = ConnectionSlot::reserve(count.clone(), 1).unwrap();
+        assert!(ConnectionSlot::reserve(count.clone(), 1).is_none());
+        let _ = std::panic::catch_unwind(move || {
+            let _slot = slot;
+            panic!("connection handler failed");
+        });
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        let slot = ConnectionSlot::reserve(count.clone(), 1).unwrap();
+        let unstarted_handler = move || {
+            let _slot = slot;
+        };
+        drop(unstarted_handler);
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "an unstarted handler must release its reservation"
+        );
+    }
     use crate::name::Name;
     use crate::qtype::{Rcode, RrClass, RrType};
     use crate::rdata::{RData, Record};
@@ -611,7 +648,6 @@ mod tests {
         let server = Server::new(resolver_pointed_at(upstream));
         let addr = server.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // A 4-byte "message": header ID, then garbage.
         sock.send_to(&[0xab, 0xcd, 0x01, 0x00], addr).unwrap();
         let mut buf = [0u8; 512];
         sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -676,9 +712,7 @@ mod tests {
         let udp = server.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let tcp = server.bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
 
-        // Hold an idle TCP connection open so a per-connection thread exists.
         let idle_conn = TcpStream::connect(tcp).unwrap();
-        // And make sure the UDP path is live.
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let query = Message::query(1, Name::from_ascii("example.com").unwrap(), RrType::A, true)
             .to_bytes()
@@ -713,7 +747,6 @@ mod tests {
         );
         let addr = server.bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
 
-        // (a) Idle: open, send nothing, expect the server to close.
         let mut idle = TcpStream::connect(addr).unwrap();
         idle.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -724,7 +757,6 @@ mod tests {
             "an idle connection must be closed by the server"
         );
 
-        // (b) Drip: send half a length prefix and stop.
         let mut drip = TcpStream::connect(addr).unwrap();
         drip.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

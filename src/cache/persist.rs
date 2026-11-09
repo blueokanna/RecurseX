@@ -24,6 +24,7 @@
 //!   an `Err`) and never poisons the live cache.
 
 use alloc::vec::Vec;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use nextjson::{NsonDeserialize, NsonSerialize};
@@ -247,13 +248,24 @@ impl Snapshot {
             let Ok(name) = Name::from_wire(&dto.name, 0) else {
                 continue;
             };
-            let (name, _) = name;
-            let expires = unix_to_ts(dto.expires_unix);
-            let end = expires.saturating_add(stale_window_secs as Ts * 1_000_000_000);
-            if now >= end {
+            let (name, consumed) = name;
+            if consumed != dto.name.len() || Rcode(dto.rcode) != Rcode::NXDOMAIN {
                 continue;
             }
-            let soa = dto.soa.as_deref().and_then(parse_record);
+            let expires = unix_to_ts(dto.expires_unix);
+            if now >= expires || cache.config.nx_capacity == 0 {
+                continue;
+            }
+            let soa = match dto.soa.as_deref() {
+                Some(bytes) => match parse_record(bytes) {
+                    Some(record) if record.rr_type == RrType::SOA => Some(record),
+                    _ => continue,
+                },
+                None => None,
+            };
+            if !cache.nx.contains_key(&name) && cache.nx.len() >= cache.config.nx_capacity {
+                cache.nx.pop_first();
+            }
             cache.nx.insert(
                 name,
                 NegativeEntry {
@@ -284,12 +296,93 @@ pub fn encode(cache: &SemanticCache, now_unix: i64) -> Result<Vec<u8>> {
 /// Atomically write a snapshot to `path` (temp file + rename).
 pub fn save_to(cache: &SemanticCache, path: &Path, now_unix: i64) -> Result<()> {
     let bytes = encode(cache, now_unix)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| Error::io(format!("cache persist write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
+    let (temporary, mut file) = TemporarySnapshot::create(path)?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| {
+            Error::io(format!(
+                "cache persist write {}: {e}",
+                temporary.path.display()
+            ))
+        })?;
+    drop(file);
+    commit_snapshot(&temporary.path, path)
         .map_err(|e| Error::io(format!("cache persist rename {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    std::fs::File::open(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(|e| Error::io(format!("cache persist directory sync: {e}")))?;
     Ok(())
+}
+
+fn commit_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
+    static COMMIT: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+    let _commit = COMMIT.lock();
+    #[cfg(windows)]
+    for attempt in 0..7 {
+        match std::fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            // Windows may briefly retain a replaced file's delete handle.
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => {
+                std::thread::sleep(std::time::Duration::from_millis(1 << attempt))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    std::fs::rename(source, destination)
+}
+
+struct TemporarySnapshot {
+    path: std::path::PathBuf,
+}
+
+impl TemporarySnapshot {
+    fn create(destination: &Path) -> Result<(Self, std::fs::File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let name = destination
+            .file_name()
+            .ok_or_else(|| Error::config("snapshot path has no filename"))?;
+        for _ in 0..16 {
+            let mut temporary = name.to_os_string();
+            temporary.push(format!(
+                ".{}.{}.tmp",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let path = destination.with_file_name(temporary);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(Error::io(format!(
+                        "cache persist create {}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Err(Error::io(
+            "could not allocate a unique snapshot temporary file",
+        ))
+    }
+}
+
+impl Drop for TemporarySnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Load a snapshot from `path` into `cache`; returns the number of entries
@@ -305,14 +398,39 @@ pub fn load_from_limit(
     now: Ts,
     frame_limit: u64,
 ) -> Result<usize> {
-    if !path.exists() {
-        return Ok(0);
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(Error::io(format!(
+                "cache persist read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let size = file
+        .metadata()
+        .map_err(|e| Error::io(format!("cache metadata: {e}")))?;
+    if !size.is_file() || size.len() > frame_limit {
+        return Err(Error::config(
+            "cache snapshot is not a regular file within the frame limit",
+        ));
     }
-    let bytes = std::fs::read(path)
+    // The extra byte detects growth after metadata was read without an
+    // unbounded allocation. The codec separately limits parsing work.
+    let mut bytes = Vec::new();
+    file.take(frame_limit.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|e| Error::io(format!("cache persist read {}: {e}", path.display())))?;
+    if bytes.len() as u64 > frame_limit {
+        return Err(Error::config("cache snapshot exceeds frame limit"));
+    }
     let snap: Snapshot = rustbinary::options()
         .with_limit(frame_limit)
         .with_collection_limit(DEFAULT_COLLECTION_LIMIT)
+        .with_value_limit(DEFAULT_COLLECTION_LIMIT)
+        .with_decode_work_limit(frame_limit)
+        .with_depth_limit(32)
         .deserialize(&bytes)
         .map_err(|e| Error::internal(format!("cache decode: {e}")))?;
     let stale = cache.config.stale_window_secs;
@@ -343,7 +461,8 @@ fn record_wire(r: &Record) -> Option<Vec<u8>> {
 
 fn parse_record(wire: &[u8]) -> Option<Record> {
     let mut pos = 0usize;
-    Record::parse(wire, &mut pos).ok()
+    let record = Record::parse(wire, &mut pos).ok()?;
+    (pos == wire.len()).then_some(record)
 }
 
 fn ecs_to_dto(ecs: &EcsKey) -> EcsDto {
@@ -473,7 +592,32 @@ fn entry_to_dto(e: &CacheEntry, tier: Tier) -> Option<EntryDto> {
 }
 
 fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEntry> {
-    let (name, _) = Name::from_wire(&d.name, 0).ok()?;
+    let (name, consumed) = Name::from_wire(&d.name, 0).ok()?;
+    if consumed != d.name.len() {
+        return None;
+    }
+    if let Some(ecs) = &d.ecs {
+        let maximum = match ecs.family {
+            1 => 32,
+            2 => 128,
+            _ => return None,
+        };
+        if ecs.prefix == 0
+            || ecs.prefix > maximum
+            || ecs.addr.len() != usize::from(ecs.prefix).div_ceil(8)
+        {
+            return None;
+        }
+        let remainder = ecs.prefix % 8;
+        if remainder != 0
+            && ecs
+                .addr
+                .last()
+                .is_some_and(|byte| byte & ((1u8 << (8 - remainder)) - 1) != 0)
+        {
+            return None;
+        }
+    }
     let expires = unix_to_ts(d.expires_unix);
     // Fully dead: neither fresh nor stale-servable.
     let stale_end = expires.saturating_add(stale_window_secs as Ts * 1_000_000_000);
@@ -498,19 +642,35 @@ fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEn
             let mut data = Vec::with_capacity(records.len());
             let mut sigs = Vec::with_capacity(rrsigs.len());
             for w in records {
-                data.push(parse_record(w)?);
+                let record = parse_record(w)?;
+                if record.name != key.name
+                    || record.rr_type != key.rr_type
+                    || record.class != key.class
+                {
+                    return None;
+                }
+                data.push(record);
             }
             for w in rrsigs {
-                sigs.push(parse_record(w)?);
+                let signature = parse_record(w)?;
+                if signature.name != key.name
+                    || signature.class != key.class
+                    || signature.rr_type != RrType::RRSIG
+                    || !matches!(&signature.rdata, crate::rdata::RData::Rrsig { type_covered, .. } if *type_covered == key.rr_type)
+                {
+                    return None;
+                }
+                sigs.push(signature);
             }
+            let ttl = data.iter().map(|record| record.ttl).min().unwrap_or(0);
             let rrset = crate::rrset::RrSet {
                 name: key.name.clone(),
                 rr_type: key.rr_type,
                 class: key.class,
                 records: data,
                 rrsigs: sigs,
-                ttl: d.kind.ttl(),
-                validated: d.validated,
+                ttl,
+                validated: false,
             };
             EntryKind::Positive(rrset)
         }
@@ -544,7 +704,7 @@ fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEn
         served: d.served,
         last_served: unix_to_ts(d.last_served_unix),
         stability: dto_to_stability(&d.stability),
-        validated: d.validated,
+        validated: false,
         score: d.score,
         tier,
         refreshing: false,
@@ -552,26 +712,117 @@ fn dto_to_entry(d: &EntryDto, now: Ts, stale_window_secs: u32) -> Option<CacheEn
     })
 }
 
-impl KindDto {
-    /// The effective TTL for a positive entry (min of record TTLs).
-    fn ttl(&self) -> u32 {
-        match self {
-            KindDto::Positive { records, .. } => records
-                .iter()
-                .filter_map(|w| parse_record(w))
-                .map(|r| r.ttl)
-                .min()
-                .unwrap_or(0),
-            KindDto::Negative { ttl_secs, .. } => *ttl_secs,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::{CacheConfig, CacheKey};
     use crate::rrset::RrSet;
+
+    #[test]
+    fn snapshot_restoration_preserves_capacity_and_drops_expired_negatives() {
+        let mut source = cache_with_entries();
+        for i in 0..16 {
+            source.insert_nxdomain(
+                &Name::from_ascii(&format!("n{i}.test")).unwrap(),
+                Rcode::NXDOMAIN,
+                None,
+                60,
+                now(),
+            );
+        }
+        let snapshot = Snapshot::new(&source, 1_700_000_000);
+        for capacity in [0, 3] {
+            let mut restored = SemanticCache::new(CacheConfig {
+                nx_capacity: capacity,
+                ..Default::default()
+            });
+            snapshot.restore_into(&mut restored, now(), 86400);
+            assert_eq!(restored.nx.len(), capacity);
+            snapshot.restore_into(&mut restored, now() + 61_000_000_000, 86400);
+            let mut fresh = SemanticCache::new(CacheConfig::default());
+            snapshot.restore_into(&mut fresh, now() + 61_000_000_000, 86400);
+            assert!(fresh.nx.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_snapshot_entries_cannot_change_cache_identity() {
+        for case in 0..4 {
+            let mut snapshot = Snapshot::new(&cache_with_entries(), 1_700_000_000);
+            let entry = snapshot.entries.first_mut().unwrap();
+            match case {
+                0 => entry.name.push(0),
+                1 => entry.rr_type = RrType::AAAA.to_u16(),
+                2 => {
+                    entry.ecs = Some(EcsDto {
+                        family: 1,
+                        prefix: 24,
+                        addr: vec![192, 0, 2, 0],
+                    })
+                }
+                _ => {
+                    if let KindDto::Positive { records, .. } = &mut entry.kind {
+                        records.first_mut().unwrap().push(0);
+                    }
+                }
+            }
+            assert!(dto_to_entry(entry, now(), 86400).is_none());
+        }
+        let mut snapshot = Snapshot::new(&cache_with_entries(), 1_700_000_000);
+        let dto = snapshot.entries.first_mut().unwrap();
+        dto.validated = true;
+        let entry = dto_to_entry(dto, now(), 86400).unwrap();
+        assert!(!entry.validated);
+        assert!(!entry.rrset().unwrap().validated);
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_before_codec_allocation() {
+        let path =
+            std::env::temp_dir().join(format!("recursex_oversized_{}.rxc", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        drop(file);
+        let result = load_from_limit(
+            &mut SemanticCache::new(CacheConfig::default()),
+            &path,
+            now(),
+            64,
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap_err().kind, crate::error::ErrorKind::Config);
+    }
+
+    #[test]
+    fn concurrent_snapshot_saves_use_independent_temporary_files() {
+        let directory =
+            std::env::temp_dir().join(format!("recursex_concurrent_save_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("cache.rxc");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    save_to(&cache_with_entries(), &path, 1_700_000_000).unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            load_from(
+                &mut SemanticCache::new(CacheConfig::default()),
+                &path,
+                now()
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     fn now() -> Ts {
         1_700_000_000_000_000_000
@@ -708,7 +959,7 @@ mod tests {
         let ecs = EcsKey {
             family: 1,
             prefix: 24,
-            addr: vec![192, 0, 2, 0],
+            addr: vec![192, 0, 2],
         };
         let k = CacheKey {
             name: Name::from_ascii("ecs.example").unwrap(),
@@ -735,7 +986,7 @@ mod tests {
             ecs: Some(EcsKey {
                 family: 1,
                 prefix: 24,
-                addr: vec![192, 0, 2, 0],
+                addr: vec![192, 0, 2],
             }),
         };
         let out = restored.lookup(&k2, now());

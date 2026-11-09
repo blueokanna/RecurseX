@@ -1,9 +1,10 @@
-//! Shared background DNS work limits, charged at the exchange boundary.
+//! Shared DNS work envelopes, charged at the exchange boundary.
 //!
 //! Byte accounting covers DNS payloads, not IP/TLS/HTTP framing or unsolicited
 //! traffic. A maximum DNS response is reserved before each send; failed
 //! exchanges retain that reservation because received bytes may be unknown.
-//! A scoped thread context also covers nested DNSSEC and forwarder exchanges.
+//! A scoped thread context shares foreground limits across nested DNSSEC and
+//! forwarder exchanges; background scopes additionally charge a global budget.
 
 use crate::budget::{FetchLimits, Work};
 use crate::error::{Error, ErrorKind, Result};
@@ -191,7 +192,7 @@ impl Drop for Permit {
 }
 
 struct TaskContext {
-    budget: Arc<BackgroundBudget>,
+    budget: Option<Arc<BackgroundBudget>>,
     limits: FetchLimits,
     work: Work,
     reserved_bytes: u64,
@@ -207,8 +208,24 @@ pub(crate) struct TaskScope {
     previous: Option<TaskContext>,
 }
 impl TaskScope {
+    /// Nested DNSKEY/DS work shares its caller's envelope and deadline.
+    pub(crate) fn enter_query(limits: FetchLimits, timeout_ms: u64) -> Option<Self> {
+        if TASK.with(|task| task.borrow().is_some()) {
+            return None;
+        }
+        Some(Self::enter_inner(None, limits, timeout_ms))
+    }
+
     pub(crate) fn enter(
         budget: Arc<BackgroundBudget>,
+        limits: FetchLimits,
+        timeout_ms: u64,
+    ) -> Self {
+        Self::enter_inner(Some(budget), limits, timeout_ms)
+    }
+
+    fn enter_inner(
+        budget: Option<Arc<BackgroundBudget>>,
         limits: FetchLimits,
         timeout_ms: u64,
     ) -> Self {
@@ -271,7 +288,7 @@ pub(crate) fn exchange(
         if remaining == 0 {
             return Err(Error::new(
                 ErrorKind::Timeout,
-                "background task deadline exhausted",
+                "resolution task deadline exhausted",
             ));
         }
         let reserve = (query_bytes as u64).saturating_add(RESPONSE_RESERVE);
@@ -280,10 +297,14 @@ pub(crate) fn exchange(
         {
             return Err(Error::new(
                 ErrorKind::RateLimited,
-                "background task work exhausted",
+                "resolution task work exhausted",
             ));
         }
-        let permit = task.budget.reserve(endpoint.ip, query_bytes as u64)?;
+        let permit = task
+            .budget
+            .as_ref()
+            .map(|budget| budget.reserve(endpoint.ip, query_bytes as u64))
+            .transpose()?;
         task.work.subqueries += 1;
         task.work.bytes = task.work.bytes.saturating_add(query_bytes as u64);
         task.reserved_bytes += reserve;
@@ -294,7 +315,9 @@ pub(crate) fn exchange(
     };
     let result = send(timeout);
     if let Ok(bytes) = &result {
-        permit.received = Some(bytes.len() as u64);
+        if let Some(permit) = permit.as_mut() {
+            permit.received = Some(bytes.len() as u64);
+        }
         TASK.with(|task| {
             if let Some(task) = task.borrow_mut().as_mut() {
                 task.work.bytes = task.work.bytes.saturating_add(bytes.len() as u64);
@@ -310,6 +333,27 @@ pub(crate) fn exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_foreground_work_shares_one_envelope() {
+        let scope = TaskScope::enter_query(
+            FetchLimits {
+                max_subqueries: 1,
+                ..FetchLimits::default()
+            },
+            1000,
+        )
+        .unwrap();
+        exchange(&endpoint(), 12, 100, |_| Ok(vec![0; 20])).unwrap();
+        assert!(TaskScope::enter_query(FetchLimits::default(), 1000).is_none());
+        assert!(exchange(&endpoint(), 12, 100, |_| panic!(
+            "nested query must not escape the limit"
+        ))
+        .is_err());
+        assert_eq!(scope.work().subqueries, 1);
+        drop(scope);
+        assert!(TaskScope::enter_query(FetchLimits::default(), 1000).is_some());
+    }
     fn endpoint() -> Endpoint {
         Endpoint::udp("127.0.0.1".parse().unwrap())
     }

@@ -321,9 +321,21 @@ impl Csprng {
                 }
             }
         }
-        // Counter overflow would repeat keystream; the rekey threshold is
-        // set far below it, but a defensive wrap keeps the type total.
         self.counter = self.counter.wrapping_add(1);
+        if self.counter == 0 {
+            // A failed OS rekey must not cause repeated keystream at the
+            // 32-bit block boundary. Continue under a distinct nonce.
+            let mut carry = true;
+            for byte in &mut self.nonce {
+                let (next, overflow) = byte.overflowing_add(u8::from(carry));
+                *byte = next;
+                carry = overflow;
+                if !carry {
+                    break;
+                }
+            }
+            assert!(!carry, "CSPRNG nonce space exhausted; rekey required");
+        }
         self.pos = 0;
     }
 }
@@ -461,6 +473,18 @@ pub fn siphash24_128(k0: u64, k1: u64, input: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_wrap_uses_a_new_nonce() {
+        let mut rng = Csprng::new([7; 32], [0; 12]);
+        rng.counter = u32::MAX;
+        let mut last = [0; 64];
+        rng.fill_bytes(&mut last);
+        let mut next = [0; 64];
+        rng.fill_bytes(&mut next);
+        assert_ne!(last, next);
+        assert_eq!(rng.nonce.first(), Some(&1));
+    }
     #[cfg(not(feature = "std"))]
     use alloc::vec::Vec;
 

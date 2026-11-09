@@ -4,42 +4,24 @@ version = 3
 
 [[package]]
 name = "courierust"
-version = "1.0.7"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dd4bdb0606308c783d886160451e8e074bb6c1c1ee7c154efa6b6402aa27ad0"
+checksum = "c5d9acf17b902baee05a1b95997adb463b1033d76a50bd652a191e22333ebe23"
 
 [[package]]
 name = "nextjson"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e11456b12f6d0776f7e431232b638d1315a3deffd790b0bf818277a7d8efca"
+checksum = "68d7b62e00bcf925eb49ba02a6ab5f9a8abc7c100e9d11c92d8f58ba7684fd11"
 dependencies = [
  "nextjson-derive",
 ]
 
 [[package]]
 name = "nextjson-derive"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84d8161c22b5b2d74b022b89480cdced97c716e9f819bf123fec0d810cb8bb86"
-
-[[package]]
-name = "proc-macro2"
-version = "1.0.107"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
-dependencies = [
- "unicode-ident",
-]
-
-[[package]]
-name = "quote"
-version = "1.0.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
-dependencies = [
- "proc-macro2",
-]
+checksum = "40902ae48213c919e92efb5f135ee952596dd2d37426ab1ab64ad65bdfdb23d1"
 
 [[package]]
 name = "recurse-x"
@@ -53,34 +35,11 @@ dependencies = [
 
 [[package]]
 name = "rustbinary"
-version = "0.1.8"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "229bae73c7a1daecd8f504d382ea8372683d1b2b30962048b051218ee96a6e7f"
+checksum = "9043ba0f2a82503efa22293821db461b45de3813b6e5a04de4595729fd159231"
 dependencies = [
  "nextjson",
- "rustbinary-derive",
-]
-
-[[package]]
-name = "rustbinary-derive"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ff15f5a7a6c6048ff7b7984847585e7cc70f36d80ed431bfbda42417f961c9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "syn"
-version = "3.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
 ]
 
 [[package]]
@@ -88,9 +47,3 @@ name = "tzcraft"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cec9458ae44ab93f5dfbbea23325c6dfef65cf1723358894785721e363e41635"
-
-[[package]]
-name = "unicode-ident"
-version = "1.0.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"

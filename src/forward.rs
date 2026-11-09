@@ -31,6 +31,35 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
+    /// Validate transport availability and identity before enabling an upstream.
+    pub fn validate(&self) -> Result<()> {
+        let available = match self.endpoint.proto {
+            Proto::Udp | Proto::Tcp => true,
+            Proto::Tls => cfg!(feature = "dot"),
+            Proto::DoH => cfg!(feature = "doh"),
+            Proto::DoH3 => cfg!(feature = "doh3"),
+            Proto::DoQ => cfg!(feature = "doq"),
+        };
+        if !available {
+            return Err(Error::config(
+                "upstream transport is not enabled in this build",
+            ));
+        }
+        if !matches!(self.endpoint.proto, Proto::Udp | Proto::Tcp)
+            && self.host.as_deref().map_or(true, str::is_empty)
+        {
+            return Err(Error::config("encrypted upstream requires a TLS identity"));
+        }
+        #[cfg(any(feature = "doh", feature = "doh3"))]
+        if matches!(self.endpoint.proto, Proto::DoH | Proto::DoH3) {
+            crate::transports::validate_http_endpoint(
+                self.host.as_deref().unwrap_or_default(),
+                &self.endpoint,
+            )?;
+        }
+        Ok(())
+    }
+
     /// A plain UDP/TCP forwarder.
     pub fn plain(endpoint: Endpoint) -> Self {
         Self {
@@ -216,22 +245,29 @@ impl ForwarderSet {
     ) -> Result<Message> {
         let mut last_err: Option<Error> = None;
         for f in group {
-            let resp_bytes = match self.exchange_one(f, query_bytes, timeout_ms) {
-                Ok(b) => b,
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
-                }
-            };
-            let resp = match Message::parse(&resp_bytes) {
+            let mut resp = match self.exchange_message(f, query, query_bytes, timeout_ms) {
                 Ok(m) => m,
                 Err(e) => {
                     last_err = Some(e);
                     continue;
                 }
             };
-            if !response_matches_query(query, &resp) {
-                last_err = Some(Error::transport("forwarder response did not match query"));
+            if resp.flags.tc && f.endpoint.proto == Proto::Udp {
+                let tcp =
+                    Forwarder::plain(Endpoint::new(f.endpoint.ip, f.endpoint.port, Proto::Tcp));
+                resp = match self.exchange_message(&tcp, query, query_bytes, timeout_ms) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        last_err = Some(error);
+                        continue;
+                    }
+                };
+            }
+            if resp.flags.tc {
+                last_err = Some(Error::new(
+                    ErrorKind::Truncated,
+                    "upstream returned a truncated stream response",
+                ));
                 continue;
             }
             let rcode = resp.rcode();
@@ -252,6 +288,20 @@ impl ForwarderSet {
         Err(last_err.unwrap_or_else(|| Error::new(ErrorKind::NoUpstream, "no forwarder answered")))
     }
 
+    fn exchange_message(
+        &self,
+        forwarder: &Forwarder,
+        query: &Message,
+        bytes: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Message> {
+        let message = Message::parse(&self.exchange_one(forwarder, bytes, timeout_ms)?)?;
+        if !response_matches_query(query, &message) {
+            return Err(Error::transport("forwarder response did not match query"));
+        }
+        Ok(message)
+    }
+
     fn exchange_one(&self, f: &Forwarder, query: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
         if matches!(f.endpoint.proto, Proto::Udp | Proto::Tcp) {
             return self.exchange_one_unmetered(f, query, timeout_ms);
@@ -267,6 +317,7 @@ impl ForwarderSet {
         query: &[u8],
         timeout_ms: u64,
     ) -> Result<Vec<u8>> {
+        f.validate()?;
         if !matches!(f.endpoint.proto, Proto::Udp | Proto::Tcp)
             && self.verify
             && (self.roots.is_empty() || f.host.as_deref().map_or(true, str::is_empty))
@@ -450,6 +501,56 @@ pub fn response_to_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_udp_forwarding_retries_tcp_on_the_same_upstream() {
+        use std::io::{Read, Write};
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = tcp.local_addr().unwrap();
+        let udp = std::net::UdpSocket::bind(address).unwrap();
+        udp.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let udp_server = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            let (length, peer) = udp.recv_from(&mut bytes).unwrap();
+            let mut response = Message::parse(&bytes[..length]).unwrap();
+            response.flags.qr = true;
+            response.flags.tc = true;
+            udp.send_to(&response.to_bytes().unwrap(), peer).unwrap();
+        });
+        let tcp_server = std::thread::spawn(move || {
+            let (mut stream, _) = tcp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut prefix = [0; 2];
+            stream.read_exact(&mut prefix).unwrap();
+            let mut bytes = vec![0; u16::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            let mut response = Message::parse(&bytes).unwrap();
+            response.flags.qr = true;
+            let bytes = response.to_bytes().unwrap();
+            stream
+                .write_all(&(bytes.len() as u16).to_be_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let forwarder = Forwarder::plain(Endpoint::new(address.ip(), address.port(), Proto::Udp));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let query = Message::query(
+            23,
+            crate::name::Name::from_ascii("tcp.example").unwrap(),
+            crate::qtype::RrType::A,
+            true,
+        );
+        let response = set
+            .exchange_with(&[forwarder], &query, &query.to_bytes().unwrap(), 1000)
+            .unwrap();
+        assert!(!response.flags.tc);
+        assert_eq!(response.questions, query.questions);
+        udp_server.join().unwrap();
+        tcp_server.join().unwrap();
+    }
     use crate::message::Question;
     use crate::name::Name;
     use crate::qtype::{RrClass, RrType};

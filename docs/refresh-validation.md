@@ -137,14 +137,45 @@ the replay plumbing, not useful predictive behavior on a real workload.
 
 ## Checks
 
+The dependency upgrade on 2026-11-09 uses the official crates.io releases:
+[courierust 1.1.1](https://crates.io/crates/courierust/1.1.1),
+[nextjson 0.1.5](https://crates.io/crates/nextjson/0.1.5),
+[tzcraft 0.1.2](https://crates.io/crates/tzcraft/0.1.2), and
+[rustbinary 0.1.10](https://crates.io/crates/rustbinary/0.1.10).
+The registry API confirmed these as the latest stable versions at the time
+of the upgrade. There is no vendored source or path override. RustBinary
+uses only its `std` feature; schema derives come from nextjson.
+
+The upgrade adds fail-closed DNSSEC handling to fresh/cache/stale paths,
+thread-local validation recursion guards, a shared foreground/nested fetch
+envelope, and active-owner retention when the coalescing table is full.
+UDP truncation in forwarding now retries TCP against the same upstream.
+UDP wrong-source floods and TCP/DoT framing use a monotonic deadline.
+
+Snapshot reads are capped before decoding, with explicit codec token/work
+limits. Restore validates record identity, ECS partitions and capacity, and
+clears validation flags. Saves use exclusive temporary files, file sync,
+atomic replacement, bounded Windows rename retries and Unix directory sync.
+The concurrent-save test reproduced Windows access-denied races before the
+bounded commit logic was added.
+
+HTTP/2 and HTTP/3 loopback tests independently verify connection reuse,
+media type, redirect rejection, and certificate failure before DNS payload.
+With this published dependency, pinned DoH requires an IP certificate
+identity; separate hostname/IP routing is rejected instead of using system
+DNS. The pooled HTTP client is refreshed when its validation second changes,
+which prevents a permanently frozen certificate clock but reduces connection
+retention. HTTP phase timeouts still follow the dependency's blocking I/O
+semantics; there is no claim of preempting an in-progress library call.
+
 Observed test results:
 
 | Build | Unit | Integration | Documentation |
 | --- | ---: | ---: | ---: |
-| Rust 1.78, all features | 467 | 28 | 4 |
-| Installed stable, all features | 467 | 28 | 4 |
-| Rust 1.78, no default features | 334 | 8 | 3 |
-| Rust 1.78, std only | 407 | 19 | 4 |
+| Rust 1.78, all features | 481 | 40 | 4 |
+| Installed stable, all features | 481 | 40 | 4 |
+| Rust 1.78, no default features | 335 | 8 | 3 |
+| Rust 1.78, std only | 414 | 19 | 4 |
 
 Formatting and strict Clippy are also checked.
 The existing empty documentation line in `src/float.rs` was fixed instead of

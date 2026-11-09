@@ -660,9 +660,6 @@ fn affinity_subject(qname: &Name, qtype: RrType) -> Vec<u8> {
 struct Slot {
     result: Mutex<Option<Result<Resolution>>>,
     cv: Condvar,
-    /// Set once a result has been published. A slot that is done but still
-    /// present in the in-flight table is a slot whose owner could not take
-    /// the table lock on its way out; the next claim for that key reaps it.
     done: std::sync::atomic::AtomicBool,
 }
 
@@ -774,16 +771,15 @@ enum Claim {
     Owner(Owner),
     /// Another caller owns it; wait on this slot.
     Waiter(Arc<Slot>),
+    /// Capacity is exhausted; live owners remain registered.
+    Rejected,
 }
 
 /// Coalescing of identical in-flight resolutions.
 ///
 /// One thread resolves a key, everyone else waits for its result. The table
-/// is bounded by `max`: claiming a new key while it is full evicts one slot.
-/// That is safe by construction — the evicted owner keeps running and still
-/// publishes to the waiters already parked on *its* slot; only the
-/// de-duplication entry is lost, so a concurrent duplicate of the evicted key
-/// would resolve again (bounded extra work) instead of being joined.
+/// is bounded by `max`. New distinct keys are rejected at capacity; live
+/// owners remain registered so duplicate queries still join their work.
 struct Inflight {
     slots: BTreeMap<QueryKey, Arc<Slot>>,
     max: usize,
@@ -807,15 +803,20 @@ impl Inflight {
             if !slot.done.load(Ordering::Acquire) {
                 return Claim::Waiter(slot.clone());
             }
-            // The previous owner finished but could not reap its entry (it
-            // was unwinding, or the table lock was busy). Replace it.
             self.slots.remove(key);
         }
         if self.slots.len() >= self.max {
-            // O(log n) eviction with no auxiliary structure: which key is
-            // dropped does not matter for correctness, only that the table
-            // stays bounded.
-            self.slots.pop_first();
+            let completed = self
+                .slots
+                .iter()
+                .take(16)
+                .find(|(_, slot)| slot.done.load(Ordering::Acquire))
+                .map(|(key, _)| key.clone());
+            if let Some(key) = completed {
+                self.slots.remove(&key);
+            } else {
+                return Claim::Rejected;
+            }
         }
         let slot = Arc::new(Slot::new());
         self.slots.insert(key.clone(), slot.clone());
@@ -949,16 +950,8 @@ impl Resolver {
         }
         let policy = PolicyEngine::new(config.policy.clone());
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
-        let mut forwarder_set = crate::forward::ForwarderSet::new(
-            config.engine.forwarder_roots.clone(),
-            true,
-            now_secs,
-        );
+        let mut forwarder_set =
+            crate::forward::ForwarderSet::new(config.engine.forwarder_roots.clone(), true, 0);
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         {
             for f in config.dns.upstreams.all() {
@@ -1045,11 +1038,7 @@ impl Resolver {
     /// `verify = false` is an explicit insecure test-only opt-out.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub fn set_forwarder_roots(&self, roots: courierust::courierust_tls::RootStore, verify: bool) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let mut fs = crate::forward::ForwarderSet::new(roots, verify, now);
+        let mut fs = crate::forward::ForwarderSet::new(roots, verify, 0);
         for f in self.inner.config.dns.upstreams.all() {
             fs.add(f);
         }
@@ -1118,6 +1107,10 @@ impl Resolver {
 
     /// Resolve a query key.
     pub fn resolve_key(&self, key: &QueryKey) -> Result<Resolution> {
+        let _query_scope = crate::background::TaskScope::enter_query(
+            self.inner.config.engine.fetch_limits,
+            self.inner.config.engine.query_budget_ms,
+        );
         let _exchange_scope =
             crate::background::ExchangeScope::enter(self.inner.exchange_counters.clone());
         let started = Instant::now();
@@ -1146,6 +1139,12 @@ impl Resolver {
 
         let claim = self.inner.inflight.lock().claim(key, &self.inner);
         let owner = match claim {
+            Claim::Rejected => {
+                return Err(Error::new(
+                    ErrorKind::RateLimited,
+                    "in-flight resolution capacity exhausted",
+                ))
+            }
             Claim::Waiter(slot) => {
                 self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
                 return match crate::background::task_deadline() {
@@ -1222,10 +1221,6 @@ impl Resolver {
         }
 
         let settings = self.inner.config.dns.fake_ip.as_ref()?;
-
-        // Reverse first, and keyed on the address rather than the name. An
-        // address the pool handed out earlier is still the pool's to explain
-        // even if the name has since been filtered out of fake-IP.
         if key.rr_type == RrType::PTR {
             let ip = match parse_in_addr_arpa(&key.name) {
                 Some(v4) => IpAddr::V4(v4),
@@ -1249,18 +1244,12 @@ impl Resolver {
             });
         }
 
-        // Which families get a synthetic answer is configuration, not a
-        // property of the query: a v6 range turns `AAAA` into a synthesized
-        // answer, and its absence keeps the NODATA answer that pushes a
-        // dual-stack client onto the v4 address it was already given.
         let family = match key.rr_type {
             RrType::A => crate::fakeip::Family::V4,
             RrType::AAAA => crate::fakeip::Family::V6,
             _ => return None,
         };
         if !settings.synthesizes(family) {
-            // A *decided* NODATA, not a miss: falling through to the network
-            // here is exactly how a client escapes the proxy over IPv6.
             return Some(empty_answer(key, settings.answer_ttl(), now));
         }
 
@@ -1268,7 +1257,6 @@ impl Resolver {
         let pool = guard.as_mut()?;
         let ip = match pool.allocate(&key.name, family, now) {
             Ok(crate::fakeip::Allocation::Address(ip)) => ip,
-            // Excluded by `fake-ip-filter`: resolve it for real.
             Ok(crate::fakeip::Allocation::Filtered) => {
                 self.inner
                     .stats
@@ -1276,8 +1264,6 @@ impl Resolver {
                     .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            // The pool could not allocate. A real answer beats no answer, so
-            // this degrades to normal resolution rather than failing.
             Err(_) => return None,
         };
         self.inner
@@ -1285,8 +1271,6 @@ impl Resolver {
             .fake_ip_answered
             .fetch_add(1, Ordering::Relaxed);
         let ttl = settings.answer_ttl();
-        // The record type follows the family, so an address from the v6 space
-        // can never be serialized into an `A` record.
         let rdata = match ip {
             IpAddr::V4(v4) => RData::A(v4),
             IpAddr::V6(v6) => RData::Aaaa(v6),
@@ -1368,8 +1352,6 @@ impl Resolver {
             qr: true,
             rd: query.flags.rd,
             ra: true,
-            // No complete root-to-answer validator exists yet. Neither a
-            // public bool nor a local signature check authenticates the chain.
             ad: false,
             cd: query.flags.cd,
             rcode: res.rcode,
@@ -1424,6 +1406,7 @@ impl Resolver {
         // Cache-first path.
         if cache_policy != ResolutionCachePolicy::Bypass {
             if let Some(res) = self.resolve_from_cache(key, now, cache_policy) {
+                let res = res?;
                 self.inner.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(res);
             }
@@ -1460,7 +1443,7 @@ impl Resolver {
                         self.inner.clock.now(),
                         ResolutionCachePolicy::AfterRefreshFailure,
                     ) {
-                        return Ok(res);
+                        return res;
                     }
                 }
                 return Err(error);
@@ -1469,13 +1452,13 @@ impl Resolver {
         res.served_at = now;
 
         #[cfg(feature = "dnssec")]
-        if self.inner.config.engine.dnssec && !key.cd && !res.answers.is_empty() {
+        if self.inner.config.engine.dnssec && !key.cd {
             let v = crate::dnssec::validate_resolution_detailed(
                 self,
                 &res,
                 self.inner.config.engine.dnssec_anchored,
             );
-            res.validated = v.state.is_signature_verified();
+            res.validated = v.checked_signature_state()?;
         }
 
         self.cache_resolution(key, &res, now);
@@ -1536,9 +1519,7 @@ impl Resolver {
                     .stats
                     .fallback_triggered
                     .fetch_add(1, Ordering::Relaxed);
-                if let Ok(fallback) = self.forward_once(key, &groups.fallback) {
-                    return Ok(fallback);
-                }
+                return self.forward_once(key, &groups.fallback);
             }
         }
         Ok(res)
@@ -1567,18 +1548,6 @@ impl Resolver {
             &bytes,
             self.inner.config.engine.timeout_ms,
         )?;
-        #[cfg(feature = "dnssec")]
-        if self.inner.config.engine.dnssec && !key.cd {
-            let v = crate::dnssec::validate_message_detailed(
-                self,
-                key,
-                &resp,
-                self.inner.config.engine.dnssec_anchored,
-            );
-            let mut res = crate::forward::response_to_resolution(key, &resp);
-            res.validated = v.state.is_signature_verified();
-            return Ok(res);
-        }
         Ok(crate::forward::response_to_resolution(key, &resp))
     }
 
@@ -1589,7 +1558,7 @@ impl Resolver {
         key: &QueryKey,
         now: Ts,
         cache_policy: ResolutionCachePolicy,
-    ) -> Option<Resolution> {
+    ) -> Option<Result<Resolution>> {
         let planner = ResolutionPlanner::new(self.inner.config.planner);
         let mut current = key.clone();
         let mut answers: Vec<Record> = Vec::new();
@@ -1674,12 +1643,6 @@ impl Resolver {
                     stale = true;
                     ttl = ttl.min(self.inner.config.stale_serve_ttl.max(1));
                     validated &= entry.validated;
-                    // Refresh the key the entry actually lives at, not the key
-                    // we asked with. Under ECS those differ whenever the answer
-                    // was found at a broader scope than the requester's own
-                    // partition, and *that* key is the one `mark_refreshing`
-                    // can find — refreshing the requester's key would silently
-                    // do nothing.
                     refresh_keys.push(entry.key.clone());
                     match entry.kind {
                         EntryKind::Positive(rrset) => {
@@ -1755,12 +1718,42 @@ impl Resolver {
         if ttl == u32::MAX {
             ttl = 0;
         }
+        let cached = Resolution {
+            name: key.name.clone(),
+            rr_type: key.rr_type,
+            class: key.class,
+            rcode,
+            answers,
+            authorities,
+            rrsigs,
+            validated,
+            ttl,
+            from_cache: true,
+            stale,
+            // A cache hit learned nothing new about the scope: the entry
+            // already sits in the partition it was filed under.
+            ecs_scope: None,
+            served_at: now,
+        };
+        #[cfg(feature = "dnssec")]
+        let cached = {
+            let mut cached = cached;
+            if self.inner.config.engine.dnssec && !key.cd {
+                match crate::dnssec::validate_resolution_detailed(self, &cached, false)
+                    .checked_signature_state()
+                {
+                    Ok(verified) => cached.validated = verified,
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            cached
+        };
         if stale {
             let representative = stale_entries.first()?;
             let value_ms = self.inner.shared.estimator.lock().est_cost_ms(&key.name);
             let ctx = crate::planner::StaleContext {
                 consequence: worst_consequence,
-                trust: self.trust_level(validated),
+                trust: self.trust_level(cached.validated),
                 freshness_lcb: provenance.joint_lower_bound(),
                 staleness_secs: max_staleness_secs,
                 value_ms,
@@ -1814,23 +1807,7 @@ impl Resolver {
                 self.refresh_with_dependents(&k, self.inner.config.max_chain_refresh);
             }
         }
-        Some(Resolution {
-            name: key.name.clone(),
-            rr_type: key.rr_type,
-            class: key.class,
-            rcode,
-            answers,
-            authorities,
-            rrsigs,
-            validated,
-            ttl,
-            from_cache: true,
-            stale,
-            // A cache hit learned nothing new about the scope: the entry
-            // already sits in the partition it was filed under.
-            ecs_scope: None,
-            served_at: now,
-        })
+        Some(Ok(cached))
     }
 
     /// The iterative resolution loop (root → TLD → authoritative).
@@ -2956,6 +2933,12 @@ impl Resolver {
         };
         let claim = self.inner.inflight.lock().claim(&qk, &self.inner);
         let owner = match claim {
+            Claim::Rejected => {
+                return Err(Error::new(
+                    ErrorKind::RateLimited,
+                    "in-flight resolution capacity exhausted",
+                ))
+            }
             Claim::Waiter(slot) => {
                 self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
                 return slot
@@ -3970,12 +3953,12 @@ mod tests {
             // Abandon an owner without publishing: its entry goes stale.
             match inf.claim(&k1, &r.inner) {
                 Claim::Owner(o) => drop(o),
-                Claim::Waiter(_) => panic!("first claim must own the key"),
+                _ => panic!("first claim must own the key"),
             }
             // The next claim replaces the dead slot instead of joining it…
             match inf.claim(&k1, &r.inner) {
                 Claim::Owner(o) => owners.push(o),
-                Claim::Waiter(_) => panic!("a done slot must be reaped"),
+                _ => panic!("a done slot must be reaped"),
             }
             // …and now a second claim does join it.
             assert!(matches!(inf.claim(&k1, &r.inner), Claim::Waiter(_)));
@@ -3985,6 +3968,8 @@ mod tests {
                     owners.push(o);
                 }
             }
+            assert!(matches!(inf.claim(&k3, &r.inner), Claim::Rejected));
+            assert!(matches!(inf.claim(&k1, &r.inner), Claim::Waiter(_)));
             assert!(inf.len() <= 2, "in-flight table must stay bounded");
         }
         drop(owners);
@@ -4002,7 +3987,7 @@ mod tests {
         let mut inf = r.inner.inflight.lock();
         let owner = match inf.claim(&k, &r.inner) {
             Claim::Owner(o) => o,
-            Claim::Waiter(_) => panic!("first claim must own the key"),
+            _ => panic!("first claim must own the key"),
         };
         let slot = owner.slot.clone();
         // While the owner is alive, a second claim joins its slot.
@@ -4016,7 +4001,7 @@ mod tests {
         // And the next claim gets a live slot, not the dead one.
         let _owner2 = match inf.claim(&k, &r.inner) {
             Claim::Owner(o) => o,
-            Claim::Waiter(_) => panic!("dead slot must be reaped"),
+            _ => panic!("dead slot must be reaped"),
         };
         assert!(!inf.slots[&k].done.load(Ordering::Acquire));
         assert_eq!(inf.len(), 1);

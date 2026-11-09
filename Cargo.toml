@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.78"
 license-file = "LICENSE"
 authors = ["blueokanna", "HyphenTeam"]
-description = "A risk-constrained recursive DNS resolver: a credibility-bounded RRset change model, dependency-consistent cache refresh, and a budgeted serve-stale policy."
+description = "A recursive DNS resolver with bounded refresh scheduling, verified encrypted upstreams, and observable-change modeling."
 homepage = "https://github.com/blueokanna/RecurseX"
 repository = "https://github.com/blueokanna/RecurseX"
 readme = "README.md"
@@ -27,7 +27,7 @@ exclude = [
 
 [features]
 default = ["std", "dot", "doh", "doh3", "doq", "dnssec", "persist"]
-std = []
+std = ["dep:courierust"]
 dnssec = ["std", "dep:courierust"]
 dot = ["std", "dep:courierust"]
 doh = ["std", "dep:courierust"]
@@ -36,18 +36,14 @@ doq = ["std", "dep:courierust"]
 persist = ["std", "dep:rustbinary"]
 
 [dependencies]
-nextjson = { version = "0.1.4", default-features = false, features = [
+nextjson = { version = "0.1.5", default-features = false, features = [
     "derive",
 ] }
-tzcraft = { version = "0.1", default-features = false, features = ["alloc"] }
-rustbinary = { version = "0.1.8", default-features = false, features = [
+tzcraft = { version = "0.1.2", default-features = false, features = ["alloc"] }
+rustbinary = { version = "0.1.10", default-features = false, features = [
     "std",
-    "derive",
-    "fingerprint",
-    "static-size",
-    "reflection",
 ], optional = true }
-courierust = { version = "1.0.7", optional = true }
+courierust = { version = "1.1.1", optional = true }
 
 [[example]]
 name = "custom_config"

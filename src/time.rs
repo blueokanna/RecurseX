@@ -158,10 +158,6 @@ pub fn format_rfc3339(t: Ts) -> String {
 #[cfg(feature = "std")]
 impl fmt::Display for ManualClock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `try_read`, not `read`: this can be reached from inside a panic
-        // message, and a plain read there would block behind a writer or
-        // re-enter a write guard the current thread still holds. Rendering
-        // "busy" is worse than a number and far better than a hang.
         match self.now.try_read() {
             Some(now) => write!(f, "ManualClock({now})"),
             None => f.write_str("ManualClock(<locked>)"),
