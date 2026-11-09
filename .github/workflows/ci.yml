@@ -6,7 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Least privilege: this workflow only reads the repository.
 permissions:
   contents: read
 
@@ -20,9 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ------------------------------------------------------------------
-  # Formatting — rustfmt must be clean.
-  # ------------------------------------------------------------------
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -37,10 +33,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # ------------------------------------------------------------------
-  # Lint — clippy with warnings denied, on every feature frontier that
-  # has its own code path.
-  # ------------------------------------------------------------------
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -59,10 +51,6 @@ jobs:
       - name: Clippy (std only, all targets)
         run: cargo clippy --locked --no-default-features --features std --all-targets -- -D warnings
 
-  # ------------------------------------------------------------------
-  # Documentation — rustdoc must be warning-free, and the doctests are
-  # part of the test suite rather than decoration.
-  # ------------------------------------------------------------------
   doc:
     name: doc
     runs-on: ubuntu-latest
@@ -105,17 +93,15 @@ jobs:
         run: cargo test --locked --all-features
       - name: Test (default features)
         run: cargo test --locked
-      - name: Repeat HTTP DNS loopback regressions (Windows MSRV)
+      - name: Repeat encrypted DNS loopback regressions (Windows MSRV)
         if: matrix.toolchain == 'msrv' && matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           for ($iteration = 1; $iteration -le 3; $iteration++) {
-            Write-Host "HTTP DNS loopback round $iteration/3"
-            cargo test --locked --all-features --test http_dns -- --test-threads=8
+            Write-Host "Encrypted DNS loopback round $iteration/3"
+            cargo test --locked --all-features --test http_dns --test tls_identity -- --test-threads=8
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      # The release profile is what ships, and optimized code is where
-      # timing assumptions break. One leg is enough for it.
       - name: Test (release, all features)
         if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
         run: cargo test --locked --release --all-features
@@ -162,8 +148,6 @@ jobs:
         run: cargo build --locked --release --all-features
       - name: Examples (release, all features)
         run: cargo build --locked --release --examples --all-features
-      # Each example declares the features it needs, so this builds exactly
-      # the std-only ones: a missing `required-features` shows up here.
       - name: Examples (debug, std only)
         run: cargo build --locked --examples --no-default-features --features std
 

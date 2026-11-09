@@ -1,26 +1,23 @@
 #![cfg(feature = "doh")]
 
+#[path = "support/encrypted.rs"]
+mod encrypted;
+
 use courierust::courierust_body::Body;
 use courierust::courierust_http::{request::Request, response::Response};
 use courierust::courierust_net::stats::Stats;
 use courierust::courierust_server::{Server, ServerConfig, ServerHandle, TlsSettings};
 use courierust::courierust_tls::{Identity, RootStore};
+use encrypted::IO_TIMEOUT_MS as REQUEST_TIMEOUT_MS;
 use recurse_x::transport::DnsTransport;
 use recurse_x::upstream::{Endpoint, Proto};
 use recurse_x::{Message, Name, RrType};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
 
 const CERT: &[u8] = include_bytes!("fixtures/loopback-ip.der");
 const KEY: &[u8] = include_bytes!("fixtures/loopback-ip-key.der");
-const REQUEST_TIMEOUT_MS: u64 = 10_000;
-
-// These tests check protocol policy and pooling, not concurrent handshake
-// throughput. Unoptimized cryptography can starve the peer's reactor on a
-// small CI runner, exhausting QUIC retransmits before the request deadline.
-static NETWORK_TEST: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct ResponseGate {
@@ -71,11 +68,9 @@ impl Drop for Upstream {
 }
 
 fn upstream(http3: bool, content_type: &'static str, redirect: bool) -> Upstream {
-    let serial = NETWORK_TEST
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let serial = encrypted::serial();
     let stats = Stats::new();
-    let io_timeout = Duration::from_millis(REQUEST_TIMEOUT_MS);
+    let io_timeout = encrypted::IO_TIMEOUT;
     let server = Server::bind_with_config(
         "127.0.0.1:0",
         ServerConfig {
@@ -304,9 +299,6 @@ fn http_timeout_is_reported_as_timeout_for_failure_fallback() {
     transport.path = "/slow".into();
     let endpoint = Endpoint::new(upstream.address.ip(), upstream.address.port(), Proto::DoH);
     let started = std::time::Instant::now();
-    // The handler withholds its response until teardown. Give TLS setup
-    // enough time, then require evidence that DNS reached the handler:
-    // a handshake timeout must not satisfy this regression accidentally.
     let error = transport.exchange(&query(), &endpoint, 2_000).unwrap_err();
     assert_eq!(
         error.kind,

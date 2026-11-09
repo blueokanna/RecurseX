@@ -177,6 +177,21 @@ Observed test results:
 | Rust 1.78, no default features | 335 | 8 | 3 |
 | Rust 1.78, std only | 414 | 19 | 4 |
 
+The Windows MSRV CI failures were reproduced with the test process restricted
+to two logical CPUs and eight test threads. The original DoT fixture's
+two-second deadline expired during all five concurrent handshakes: the two
+success cases failed, while three certificate-rejection cases falsely passed
+because they reduced every error to `false`. The earlier HTTP fixture fix
+did not cover this separate test binary.
+
+DoT and HTTP fixtures now share a functional-test budget and serialization
+helper. DoT assertions retain both peers' errors, require the specific
+certificate rejection reason and count every received application byte.
+Successful cases exchange complete DNS messages with the response length
+prefix and payload split across TLS records. Listener acceptance is bounded,
+and teardown joins the server before releasing the test gate. CI repeats
+both encrypted-DNS test binaries; a failed round terminates the step.
+
 Formatting and strict Clippy are also checked.
 The existing empty documentation line in `src/float.rs` was fixed instead of
 waiving the stable Clippy warning. Exact final counts are reported in the
