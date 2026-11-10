@@ -93,6 +93,14 @@ jobs:
         run: cargo test --locked --all-features
       - name: Test (default features)
         run: cargo test --locked
+      - name: Repeat outbound factory regression (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          for ($iteration = 1; $iteration -le 10; $iteration++) {
+            cargo test --locked --all-features --test outbound_factory
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Repeat encrypted DNS loopback regressions (Windows MSRV)
         if: matrix.toolchain == 'msrv' && matrix.os == 'windows-latest'
         shell: pwsh

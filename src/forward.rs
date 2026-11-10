@@ -756,6 +756,10 @@ impl Drop for RaceCancellation {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/sockets.rs"]
+mod test_sockets;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -854,9 +858,9 @@ mod tests {
     #[test]
     fn truncated_udp_forwarding_retries_tcp_on_the_same_upstream() {
         use std::io::{Read, Write};
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (tcp, udp) = super::test_sockets::bind_dns_pair()
+            .expect("reserve UDP and TCP on the same upstream endpoint");
         let address = tcp.local_addr().unwrap();
-        let udp = std::net::UdpSocket::bind(address).unwrap();
         udp.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
         let udp_server = std::thread::spawn(move || {

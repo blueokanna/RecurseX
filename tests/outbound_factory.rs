@@ -1,6 +1,9 @@
 //! One isolated process: Courierust's socket factory can only be installed once.
 #![cfg(feature = "std")]
 
+#[path = "support/sockets.rs"]
+mod sockets;
+
 use recurse_x::transport::DnsTransport;
 use recurse_x::upstream::{Endpoint, Proto};
 use recurse_x::{Message, Name, RrType};
@@ -98,10 +101,10 @@ fn every_transport_honors_courierust_factory_denial_without_os_fallback() {
         Proto::DoQ,
     ));
     for (transport, proto) in transports.drain(..) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (listener, datagrams) = sockets::bind_dns_pair()
+            .unwrap_or_else(|error| panic!("{proto:?} probe setup failed: {error}"));
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let datagrams = UdpSocket::bind(address).unwrap();
         datagrams.set_nonblocking(true).unwrap();
         let before = TCP.load(Ordering::Relaxed) + UDP.load(Ordering::Relaxed);
         assert!(transport
