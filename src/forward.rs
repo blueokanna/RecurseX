@@ -100,6 +100,7 @@ impl Forwarder {
 /// host over different SNI names.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct TransportKey {
+    generation: u64,
     endpoint: Endpoint,
     host: Option<String>,
     path: Option<String>,
@@ -115,6 +116,7 @@ impl TransportKey {
             Some(p) => Some(p.to_string()),
         };
         Self {
+            generation: courierust::courierust_net::outbound::generation(),
             endpoint: f.endpoint,
             host: f.host.clone(),
             path,
@@ -128,21 +130,26 @@ fn pooled_transport<T>(
     build: impl FnOnce() -> T,
 ) -> Arc<T> {
     let mut cache = cache.lock();
+    // A TUN transition changes socket binding. Retain no idle connection from
+    // the old path; in-flight exchanges keep their own Arc until they finish.
+    cache.retain(|existing, _| existing.generation == key.generation);
     Arc::clone(cache.entry(key).or_insert_with(|| Arc::new(build())))
 }
 
 /// The set of forwarding upstreams with cached per-endpoint transports.
+#[derive(Clone)]
 pub struct ForwarderSet {
     forwarders: Vec<Forwarder>,
+    privacy: crate::privacy::UpstreamPrivacy,
     #[cfg(feature = "dot")]
-    dot: Mutex<BTreeMap<TransportKey, Arc<crate::transports::dot::DotTransport>>>,
+    dot: Arc<Mutex<BTreeMap<TransportKey, Arc<crate::transports::dot::DotTransport>>>>,
     #[cfg(feature = "doh")]
-    doh: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh::DohTransport>>>,
+    doh: Arc<Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh::DohTransport>>>>,
     #[cfg(feature = "doh3")]
-    doh3: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh3::Doh3Transport>>>,
+    doh3: Arc<Mutex<BTreeMap<TransportKey, Arc<crate::transports::doh3::Doh3Transport>>>>,
     #[cfg(feature = "doq")]
-    doq: Mutex<BTreeMap<TransportKey, Arc<crate::transports::doq::DoqTransport>>>,
-    plain: Transports,
+    doq: Arc<Mutex<BTreeMap<TransportKey, Arc<crate::transports::doq::DoqTransport>>>>,
+    plain: Arc<Transports>,
     roots: courierust::courierust_tls::RootStore,
     verify: bool,
     now: i64,
@@ -154,10 +161,11 @@ impl core::fmt::Debug for ForwarderSet {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "ForwarderSet(forwarders={}, verify={}, roots={})",
+            "ForwarderSet(forwarders={}, verify={}, roots={}, privacy={:?})",
             self.forwarders.len(),
             self.verify,
-            self.roots.len()
+            self.roots.len(),
+            self.privacy
         )
     }
 }
@@ -167,19 +175,26 @@ impl ForwarderSet {
     pub fn new(roots: courierust::courierust_tls::RootStore, verify: bool, now: i64) -> Self {
         Self {
             forwarders: Vec::new(),
+            privacy: crate::privacy::UpstreamPrivacy::default(),
             #[cfg(feature = "dot")]
-            dot: Mutex::new(BTreeMap::new()),
+            dot: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "doh")]
-            doh: Mutex::new(BTreeMap::new()),
+            doh: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "doh3")]
-            doh3: Mutex::new(BTreeMap::new()),
+            doh3: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "doq")]
-            doq: Mutex::new(BTreeMap::new()),
-            plain: Transports::new(),
+            doq: Arc::new(Mutex::new(BTreeMap::new())),
+            plain: Arc::new(Transports::new()),
             roots,
             verify,
             now,
         }
+    }
+
+    /// Set disclosure limits. They are validated again before any network I/O.
+    pub fn with_privacy(mut self, privacy: crate::privacy::UpstreamPrivacy) -> Self {
+        self.privacy = privacy;
+        self
     }
 
     /// The configured forwarders.
@@ -243,8 +258,176 @@ impl ForwarderSet {
         query_bytes: &[u8],
         timeout_ms: u64,
     ) -> Result<Message> {
+        self.privacy.validate()?;
+        let _scope = crate::background::TaskScope::enter_query(
+            crate::budget::FetchLimits::default(),
+            timeout_ms,
+        );
+        // Validate the complete group before sending anything. A typo must not
+        // silently switch a strict query to another privacy boundary.
+        for forwarder in group {
+            forwarder.validate()?;
+            if self.privacy.encrypted_only
+                && (matches!(forwarder.endpoint.proto, Proto::Udp | Proto::Tcp)
+                    || !self.verify
+                    || self.roots.is_empty())
+            {
+                return Err(Error::config(
+                    "strict DNS privacy requires verified encrypted upstreams",
+                ));
+            }
+        }
+        if Message::parse(query_bytes)? != *query {
+            return Err(Error::config(
+                "forwarding query bytes differ from the validation message",
+            ));
+        }
+        if query.flags.qr
+            || query.flags.opcode != crate::qtype::Opcode::QUERY
+            || query.questions.len() != 1
+            || !query.answers.is_empty()
+            || !query.authorities.is_empty()
+            || !query.additionals.is_empty()
+        {
+            return Err(Error::config(
+                "forwarding requires one unsigned DNS question",
+            ));
+        }
+        let mut private_query;
+        let private_bytes;
+        let (query, query_bytes) = if self.privacy.encrypted_only {
+            private_query = query.clone();
+            let edns = private_query
+                .edns
+                .get_or_insert_with(|| crate::edns::Edns::new(1232));
+            // Do not relay client subnet, cookies, tags or unknown identifiers.
+            edns.options.clear();
+            let length = private_query.to_bytes()?.len();
+            let padding = (128 - (length + 4) % 128) % 128;
+            private_query
+                .edns
+                .as_mut()
+                .ok_or_else(|| Error::internal("missing private query EDNS"))?
+                .options
+                .push(crate::edns::EdnsOption::Padding(padding as u16));
+            private_bytes = private_query.to_bytes()?;
+            (&private_query, private_bytes.as_slice())
+        } else {
+            (query, query_bytes)
+        };
+        // A local recursive resolver has explicit precedence.
+        if !self.privacy.parallel
+            || self.privacy.max_upstreams == 1
+            || group.len() < 2
+            || group.first().is_some_and(|f| f.endpoint.ip.is_loopback())
+        {
+            return self.exchange_sequential(group, query, query_bytes, timeout_ms);
+        }
+        self.exchange_racing(group, query, query_bytes, timeout_ms)
+    }
+
+    fn exchange_racing(
+        &self,
+        group: &[Forwarder],
+        query: &Message,
+        query_bytes: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Message> {
+        let _scope = crate::background::TaskScope::enter_query(
+            crate::budget::FetchLimits::default(),
+            timeout_ms,
+        );
+        let Some(permits) = RacePermit::pair() else {
+            return self.exchange_sequential(group, query, query_bytes, timeout_ms);
+        };
+        let deadline = query_deadline(timeout_ms)?;
+        let cancellation = RaceCancellation(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (send, receive) = std::sync::mpsc::channel();
+        for (lane, permit) in permits.into_iter().enumerate() {
+            let servers: Vec<_> = group.iter().skip(lane).step_by(2).cloned().collect();
+            let pool = self.clone();
+            let message = query.clone();
+            let bytes = query_bytes.to_vec();
+            let send = send.clone();
+            let context = crate::background::WorkerContext::capture();
+            let canceled = Arc::clone(&cancellation.0);
+            let spawned = std::thread::Builder::new()
+                .name("dns-race".into())
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    let _permit = permit;
+                    let _context = context.enter();
+                    let answer = pool.exchange_sequential_until(
+                        &servers,
+                        &message,
+                        &bytes,
+                        deadline,
+                        Some(&canceled),
+                    );
+                    let _ = send.send(answer);
+                });
+            if let Err(error) = spawned {
+                // Dropping the failed spawn's closure releases its permit.
+                return Err(Error::io(format!("cannot start DNS worker: {error}")));
+            }
+        }
+        drop(send);
+        let mut last = Error::new(ErrorKind::Timeout, "DNS query deadline exhausted");
+        while let Ok(answer) =
+            receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            match answer {
+                Ok(message) => return Ok(message),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
+    fn exchange_sequential(
+        &self,
+        group: &[Forwarder],
+        query: &Message,
+        query_bytes: &[u8],
+        timeout_ms: u64,
+    ) -> Result<Message> {
+        let _scope = crate::background::TaskScope::enter_query(
+            crate::budget::FetchLimits::default(),
+            timeout_ms,
+        );
+        self.exchange_sequential_until(group, query, query_bytes, query_deadline(timeout_ms)?, None)
+    }
+
+    fn exchange_sequential_until(
+        &self,
+        group: &[Forwarder],
+        query: &Message,
+        query_bytes: &[u8],
+        deadline: std::time::Instant,
+        canceled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Message> {
         let mut last_err: Option<Error> = None;
-        for f in group {
+        for (index, f) in group.iter().enumerate() {
+            if canceled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(Error::new(
+                    ErrorKind::Canceled,
+                    "another DNS worker completed",
+                ));
+            }
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            if remaining == 0 {
+                last_err = Some(Error::new(
+                    ErrorKind::Timeout,
+                    "DNS query deadline exhausted",
+                ));
+                break;
+            }
+            // Reserve time for alternate servers; a blackhole must not consume
+            // the complete query budget before the next server is attempted.
+            let timeout_ms = (remaining / (group.len() - index) as u64).max(1);
+            let attempt_deadline = query_deadline(timeout_ms)?.min(deadline);
             let mut resp = match self.exchange_message(f, query, query_bytes, timeout_ms) {
                 Ok(m) => m,
                 Err(e) => {
@@ -253,9 +436,22 @@ impl ForwarderSet {
                 }
             };
             if resp.flags.tc && f.endpoint.proto == Proto::Udp {
+                if canceled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                    return Err(Error::new(
+                        ErrorKind::Canceled,
+                        "another DNS worker completed",
+                    ));
+                }
                 let tcp =
                     Forwarder::plain(Endpoint::new(f.endpoint.ip, f.endpoint.port, Proto::Tcp));
-                resp = match self.exchange_message(&tcp, query, query_bytes, timeout_ms) {
+                resp = match self.exchange_message(
+                    &tcp,
+                    query,
+                    query_bytes,
+                    attempt_deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis() as u64,
+                ) {
                     Ok(message) => message,
                     Err(error) => {
                         last_err = Some(error);
@@ -271,15 +467,21 @@ impl ForwarderSet {
                 continue;
             }
             let rcode = resp.rcode();
-            if rcode <= u16::from(u8::MAX) && Rcode(rcode as u8).is_failure() {
-                let code = Rcode(rcode as u8);
+            if rcode != u16::from(Rcode::NOERROR.to_u8())
+                && rcode != u16::from(Rcode::NXDOMAIN.to_u8())
+                && rcode != u16::from(Rcode::YXDOMAIN.to_u8())
+            {
+                let code = Rcode(u8::try_from(rcode).unwrap_or(Rcode::SERVFAIL.to_u8()));
                 last_err = Some(Error::new(
                     if code == Rcode::REFUSED {
                         ErrorKind::Refused
                     } else {
                         ErrorKind::Servfail
                     },
-                    format!("the upstream {} answered {code}", f.endpoint.ip),
+                    format!(
+                        "the upstream {} answered {code} (RCODE {rcode})",
+                        f.endpoint.ip
+                    ),
                 ));
                 continue;
             }
@@ -327,6 +529,7 @@ impl ForwarderSet {
                 "encrypted upstream requires trust roots and a TLS identity",
             ));
         }
+        crate::background::admit_forwarder(f.endpoint.ip, self.privacy.max_upstreams)?;
         let key = TransportKey::of(f);
         match f.endpoint.proto {
             Proto::Udp | Proto::Tcp => self.plain.exchange(&f.endpoint, query, timeout_ms),
@@ -433,6 +636,7 @@ pub fn build_forward_query(
 ) -> Message {
     let mut m = Message::new((rng.next_u32() & 0xffff) as u16);
     m.flags.rd = true;
+    m.flags.cd = key.cd;
     m.questions.push(crate::message::Question {
         qname: key.name.clone(),
         qtype: key.rr_type,
@@ -498,9 +702,154 @@ pub fn response_to_resolution(
     }
 }
 
+fn query_deadline(timeout_ms: u64) -> Result<std::time::Instant> {
+    if timeout_ms == 0 {
+        return Err(Error::new(
+            ErrorKind::Timeout,
+            "DNS query deadline exhausted",
+        ));
+    }
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(timeout_ms))
+        .ok_or_else(|| Error::config("DNS query timeout is too large"))?;
+    Ok(crate::background::task_deadline().map_or(deadline, |outer| deadline.min(outer)))
+}
+
+// Bounded independently of each resolver's inflight limit: multiple profiles
+// and bootstrap/client resolvers all share the same thread budget.
+static RACE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct RacePermit;
+impl RacePermit {
+    fn pair() -> Option<[Self; 2]> {
+        use std::sync::atomic::Ordering;
+        let mut count = RACE_WORKERS.load(Ordering::Relaxed);
+        loop {
+            if count > 30 {
+                return None;
+            }
+            match RACE_WORKERS.compare_exchange_weak(
+                count,
+                count + 2,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => count = current,
+            }
+        }
+        Some([Self, Self])
+    }
+}
+impl Drop for RacePermit {
+    fn drop(&mut self) {
+        RACE_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+// Returning a winner stops further retries in the losing lane. Already-sent
+// synchronous I/O remains bounded by the original deadline.
+struct RaceCancellation(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RaceCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn racing_cannot_bypass_background_or_task_limits() {
+        let budget = Arc::new(crate::background::BackgroundBudget::new(
+            crate::background::BackgroundLimits::default(),
+        ));
+        let scope = crate::background::TaskScope::enter(
+            budget.clone(),
+            crate::budget::FetchLimits {
+                max_subqueries: 1,
+                ..crate::budget::FetchLimits::default()
+            },
+            2000,
+        );
+        let (first, seen_first) = spawn_upstream(|query| response_for(query, Rcode::SERVFAIL));
+        let (second, seen_second) = spawn_upstream(|query| response_for(query, Rcode::SERVFAIL));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("bounded.example");
+        assert!(set
+            .exchange_racing(&[plain(first), plain(second)], &query, &bytes, 1000)
+            .is_err());
+        assert_eq!(
+            seen_first.load(Ordering::Relaxed) + seen_second.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(scope.work().subqueries, 1);
+        assert_eq!(budget.snapshot().0.subqueries, 1);
+    }
+
+    #[test]
+    fn cancellation_prevents_a_losing_lane_from_contacting_more_servers() {
+        let (server, seen) = spawn_upstream(|query| answer_for(query, Ipv4Addr::LOCALHOST));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("canceled.example");
+        let canceled = std::sync::atomic::AtomicBool::new(true);
+        let result = set.exchange_sequential_until(
+            &[plain(server)],
+            &query,
+            &bytes,
+            query_deadline(1000).unwrap(),
+            Some(&canceled),
+        );
+        assert_eq!(result.unwrap_err().kind, ErrorKind::Canceled);
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn extended_failure_rcode_does_not_become_a_successful_answer() {
+        let (bad, _) = spawn_upstream(|query| {
+            let mut response = response_for(query, Rcode::NOERROR);
+            let mut edns = crate::edns::Edns::new(1232);
+            edns.ext_rcode = 16; // Full RCODE 256, not NOERROR.
+            response.edns = Some(edns);
+            response
+        });
+        let (good, _) = spawn_upstream(|query| answer_for(query, Ipv4Addr::new(203, 0, 113, 5)));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("rcode.example");
+        let response = set
+            .exchange_with(&[plain(bad), plain(good)], &query, &bytes, 1000)
+            .unwrap();
+        assert_eq!(response.answers.len(), 1);
+    }
+
+    #[test]
+    fn dname_overflow_is_a_terminal_answer() {
+        // RFC 6672 section 2.2: DNAME substitution can produce YXDOMAIN.
+        let (first, _) = spawn_upstream(|query| response_for(query, Rcode::YXDOMAIN));
+        let (second, seen) = spawn_upstream(|query| answer_for(query, Ipv4Addr::LOCALHOST));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("overflow.example");
+        let response = set
+            .exchange_with(&[plain(first), plain(second)], &query, &bytes, 1000)
+            .unwrap();
+        assert_eq!(response.rcode(), u16::from(Rcode::YXDOMAIN.to_u8()));
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn strict_policy_rejects_plaintext_before_sending() {
+        let (server, seen) = spawn_upstream(|query| answer_for(query, Ipv4Addr::LOCALHOST));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0)
+            .with_privacy(crate::privacy::UpstreamPrivacy::strict());
+        let (query, bytes) = query_for("private.example");
+        assert_eq!(
+            set.exchange_with(&[plain(server)], &query, &bytes, 1000)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Config
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn truncated_udp_forwarding_retries_tcp_on_the_same_upstream() {
@@ -575,6 +924,7 @@ mod tests {
     fn pooled_transports_are_reused_without_holding_the_pool_lock() {
         let pool = Mutex::new(BTreeMap::new());
         let key = TransportKey {
+            generation: 0,
             endpoint: Endpoint::udp("192.0.2.1".parse().unwrap()),
             host: None,
             path: None,
@@ -585,7 +935,7 @@ mod tests {
             builds += 1;
             7
         });
-        let second = pooled_transport(&pool, key, || {
+        let second = pooled_transport(&pool, key.clone(), || {
             builds += 1;
             9
         });
@@ -594,6 +944,21 @@ mod tests {
         assert_eq!(*first, 7);
         assert_eq!(builds, 1);
         assert!(pool.try_lock().is_some());
+        let next = pooled_transport(
+            &pool,
+            TransportKey {
+                generation: 1,
+                ..key
+            },
+            || {
+                builds += 1;
+                11
+            },
+        );
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert_eq!(*next, 11);
+        assert_eq!(builds, 2);
+        assert_eq!(pool.lock().len(), 1);
     }
 
     #[cfg(feature = "doh3")]
@@ -675,6 +1040,61 @@ mod tests {
         });
         let bytes = query.to_bytes().expect("the query serializes");
         (query, bytes)
+    }
+
+    #[test]
+    fn racing_returns_fast_answer_without_waiting_for_slow_peer() {
+        let (slow, worker) = spawn_upstream(|query| {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            answer_for(query, Ipv4Addr::new(203, 0, 113, 1))
+        });
+        let (fast, fast_worker) =
+            spawn_upstream(|query| answer_for(query, Ipv4Addr::new(203, 0, 113, 2)));
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("race.example");
+        let start = std::time::Instant::now();
+        let response = set
+            .exchange_racing(&[plain(slow), plain(fast)], &query, &bytes, 1500)
+            .unwrap();
+        assert_eq!(
+            response.answers[0].rdata,
+            RData::A(Ipv4Addr::new(203, 0, 113, 2))
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(600));
+        // A winner may finish before the other thread is scheduled.
+        let _ = worker;
+        assert!(fast_worker.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn zero_budget_is_a_timeout_without_starting_io() {
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("timeout.example");
+        let error = set
+            .exchange_sequential(&[plain(9)], &query, &bytes, 0)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn sequential_failures_share_one_deadline() {
+        let (one, worker_one) = spawn_upstream(|query| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            answer_for(query, Ipv4Addr::new(203, 0, 113, 1))
+        });
+        let (two, worker_two) = spawn_upstream(|query| {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            answer_for(query, Ipv4Addr::new(203, 0, 113, 2))
+        });
+        let set = ForwarderSet::new(courierust::courierust_tls::RootStore::new(), true, 0);
+        let (query, bytes) = query_for("timeout.example");
+        let start = std::time::Instant::now();
+        assert!(set
+            .exchange_sequential(&[plain(one), plain(two)], &query, &bytes, 250)
+            .is_err());
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(worker_one.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(worker_two.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     fn plain(port: u16) -> Forwarder {

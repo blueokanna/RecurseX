@@ -79,7 +79,12 @@ pub fn ecs_option(key: &QueryKey) -> Option<Ecs> {
 /// back to a case-insensitive match (the 0x20 protection then rests on the
 /// ID + source + bailiwick checks, which remain mandatory).
 pub fn response_matches_query(query: &Message, response: &Message) -> bool {
-    if query.id != response.id {
+    if query.id != response.id
+        || !response.flags.qr
+        || query.flags.opcode != response.flags.opcode
+        || query.questions.len() != 1
+        || response.questions.len() != 1
+    {
         return false;
     }
     let Some(qq) = query.question() else {
@@ -160,5 +165,18 @@ mod tests {
         assert!(response_matches_query(&q, &r));
         r.id = 8;
         assert!(!response_matches_query(&q, &r));
+    }
+
+    #[test]
+    fn rejects_reflected_queries_wrong_opcodes_and_extra_questions() {
+        let q = Message::query(7, Name::from_ascii("example.com").unwrap(), RrType::A, true);
+        assert!(!response_matches_query(&q, &q));
+        let mut response = q.clone();
+        response.flags.qr = true;
+        response.flags.opcode = crate::qtype::Opcode::UPDATE;
+        assert!(!response_matches_query(&q, &response));
+        response.flags.opcode = q.flags.opcode;
+        response.questions.push(q.questions[0].clone());
+        assert!(!response_matches_query(&q, &response));
     }
 }

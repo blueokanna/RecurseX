@@ -9,13 +9,13 @@ use courierust::courierust_tls::RootStore;
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// courierust 1.1.1 uses the URL host for both routing and TLS identity.
+/// courierust 1.1.2 uses the URL host for both routing and TLS identity.
 /// Only a literal identity equal to the configured IP can guarantee that
 /// no bootstrap lookup or different destination is used.
 pub(crate) fn validate_endpoint(host: &str, endpoint: &Endpoint) -> Result<()> {
     if host.parse::<IpAddr>().ok() != Some(endpoint.ip) {
         return Err(Error::config(
-            "pinned DoH requires a TLS IP identity equal to the upstream IP; courierust 1.1.1 cannot override the URL connection address",
+            "pinned DoH requires a TLS IP identity equal to the upstream IP; courierust 1.1.2 cannot override the URL connection address",
         ));
     }
     Ok(())
@@ -36,6 +36,8 @@ pub(crate) struct HttpDnsClient {
 }
 
 struct CachedClient {
+    generation: u64,
+    http3: bool,
     endpoint: Endpoint,
     roots: RootStore,
     verify: bool,
@@ -77,14 +79,17 @@ impl HttpDnsClient {
             return Err(Error::config("encrypted DNS requires trust roots"));
         }
         let now = super::io::certificate_time(settings.now)?;
+        let generation = courierust::courierust_net::outbound::generation();
         let client = {
             let mut cached = self.cached.lock();
             let reusable = cached.as_ref().is_some_and(|entry| {
-                entry.endpoint == *endpoint
+                entry.generation == generation
+                    && entry.http3 == settings.http3
+                    && entry.endpoint == *endpoint
                     && entry.verify == settings.verify
                     && entry.now == now
                     && entry.timeout_ms == timeout_ms
-                    && same_roots(&entry.roots, settings.roots)
+                    && super::io::same_roots(&entry.roots, settings.roots)
             });
             if !reusable {
                 let timeout = Some(Duration::from_millis(timeout_ms));
@@ -114,6 +119,8 @@ impl HttpDnsClient {
                     ..Default::default()
                 };
                 *cached = Some(CachedClient {
+                    generation,
+                    http3: settings.http3,
                     endpoint: *endpoint,
                     roots: settings.roots.clone(),
                     verify: settings.verify,
@@ -172,15 +179,6 @@ impl HttpDnsClient {
         }
         Ok(body.to_vec())
     }
-}
-
-fn same_roots(left: &RootStore, right: &RootStore) -> bool {
-    left.len() == right.len()
-        && left
-            .roots()
-            .iter()
-            .zip(right.roots())
-            .all(|(a, b)| a.der == b.der)
 }
 
 fn http_error(

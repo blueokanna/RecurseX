@@ -62,7 +62,7 @@ pub enum EdnsOption {
     },
     /// TCP Keepalive (RFC 7828). `None` requests the server's idle timeout.
     TcpKeepalive(Option<u16>),
-    /// Padding (RFC 7830) — the length in octets the sender asks to pad to.
+    /// Padding (RFC 7830): the number of zero-valued payload octets.
     Padding(u16),
     /// Key Tag (RFC 8145) — used for RFC 5011 trust-anchor signaling.
     KeyTag(Vec<u16>),
@@ -379,7 +379,7 @@ impl Edns {
                 }
                 EdnsOption::TcpKeepalive(Some(t)) => data.extend_from_slice(&t.to_be_bytes()),
                 EdnsOption::TcpKeepalive(None) => {}
-                EdnsOption::Padding(_) => {}
+                EdnsOption::Padding(length) => data.resize(usize::from(*length), 0),
                 EdnsOption::KeyTag(tags) => {
                     for t in tags {
                         data.extend_from_slice(&t.to_be_bytes());
@@ -487,6 +487,20 @@ pub fn parse_options(rdata: &[u8]) -> Result<Vec<EdnsOption>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_payload_length_is_preserved_on_the_wire() {
+        for length in [0, 1, 127, 128, 468] {
+            let mut edns = Edns::new(1232);
+            edns.options.push(EdnsOption::Padding(length));
+            let bytes = edns.options_wire();
+            assert_eq!(bytes.len(), usize::from(length) + 4);
+            assert_eq!(&bytes[..2], &opt::PADDING.to_be_bytes());
+            assert_eq!(&bytes[2..4], &length.to_be_bytes());
+            assert!(bytes[4..].iter().all(|byte| *byte == 0));
+            assert_eq!(parse_options(&bytes).unwrap(), edns.options);
+        }
+    }
 
     #[test]
     fn ecs_ipv4_roundtrip() {

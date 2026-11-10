@@ -41,42 +41,26 @@
 //!   mode here, so recycling only happens past the entry TTL, and every
 //!   recycle is counted so it can be observed rather than guessed at.
 //!
-//! # The pool recycles, and says how much
+//! # Capacity and lifetime
 //!
-//! `maxEntries` bounds memory, and at that bound the pool reclaims the
-//! least-recently-used mappings: recency is the only signal available for
-//! "probably no longer in use", and the pool keeps answering.
+//! Full pools reclaim only mappings whose idle lifetime has expired. If all
+//! mappings remain live, allocation fails and the resolver returns SERVFAIL.
+//! Rebinding an address still held by a client can route traffic to another
+//! domain; resolving the new name outside the pool can bypass proxy routing.
 //!
-//! The tempting alternative — refuse once full, and let the caller resolve
-//! the name for real — is worse *for this deployment*. A real answer means
-//! the client dials the true address directly, escaping the proxy and the
-//! routing rules with it: the domain silently stops being proxied. A
-//! renumbered mapping costs one connection's routing; a leaked connection
-//! costs the rule. So the pool recycles, counts every recycle
-//! ([`FakeIpPool::evicted`]), and leaves the tuning to `maxEntries` — which
-//! should sit comfortably above the working set so recycling stays rare.
+//! Expiration is an idle-time policy, not evidence that connections ended.
+//! Proxies must keep active mappings warm through `lookup` and retain the
+//! chosen destination for established connections. Persistence across restart
+//! is required if clients can retain old synthetic addresses.
 //!
-//! Stale entries are always chosen first: an entry past its TTL has no live
-//! connection by definition, so dropping it is free, while dropping a fresh
-//! one is a real (if bounded) risk. Only when *every* entry is fresh does a
-//! recency-ordered batch go.
-//!
-//! # Bounds and bookkeeping
-//!
-//! Live entries are capped at `min(addresses in range, maxEntries)`. At the
-//! cap the pool reclaims through [`crate::bounded::evict_for_capacity`],
-//! whose contract — a non-empty map always loses at least one entry — is
-//! what lets allocation assume room afterwards. Both maps are rebuilt from
-//! the address-keyed one after a sweep rather than patched in place: a
-//! running index over two maps is bookkeeping that drifts, and a drifted
-//! index means a name mapped to an address nobody owns.
+//! Both indexes are rebuilt together after expiration. Memory stays bounded
+//! by the smaller of the configured entry cap and the address-space capacity.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::bounded::evict_for_capacity;
 use crate::cidr::{Ipv4Cidr, Ipv6Cidr};
 use crate::error::{Error, Result};
 use crate::name::Name;
@@ -175,9 +159,6 @@ pub const DEFAULT_FAKE_IP_FILTER: [&str; 24] = [
 /// capping below that keeps a hostile client from pinning the whole block by
 /// querying random names.
 pub const DEFAULT_FAKE_IP_MAX_ENTRIES: usize = 16_384;
-
-/// Eviction stride for a pool full of fresh entries.
-const EVICT_STRIDE: usize = 8;
 
 /// A ceiling on the configured TTL, so a typo cannot make entries immortal
 /// (or overflow the nanosecond arithmetic).
@@ -346,6 +327,8 @@ impl FakeIpSettings {
     /// The TTL carried by a synthesized answer.
     pub fn answer_ttl(&self) -> u32 {
         self.answer_ttl
+            .max(1)
+            .min(self.ttl_secs.min(MAX_TTL_SECS) as u32)
     }
 
     /// Whether answers of `family` are synthesized. When this is false the
@@ -487,6 +470,12 @@ impl Space {
         }
         if self.by_key.len() >= self.cap() {
             self.reclaim(now);
+            if self.by_key.len() >= self.cap() {
+                return Err(Error::new(
+                    crate::error::ErrorKind::RateLimited,
+                    "fake-ip pool is full of live mappings",
+                ));
+            }
         }
         let key = self
             .take_key()
@@ -570,15 +559,10 @@ impl Space {
         self.by_name.clear();
     }
 
-    /// Reclaim space at the cap: stale entries first, then an amortised
-    /// stride batch if every entry is still fresh.
+    /// Reclaim expired mappings without reassigning a live client's address.
     fn reclaim(&mut self, now: Ts) {
-        let cutoff = now.saturating_sub(self.ttl_nanos);
-        let freed = evict_for_capacity(&mut self.by_key, cutoff, EVICT_STRIDE, |e| e.last_access);
-        if freed > 0 {
-            self.evicted += freed as u64;
-            self.rebuild_name_index();
-        }
+        let freed = self.cleanup_expired(now);
+        self.evicted = self.evicted.saturating_add(freed as u64);
     }
 
     /// Rebuild the name index from the authoritative address index. Rebuilding
@@ -878,6 +862,19 @@ fn ttl_nanos(secs: u64) -> Ts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_ttl_never_exceeds_the_effective_mapping_lifetime() {
+        let mut settings = FakeIpSettings::with_defaults()
+            .unwrap()
+            .with_answer_ttl(u32::MAX);
+        settings.ttl_secs = 2;
+        assert_eq!(settings.answer_ttl(), 2);
+        settings.ttl_secs = u64::MAX;
+        assert_eq!(settings.answer_ttl(), MAX_TTL_SECS as u32);
+        settings.ttl_secs = 0;
+        assert_eq!(settings.answer_ttl(), 0);
+    }
     #[cfg(not(feature = "std"))]
     use alloc::string::ToString;
     #[cfg(not(feature = "std"))]
@@ -1040,20 +1037,25 @@ mod tests {
         assert_eq!(p.len(), 3);
     }
 
-    /// At the cap with everything fresh, the pool reclaims and keeps
-    /// answering rather than refusing. Refusing would resolve the name for
-    /// real, which escapes the proxy and its routing rules.
     #[test]
-    fn full_pool_of_fresh_entries_recycles_and_keeps_answering() {
+    fn full_pool_preserves_live_mappings_and_refuses_new_names() {
         let mut p = pool("198.18.0.0/24", &[], 4);
+        let mut mappings = Vec::new();
         for i in 0..4 {
-            alloc(&mut p, &alloc::format!("host{i}.com"), now());
+            let host = alloc::format!("host{i}.com");
+            mappings.push((host.clone(), alloc(&mut p, &host, now())));
         }
+        assert_eq!(
+            p.allocate(&name("overflow.com"), Family::V4, now())
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::RateLimited
+        );
+        for (host, ip) in mappings {
+            assert_eq!(p.lookup(ip.into(), now()), Some(name(&host)));
+        }
+        assert_eq!(p.evicted(), 0);
         assert_eq!(p.len(), 4);
-        let ip: IpAddr = alloc(&mut p, "overflow.com", now()).into();
-        assert_eq!(p.lookup(ip, now()).unwrap(), name("overflow.com"));
-        assert!(p.evicted() >= 1, "the recycle must be counted, not hidden");
-        assert!(p.len() <= 4, "the cap still holds");
     }
 
     /// At the cap with stale entries, allocation reclaims and proceeds.
@@ -1216,11 +1218,11 @@ mod tests {
         assert_eq!(p.len_for(Family::V6), 2);
         assert_eq!(p.len(), 4);
 
-        // Pushing past the v4 cap recycles a v4 mapping and leaves v6 alone.
-        alloc(&mut p, "extra.com", now());
+        // A v4 flood cannot reassign addresses in either family.
+        assert!(p.allocate(&name("extra.com"), Family::V4, now()).is_err());
         assert_eq!(p.len_for(Family::V4), 2);
         assert_eq!(p.len_for(Family::V6), 2);
-        assert!(p.evicted() >= 1);
+        assert_eq!(p.evicted(), 0);
     }
 
     /// v6 hygiene: a range with no usable address is refused, and the cap is
@@ -1243,10 +1245,9 @@ mod tests {
             alloc6(&mut p, "a.com", now()),
             "fdfe::1".parse::<Ipv6Addr>().unwrap()
         );
-        // The next name must recycle rather than hand out the network
-        // address or an address outside the block.
-        let second = alloc6(&mut p, "b.com", now());
-        assert_eq!(second, "fdfe::1".parse::<Ipv6Addr>().unwrap());
+        // Exhaustion must not rebind the only live address.
+        assert!(p.allocate(&name("b.com"), Family::V6, now()).is_err());
+        assert_eq!(p.peek("fdfe::1".parse().unwrap()), Some(&name("a.com")));
     }
 
     /// Both spaces share the filter: a name excluded from fake-IP is excluded

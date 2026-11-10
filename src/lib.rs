@@ -99,6 +99,7 @@ pub mod name;
 pub mod pattern;
 pub mod planner;
 pub mod policy;
+pub mod privacy;
 pub mod prng;
 pub mod provenance;
 pub mod qtype;

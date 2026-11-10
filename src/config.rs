@@ -391,6 +391,16 @@ pub struct DnsJson {
     /// The answer-quality gate.
     #[njson(default, alias = "fallback-filter", alias = "fallback_filter")]
     pub fallback_filter: Option<FallbackFilterJson>,
+    /// `standard` (default) or `strict`: verified encryption without speculative racing.
+    #[njson(default)]
+    pub privacy: Option<String>,
+    /// Maximum distinct upstream IPs per resolution, including fallback and DNSSEC.
+    #[njson(
+        default,
+        alias = "max-upstream-exposures",
+        alias = "max_upstream_exposures"
+    )]
+    pub max_upstream_exposures: Option<usize>,
 }
 
 /// Parse one upstream string into a forwarder.
@@ -527,7 +537,6 @@ pub fn parse_upstream(s: &str) -> Result<crate::forward::Forwarder> {
 fn parse_authority(authority: &str) -> Option<(std::net::IpAddr, Option<u16>)> {
     let authority = authority.trim();
     if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literals must be bracketed, or `::1:853` is ambiguous.
         let (host, tail) = rest.split_once(']')?;
         let port = match tail {
             "" => None,
@@ -540,9 +549,6 @@ fn parse_authority(authority: &str) -> Option<(std::net::IpAddr, Option<u16>)> {
         };
         return Some((host.parse().ok()?, port));
     }
-    // Unbound's spelling. `@` can never occur inside an address, so unlike a
-    // bare `:` it is unambiguous — and a line copied out of an Unbound
-    // `forward-addr` keeps working here.
     if let Some((host, port)) = authority.rsplit_once('@') {
         return Some((host.parse().ok()?, Some(port.parse().ok()?)));
     }
@@ -686,9 +692,16 @@ impl Config {
         };
 
         let dns = &self.dns;
+        let mut privacy = match dns.privacy.as_deref().unwrap_or("standard") {
+            "standard" => crate::privacy::UpstreamPrivacy::default(),
+            "strict" => crate::privacy::UpstreamPrivacy::strict(),
+            _ => return Err(Error::config("dns.privacy must be standard or strict")),
+        };
+        if let Some(limit) = dns.max_upstream_exposures {
+            privacy.max_upstreams = limit;
+        }
+        privacy.validate()?;
 
-        // A configuration that names its upstreams twice is ambiguous, and
-        // picking one silently is how the two lists drift apart.
         if !dns.nameservers.is_empty() && !self.engine.forwarders.is_empty() {
             return Err(Error::config(
                 "set either `dns.nameservers` or `engine.forwarders`, not both: they are the \
@@ -787,6 +800,24 @@ impl Config {
                 rules.push((pattern.clone(), 2 + extra.len()));
                 extra.push(group);
             }
+            if privacy.encrypted_only && default.is_empty() {
+                return Err(Error::config(
+                    "strict DNS privacy requires default encrypted nameservers",
+                ));
+            }
+            if !fallback.is_empty() && default.is_empty() {
+                return Err(Error::config("fallback requires default nameservers"));
+            }
+            if dns
+                .fallback_filter
+                .as_ref()
+                .is_some_and(|f| !f.domain.is_empty())
+                && fallback.is_empty()
+            {
+                return Err(Error::config(
+                    "fallback-filter.domain requires fallback nameservers",
+                ));
+            }
             let policy = crate::routing::NameserverPolicy::new(&rules)?;
             (
                 crate::resolver::UpstreamGroups {
@@ -799,7 +830,9 @@ impl Config {
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
         let policy = {
-            if !dns.nameservers.is_empty()
+            if privacy.encrypted_only
+                || dns.max_upstream_exposures.is_some()
+                || !dns.nameservers.is_empty()
                 || !dns.fallback.is_empty()
                 || !dns.nameserver_policy.is_empty()
             {
@@ -812,6 +845,7 @@ impl Config {
         };
 
         Ok(crate::resolver::DnsPolicy {
+            privacy,
             hosts,
             fake_ip,
             policy,
@@ -884,6 +918,13 @@ impl Config {
         {
             for forwarder in dns_policy.upstreams.all() {
                 forwarder.validate()?;
+                if dns_policy.privacy.encrypted_only
+                    && matches!(forwarder.endpoint.proto, Proto::Udp | Proto::Tcp)
+                {
+                    return Err(Error::config(
+                        "strict DNS privacy prohibits plaintext upstreams",
+                    ));
+                }
             }
             if let Some(path) = &self.forwarder_ca_file {
                 ec.forwarder_roots.add_pem_file(path).map_err(|e| {
@@ -982,6 +1023,43 @@ pub fn parse_rr_type(s: &str) -> Option<RrType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_configuration_rejects_silent_downgrades_and_invalid_limits() {
+        for json in [
+            r#"{"dns":{"privacy":"anonymous"}}"#,
+            r#"{"dns":{"privacy":"strict"}}"#,
+            r#"{"dns":{"privacy":"strict","nameservers":["1.1.1.1"]}}"#,
+            r#"{"dns":{"max-upstream-exposures":0}}"#,
+            r#"{"dns":{"max-upstream-exposures":33}}"#,
+        ] {
+            assert!(
+                Config::from_json_str(json)
+                    .unwrap()
+                    .into_resolver_config()
+                    .is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dot")]
+    #[test]
+    fn strict_privacy_parses_and_can_explicitly_allow_failover() {
+        let config = Config::from_json_str(
+            r#"{
+            "forwarderCaFile":"tests/fixtures/localhost.pem",
+            "dns":{"privacy":"strict","max-upstream-exposures":2,
+                "nameservers":["tls://127.0.0.1#localhost"]}
+        }"#,
+        )
+        .unwrap()
+        .into_resolver_config()
+        .unwrap();
+        assert!(config.dns.privacy.encrypted_only);
+        assert!(!config.dns.privacy.parallel);
+        assert_eq!(config.dns.privacy.max_upstreams, 2);
+    }
 
     #[cfg(feature = "dot")]
     #[test]

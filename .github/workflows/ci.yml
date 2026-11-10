@@ -161,6 +161,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.78.0
       - uses: Swatinem/rust-cache@v2
       - name: Package (verify the published tarball)
-        run: cargo package --allow-dirty
+        run: cargo package --locked --allow-dirty
       - name: List the packaged files
         run: tar -tzf target/package/recurse-x-*.crate

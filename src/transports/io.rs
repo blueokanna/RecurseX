@@ -22,6 +22,10 @@ pub(crate) fn certificate_time(fixed: i64) -> Result<i64> {
 pub(crate) struct Deadline(Instant);
 
 impl Deadline {
+    #[cfg(feature = "doq")]
+    pub(crate) fn instant(self) -> Instant {
+        self.0
+    }
     pub(crate) fn after(timeout_ms: u64) -> Result<Self> {
         if timeout_ms == 0 {
             return Err(Error::new(
@@ -46,6 +50,42 @@ impl Deadline {
             Ok(duration)
         }
     }
+
+    #[cfg(feature = "doq")]
+    pub(crate) fn remaining_ms(self) -> Result<u64> {
+        self.remaining()
+            .map(|remaining| remaining.as_millis().min(u64::MAX as u128).max(1) as u64)
+            .map_err(|error| network_error("DoQ deadline", error))
+    }
+}
+
+#[cfg(feature = "doq")]
+pub(crate) fn lock_until<T>(
+    mutex: &crate::sync::Mutex<T>,
+    deadline: Deadline,
+) -> Result<std::sync::MutexGuard<'_, T>> {
+    loop {
+        let remaining = deadline
+            .remaining()
+            .map_err(|error| network_error("DoQ pool wait", error))?;
+        if let Some(guard) = mutex.try_lock() {
+            return Ok(guard);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+}
+
+#[cfg(any(feature = "doh", feature = "doq"))]
+pub(crate) fn same_roots(
+    left: &courierust::courierust_tls::RootStore,
+    right: &courierust::courierust_tls::RootStore,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .roots()
+            .iter()
+            .zip(right.roots())
+            .all(|(a, b)| a.der == b.der)
 }
 
 pub(crate) fn network_error(context: &str, error: std::io::Error) -> Error {

@@ -1,7 +1,9 @@
 //! Plain UDP DNS transport (RFC 1035, RFC 7766).
 
 use super::io::{network_error, Deadline};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+#[cfg(test)]
+use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::error::{Error, Result};
 use crate::transport::{DnsTransport, MAX_UDP_PAYLOAD};
@@ -21,16 +23,15 @@ impl DnsTransport for UdpTransport {
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
         let deadline = Deadline::after(timeout_ms)?;
-        // Constructed rather than parsed. `"0.0.0.0:0".parse().unwrap()` is
-        // infallible in practice but is still a parse and still a panic site,
-        // and this runs once per query.
         let bind_addr = match endpoint.ip {
             IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
-        let sock = UdpSocket::bind(bind_addr).map_err(|e| Error::io(format!("udp bind: {e}")))?;
-        // Unconnected socket: recv_from reports the real source so a
-        // response from an unexpected address is rejected (anti-spoofing).
+        let sock = courierust::courierust_net::outbound::udp_bind(
+            bind_addr,
+            SocketAddr::new(endpoint.ip, endpoint.port),
+        )
+        .map_err(|e| Error::io(format!("udp bind: {e}")))?;
         sock.set_read_timeout(Some(
             deadline
                 .remaining()
@@ -51,12 +52,6 @@ impl DnsTransport for UdpTransport {
             .map_err(|e| network_error("UDP timeout", e))?;
             let (n, src) = match sock.recv_from(&mut buf) {
                 Ok(v) => v,
-                // Both spellings of "the read timed out": Unix and Go-style
-                // pollers report `WouldBlock`, while Windows reports the socket's
-                // own `WSAETIMEDOUT`. Missing the second one made a dead upstream
-                // look like an I/O fault to every caller that matches on
-                // `ErrorKind` — a timeout is not a broken socket, and the
-                // distinction is the whole reason the kinds exist.
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -69,8 +64,6 @@ impl DnsTransport for UdpTransport {
                     ));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                    // Windows reports ICMP errors on connected-style UDP
-                    // paths; treat as a transient failure of this attempt.
                     return Err(Error::io(format!("udp reset: {e}")));
                 }
                 Err(e) => return Err(Error::io(format!("udp recv: {e}"))),
@@ -78,8 +71,6 @@ impl DnsTransport for UdpTransport {
             if src == target {
                 return Ok(crate::wire::capped(&buf, n).to_vec());
             }
-            // Datagram from an unexpected source: ignore and keep reading
-            // (bounded by the read timeout).
         }
     }
 }
@@ -123,9 +114,6 @@ mod tests {
 
     #[test]
     fn exchange_times_out_on_dead_endpoint() {
-        // 192.0.2.0/24 is TEST-NET and not routable; on loopback it usually
-        // returns an unreachable error quickly. Either way the exchange
-        // must fail, not hang.
         let t = UdpTransport::default();
         let ep = Endpoint::udp("192.0.2.1".parse().unwrap());
         let r = t.exchange(b"\x00", &ep, 200);
@@ -134,20 +122,12 @@ mod tests {
 
     #[test]
     fn rejects_wrong_source() {
-        // Send a query to ourselves; the response comes back from the
-        // bound port, not from the target, so it must be ignored/looped
-        // until timeout.
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let sock = UdpSocket::bind(bind).unwrap();
         let local = sock.local_addr().unwrap();
-        // The transport binds its own socket; we can't easily point it at
-        // a port that responds. This test only checks the timeout path.
         let t = UdpTransport::default();
         let ep = Endpoint::new(local.ip(), local.port(), Proto::Udp);
         let r = t.exchange(b"\x00", &ep, 100);
-        // No server is listening on `local` (the transport's socket is a
-        // different one), so this fails with a connect/send error or
-        // timeout — either way, an error.
         assert!(r.is_err());
         let _ = sock;
     }

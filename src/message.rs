@@ -274,6 +274,21 @@ impl Message {
 
     /// Serialize this message to wire bytes with name compression.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let extra = self
+            .additionals
+            .len()
+            .checked_add(usize::from(self.edns.is_some()))
+            .ok_or_else(|| Error::wire("additional section count overflow"))?;
+        let mut counts = [0u16; 4];
+        for (count, length) in counts.iter_mut().zip([
+            self.questions.len(),
+            self.answers.len(),
+            self.authorities.len(),
+            extra,
+        ]) {
+            *count = u16::try_from(length)
+                .map_err(|_| Error::wire("DNS section exceeds 65535 records"))?;
+        }
         let mut out = Vec::with_capacity(512);
         let mut comp = NameCompressor::new();
 
@@ -303,18 +318,13 @@ impl Message {
             out.extend_from_slice(&edns.udp_payload_size.to_be_bytes());
             out.extend_from_slice(&edns.ttl_field().to_be_bytes());
             let opt_data = edns.options_wire();
-            out.extend_from_slice(&(opt_data.len() as u16).to_be_bytes());
+            let opt_length = u16::try_from(opt_data.len())
+                .map_err(|_| Error::wire("EDNS option data exceeds 65535 bytes"))?;
+            out.extend_from_slice(&opt_length.to_be_bytes());
             out.extend_from_slice(&opt_data);
         }
 
         // Patch the section counts.
-        let extra = self.additionals.len() + usize::from(self.edns.is_some());
-        let counts = [
-            self.questions.len() as u16,
-            self.answers.len() as u16,
-            self.authorities.len() as u16,
-            extra as u16,
-        ];
         let mut header_tail = [0u8; 8];
         for (dst, n) in header_tail.chunks_exact_mut(2).zip(counts) {
             dst.copy_from_slice(&n.to_be_bytes());
@@ -325,6 +335,9 @@ impl Message {
             .and_then(|tail| tail.get_mut(..header_tail.len()))
             .ok_or_else(|| Error::internal("header count offset out of range"))?;
         dst.copy_from_slice(&header_tail);
+        if out.len() > usize::from(u16::MAX) {
+            return Err(Error::wire("DNS message exceeds 65535 bytes"));
+        }
         Ok(out)
     }
 
@@ -458,6 +471,23 @@ pub fn encode_query(id: u16, qname: &Name, qtype: RrType, edns: Option<&Edns>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialization_rejects_overflowing_counts_and_edns_lengths() {
+        let mut message =
+            Message::query(1, Name::from_ascii("example.com").unwrap(), RrType::A, true);
+        message.questions = alloc::vec![message.questions[0].clone(); 65_536];
+        assert!(message.to_bytes().unwrap_err().msg.contains("section"));
+        message.questions.truncate(1);
+        let mut edns = Edns::new(1232);
+        edns.options
+            .push(crate::edns::EdnsOption::Padding(u16::MAX));
+        message.edns = Some(edns);
+        assert!(message.to_bytes().unwrap_err().msg.contains("EDNS"));
+        message.edns.as_mut().unwrap().options =
+            alloc::vec![crate::edns::EdnsOption::Padding(65_500)];
+        assert!(message.to_bytes().unwrap_err().msg.contains("message"));
+    }
     use crate::edns::EdnsOption;
     use crate::rdata::RData;
     #[cfg(not(feature = "std"))]

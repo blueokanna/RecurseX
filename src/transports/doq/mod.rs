@@ -2,12 +2,12 @@
 //! a real QUIC client transport.
 //!
 //! The protocol layer is implemented here — 2-octet length-prefixed
-//! messages, one query per fresh bidirectional stream, the mandatory
-//! session stream, and the DOQ_* error-code mapping. The QUIC transport
+//! messages, one query per fresh client-initiated bidirectional stream,
+//! zero wire IDs, and the DOQ_* error-code mapping. The QUIC transport
 //! itself ([`quic`]) and the QUIC-TLS handshake ([`tls`]) are implemented
 //! from the RFCs on top of courierust's public wire codecs, so the
-//! default transport talks to real RFC 9250 servers (Cloudflare, AdGuard,
-//! ...) out of the box — no provider wiring required.
+//! default transport needs no provider wiring. It remains experimental:
+//! public-server interoperability and full congestion control are not established.
 //!
 //! Advanced embeddings that want to substitute their own QUIC stack can
 //! still do so through the [`DoqProvider`] / [`DoqConnection`] traits.
@@ -15,11 +15,11 @@
 pub mod quic;
 pub mod tls;
 
+use super::io::{lock_until, Deadline};
 use crate::sync::Mutex;
 use crate::wire::WireBytes;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use courierust::courierust_tls::RootStore;
 
@@ -43,7 +43,7 @@ pub mod error_code {
     /// An unspecified error.
     pub const UNSPECIFIED_ERROR: u64 = 0x5;
     /// Reserved error code.
-    pub const ERROR_RESERVED: u64 = 0x6;
+    pub const ERROR_RESERVED: u64 = 0xd098ea5e;
 
     /// A human-readable name for a DOQ error code.
     pub fn name(code: u64) -> &'static str {
@@ -89,7 +89,15 @@ pub trait DoqConnection: Send {
     /// Send a framed query on a fresh client-initiated bidirectional stream
     /// and return the framed response bytes.
     fn request(&mut self, framed_query: &[u8]) -> Result<Vec<u8>>;
-    /// Gracefully close the session.
+    /// Execute within the supplied remaining budget. Implementations must bound
+    /// all blocking I/O. Legacy providers fail closed until they implement it.
+    fn request_with_timeout(&mut self, _framed_query: &[u8], _timeout_ms: u64) -> Result<Vec<u8>> {
+        Err(Error::new(
+            crate::error::ErrorKind::Unsupported,
+            "DoQ provider does not implement request deadlines",
+        ))
+    }
+    /// Gracefully close the session. This must not block.
     fn close(&mut self);
 }
 
@@ -104,6 +112,24 @@ pub trait DoqProvider: Send + Sync {
         verify: bool,
         now: i64,
     ) -> Result<Box<dyn DoqConnection>>;
+
+    /// Open within the supplied remaining budget; DNS transports never call
+    /// the unbounded legacy method as a fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_timeout(
+        &self,
+        _endpoint: &Endpoint,
+        _host: Option<&str>,
+        _roots: &RootStore,
+        _verify: bool,
+        _now: i64,
+        _timeout_ms: u64,
+    ) -> Result<Box<dyn DoqConnection>> {
+        Err(Error::new(
+            crate::error::ErrorKind::Unsupported,
+            "DoQ provider does not implement connection deadlines",
+        ))
+    }
 }
 
 /// The built-in provider: a from-scratch RFC 9000/9001/9002 client
@@ -120,8 +146,20 @@ impl DoqProvider for BuiltinProvider {
         verify: bool,
         now: i64,
     ) -> Result<Box<dyn DoqConnection>> {
+        self.open_with_timeout(endpoint, host, roots, verify, now, 10_000)
+    }
+
+    fn open_with_timeout(
+        &self,
+        endpoint: &Endpoint,
+        host: Option<&str>,
+        roots: &RootStore,
+        verify: bool,
+        now: i64,
+        timeout_ms: u64,
+    ) -> Result<Box<dyn DoqConnection>> {
         let conn =
-            quic::QuicConnection::connect(endpoint, host, roots.clone(), verify, now, 10_000)?;
+            quic::QuicConnection::connect(endpoint, host, roots.clone(), verify, now, timeout_ms)?;
         Ok(Box::new(BuiltinConnection {
             inner: Mutex::new(Some(conn)),
         }))
@@ -138,11 +176,15 @@ struct BuiltinConnection {
 
 impl DoqConnection for BuiltinConnection {
     fn request(&mut self, framed_query: &[u8]) -> Result<Vec<u8>> {
+        self.request_with_timeout(framed_query, 10_000)
+    }
+
+    fn request_with_timeout(&mut self, framed_query: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
         let mut guard = self.inner.lock();
         let conn = guard
             .as_mut()
             .ok_or_else(|| Error::transport("doq connection closed"))?;
-        let resp = conn.exchange_query(framed_query, 10_000);
+        let resp = conn.exchange_query(framed_query, timeout_ms);
         match resp {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
@@ -179,7 +221,32 @@ pub struct DoqTransport {
     /// Optional custom QUIC provider (overrides the built-in client).
     pub provider: Option<Box<dyn DoqProvider>>,
     /// The live built-in connection (only used when `provider` is None).
-    conn: Mutex<Option<quic::QuicConnection>>,
+    conn: Mutex<Option<CachedConnection>>,
+}
+
+struct CachedConnection {
+    identity: ConnectionIdentity,
+    connection: quic::QuicConnection,
+}
+
+#[derive(Clone)]
+struct ConnectionIdentity {
+    endpoint: Endpoint,
+    host: Option<String>,
+    roots: RootStore,
+    verify: bool,
+    now: i64,
+    generation: u64,
+}
+impl ConnectionIdentity {
+    fn matches(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.host == other.host
+            && self.verify == other.verify
+            && self.now == other.now
+            && self.generation == other.generation
+            && super::io::same_roots(&self.roots, &other.roots)
+    }
 }
 
 /// Which server this transport talks to and how it verifies it; the live
@@ -207,7 +274,7 @@ impl Default for DoqTransport {
             host: None,
             roots: RootStore::new(),
             verify: true,
-            now: unix_now(),
+            now: 0,
             provider: None,
             conn: Mutex::new(None),
         }
@@ -241,71 +308,122 @@ impl DoqTransport {
     }
 }
 
-/// Current Unix time in seconds.
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 impl DnsTransport for DoqTransport {
     fn proto(&self) -> Proto {
         Proto::DoQ
     }
 
     fn exchange(&self, query: &[u8], endpoint: &Endpoint, timeout_ms: u64) -> Result<Vec<u8>> {
+        let deadline = Deadline::after(timeout_ms)?;
         let now = super::io::certificate_time(self.now)?;
         if query.len() > MAX_TCP_MESSAGE {
             return Err(Error::transport("query too large for DoQ"));
         }
-        let framed = frame_query(query)?;
-        let resp = if let Some(provider) = &self.provider {
-            let mut conn = provider.open(
+        let mut message = Message::parse(query)?;
+        if message.flags.qr
+            || message.questions.len() != 1
+            || message.flags.opcode != crate::qtype::Opcode::QUERY
+        {
+            return Err(Error::wire("DoQ requires a DNS query with one question"));
+        }
+        if self.verify
+            && (self.roots.is_empty() || self.host.as_deref().map_or(true, str::is_empty))
+        {
+            return Err(Error::config(
+                "verified DoQ requires trust roots and a TLS identity",
+            ));
+        }
+        let original_id = message.id;
+        message.id = 0;
+        if let Some(edns) = &mut message.edns {
+            edns.options
+                .retain(|option| option.code() != crate::edns::opt::KEEPALIVE);
+        }
+        let framed = frame_query(&message.to_bytes()?)?;
+        let mut response = if let Some(provider) = &self.provider {
+            let mut conn = provider.open_with_timeout(
                 endpoint,
                 self.host.as_deref(),
                 &self.roots,
                 self.verify,
                 now,
+                deadline.remaining_ms()?,
             )?;
-            let r = conn.request(&framed);
+            let result = (|| {
+                let bytes = conn.request_with_timeout(&framed, deadline.remaining_ms()?)?;
+                deadline.remaining_ms()?;
+                validate_response(&bytes, &message)
+            })();
             conn.close();
-            r?
+            result?
         } else {
-            let mut guard = self.conn.lock();
-            let conn = match guard.as_mut() {
-                Some(c) if c.is_open() => c,
-                _ => {
-                    // The caller's timeout is the bound, verbatim. It used to be
-                    // floored at 10 s "because a QUIC handshake needs more than a
-                    // UDP exchange", which quietly turned a 200 ms request into a
-                    // ten-second stall and made every deadline above it — the
-                    // engine's per-query budget included — meaningless for DoQ.
-                    // A caller that wants ten seconds can ask for ten seconds.
-                    // `Option::insert` hands back the reference it just stored,
-                    // so there is no "I assigned it, therefore it is there" step
-                    // and no place for the two to disagree.
-                    guard.insert(quic::QuicConnection::connect(
-                        endpoint,
-                        self.host.as_deref(),
-                        self.roots.clone(),
-                        self.verify,
-                        now,
-                        timeout_ms,
-                    )?)
-                }
+            let identity = ConnectionIdentity {
+                endpoint: *endpoint,
+                host: self.host.clone(),
+                roots: self.roots.clone(),
+                verify: self.verify,
+                now,
+                generation: courierust::courierust_net::outbound::generation(),
             };
-            match conn.exchange_query(&framed, timeout_ms) {
-                Ok(bytes) => bytes,
-                Err(e) => {
+            let mut guard = lock_until(&self.conn, deadline)?;
+            if !guard.as_ref().is_some_and(|cached| {
+                cached.connection.is_open() && cached.identity.matches(&identity)
+            }) {
+                // Drop the old route or identity before attempting a replacement.
+                *guard = None;
+                let connection = quic::QuicConnection::connect(
+                    endpoint,
+                    self.host.as_deref(),
+                    self.roots.clone(),
+                    self.verify,
+                    now,
+                    deadline.remaining_ms()?,
+                )?;
+                *guard = Some(CachedConnection {
+                    identity,
+                    connection,
+                });
+            }
+            let result = (|| {
+                let cached = guard
+                    .as_mut()
+                    .ok_or_else(|| Error::internal("missing DoQ connection"))?;
+                let bytes = cached
+                    .connection
+                    .exchange_query(&framed, deadline.remaining_ms()?)?;
+                deadline.remaining_ms()?;
+                validate_response(&bytes, &message)
+            })();
+            match result {
+                Ok(response) => response,
+                Err(error) => {
                     *guard = None;
-                    return Err(e);
+                    return Err(error);
                 }
             }
         };
-        let _ = deframe_response(&resp)?;
-        Ok(resp.rest_at(2)?.to_vec())
+        response.id = original_id;
+        response.to_bytes()
     }
+}
+
+fn validate_response(bytes: &[u8], query: &Message) -> Result<Message> {
+    let response = deframe_response(bytes)?;
+    if !crate::query::response_matches_query(query, &response) || response.flags.tc {
+        return Err(Error::transport(
+            "DoQ response has an invalid ID, question or flags",
+        ));
+    }
+    if response.edns.as_ref().is_some_and(|edns| {
+        edns.options
+            .iter()
+            .any(|option| option.code() == crate::edns::opt::KEEPALIVE)
+    }) {
+        return Err(Error::transport(
+            "DoQ response contains forbidden TCP keepalive",
+        ));
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -313,6 +431,146 @@ mod tests {
     use super::*;
     use crate::name::Name;
     use crate::qtype::RrType;
+
+    struct EchoProvider {
+        bad_id: bool,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct EchoConnection {
+        bad_id: bool,
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl DoqProvider for EchoProvider {
+        fn open(
+            &self,
+            _: &Endpoint,
+            _: Option<&str>,
+            _: &RootStore,
+            _: bool,
+            _: i64,
+        ) -> Result<Box<dyn DoqConnection>> {
+            panic!("transport called unbounded provider open")
+        }
+        fn open_with_timeout(
+            &self,
+            _: &Endpoint,
+            _: Option<&str>,
+            _: &RootStore,
+            _: bool,
+            _: i64,
+            timeout: u64,
+        ) -> Result<Box<dyn DoqConnection>> {
+            assert!((1..=500).contains(&timeout));
+            Ok(Box::new(EchoConnection {
+                bad_id: self.bad_id,
+                closed: self.closed.clone(),
+            }))
+        }
+    }
+    impl DoqConnection for EchoConnection {
+        fn request(&mut self, _: &[u8]) -> Result<Vec<u8>> {
+            panic!("transport called unbounded provider request")
+        }
+        fn request_with_timeout(&mut self, bytes: &[u8], timeout: u64) -> Result<Vec<u8>> {
+            assert!((1..=500).contains(&timeout));
+            let mut message = deframe_response(bytes)?;
+            assert_eq!(message.id, 0);
+            assert!(message
+                .edns
+                .as_ref()
+                .unwrap()
+                .options
+                .iter()
+                .all(|option| option.code() != crate::edns::opt::KEEPALIVE));
+            message.flags.qr = true;
+            if self.bad_id {
+                message.id = 7;
+            }
+            frame_query(&message.to_bytes()?)
+        }
+        fn close(&mut self) {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn doq_wire_id_is_zero_and_client_id_is_restored_only_after_validation() {
+        for bad_id in [false, true] {
+            let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut transport = DoqTransport::with_provider(Box::new(EchoProvider {
+                bad_id,
+                closed: closed.clone(),
+            }));
+            transport.verify = false; // No TLS in this protocol-boundary fixture.
+            let mut query = Message::query(
+                123,
+                Name::from_ascii("example.com").unwrap(),
+                RrType::A,
+                true,
+            );
+            let mut edns = crate::edns::Edns::new(1232);
+            edns.options
+                .push(crate::edns::EdnsOption::TcpKeepalive(None));
+            query.edns = Some(edns);
+            let result = transport.exchange(
+                &query.to_bytes().unwrap(),
+                &Endpoint::new("127.0.0.1".parse().unwrap(), 853, Proto::DoQ),
+                500,
+            );
+            if bad_id {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(Message::parse(&result.unwrap()).unwrap().id, 123);
+            }
+            assert!(closed.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn connection_identity_includes_route_certificate_settings_and_egress_generation() {
+        let identity = ConnectionIdentity {
+            endpoint: Endpoint::new("127.0.0.1".parse().unwrap(), 853, Proto::DoQ),
+            host: Some("localhost".into()),
+            roots: RootStore::new(),
+            verify: true,
+            now: 1,
+            generation: 0,
+        };
+        for field in 0..6 {
+            let mut changed = identity.clone();
+            match field {
+                0 => changed.endpoint.port += 1,
+                1 => changed.host = Some("different.example".into()),
+                2 => changed.roots.add_der(vec![1]),
+                3 => changed.verify = false,
+                4 => changed.now += 1,
+                _ => changed.generation += 1,
+            }
+            assert!(!identity.matches(&changed));
+        }
+        assert!(identity.matches(&identity.clone()));
+        assert_eq!(DoqTransport::default().now, 0);
+    }
+
+    #[test]
+    fn waiting_for_a_busy_doq_connection_consumes_the_callers_deadline() {
+        let transport = DoqTransport::for_host("localhost", RootStore::new(), false, 0);
+        let _held = transport.conn.lock();
+        let query = Message::query(1, Name::from_ascii("example.com").unwrap(), RrType::A, true)
+            .to_bytes()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = transport
+            .exchange(
+                &query,
+                &Endpoint::new("127.0.0.1".parse().unwrap(), 853, Proto::DoQ),
+                20,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, crate::error::ErrorKind::Timeout);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn framing_roundtrip() {
@@ -348,10 +606,16 @@ mod tests {
         // "not implemented" provider. 192.0.2.1 is TEST-NET: the Initial goes
         // nowhere and nothing ever comes back, so the transport has to give up
         // by itself.
-        let t = DoqTransport::default();
+        let t = DoqTransport {
+            verify: false,
+            ..DoqTransport::default()
+        };
         let ep = Endpoint::new("192.0.2.1".parse().unwrap(), 853, Proto::DoQ);
         let started = std::time::Instant::now();
-        let r = t.exchange(b"\x00", &ep, 200);
+        let query = Message::query(7, Name::from_ascii("example.com").unwrap(), RrType::A, true)
+            .to_bytes()
+            .unwrap();
+        let r = t.exchange(&query, &ep, 200);
         let elapsed = started.elapsed();
         let e = r.expect_err("a blackhole DoQ endpoint must fail");
         // Which *kind* of failure depends on the route's temper, and both are

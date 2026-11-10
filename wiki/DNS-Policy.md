@@ -145,11 +145,11 @@ significant first, with non-canonical labels refused rather than read as an
 address).
 * A name keeps the same address until the mapping expires, and the address maps
   back to the name. Reversibility is what makes the mode usable at all.
-* When the pool is full it **recycles the least-recently-used mapping** and
-  keeps answering rather than refusing. For a proxy, refusing means the client
-  gets the real address and leaks past the routing rules; a renumbered mapping
-  costs one connection. The recycle count is readable at
-  `shared.fake_ip.evicted()`.
+* A full pool reclaims expired mappings only. If every mapping is live, it
+  returns SERVFAIL without resolving the name externally or reassigning a live
+  address. Expired reclamations are counted by `shared.fake_ip.evicted()`.
+* The answer TTL is capped by the mapping idle lifetime. Proxies must keep
+  active mappings warm and preserve destinations for established connections.
 * `fake-ip-ttl` is the **mapping** lifetime (default 3600s);
   `fake-ip-answer-ttl` is the **answer** TTL (default 1s). They are different
   things: one bounds the pool, the other bounds how long a client may keep
@@ -201,8 +201,8 @@ address).
 * RFC1918 private ranges are deliberately **not** in the default: home and
   split-horizon upstreams return private addresses legitimately, and flagging
   those as pollution would break working setups.
-* `domain`: these names go straight to the `fallback` group, never touching the
-  default servers.
+* `domain`: names without an explicit `nameserver-policy` match go straight
+  to the `fallback` group. Explicit groups are isolated from public fallback.
 * `geoip` / `geoipCode` need a country-to-CIDR database, which this build does
   not embed, so setting `geoip: true` is a **configuration error** naming the
   replacements (`ipcidr` + `domain`). Accepting it silently would leave an
@@ -237,3 +237,12 @@ That property is what makes the whole feature safe to adopt incrementally.
 - [Architecture](Architecture.md) — where this layer sits in the pipeline.
 - [Deployment](Deployment.md) — running it for real clients.
 - [Testing](Testing.md) — how these behaviours are pinned down.
+
+## Disclosure limits
+
+`dns.privacy: "strict"` requires verified encrypted forwarding, removes client
+EDNS identifiers, pads queries and disables speculative racing. Its default
+`max-upstream-exposures` is 1; the standard mode defaults to 32. Limits count
+upstream IPs, including failed attempts, across retries, fallback and nested
+DNSSEC work. Exhaustion fails closed. See [the privacy contract](../docs/dns-privacy.md)
+for the configuration, routing precedence and remaining limitations.

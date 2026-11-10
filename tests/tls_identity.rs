@@ -62,8 +62,6 @@ fn read_exact(
         if count == 0 {
             return Err("server received EOF before a complete DNS frame".into());
         }
-        // Count even a partial length prefix: certificate rejection must
-        // precede every application byte, not just complete DNS messages.
         received.fetch_add(count, Ordering::Relaxed);
         bytes = &mut bytes[count..];
     }
@@ -110,8 +108,6 @@ fn serve(listener: TcpListener, received: Arc<AtomicUsize>) -> Result<(), String
     response.flags.qr = true;
     let response = response.to_bytes().unwrap();
     let prefix = (response.len() as u16).to_be_bytes();
-    // A DNS frame may span TLS records. Split both the length and body so
-    // the successful exchange also checks the transport's framing loop.
     for fragment in [&prefix[..1], &prefix[1..], &response[..7], &response[7..]] {
         tls.write_all(fragment)
             .map_err(|error| format!("server write: {error}"))?;
@@ -198,4 +194,81 @@ fn untrusted_certificate_never_sends_dns() {
 #[test]
 fn expired_certificate_never_sends_dns() {
     assert_certificate_rejected("localhost", true, 2_200_000_000, "outside validity window");
+}
+
+#[test]
+fn strict_forwarding_removes_client_identifiers_and_pads_the_wire_query() {
+    use recurse_x::edns::{Edns, EdnsOption};
+    use recurse_x::forward::{Forwarder, ForwarderSet};
+    use recurse_x::privacy::UpstreamPrivacy;
+
+    let _serial = encrypted::serial();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let stream = accept(&listener).unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(encrypted::IO_TIMEOUT))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(encrypted::IO_TIMEOUT))
+            .unwrap();
+        let acceptor = TlsAcceptor::new(ServerConfig {
+            identity: Identity::from_der(vec![CERT.to_vec()], KEY.to_vec()).unwrap(),
+            alpn: vec![b"dot".to_vec()],
+            ..ServerConfig::default()
+        });
+        let mut tls = acceptor.accept(&stream, &stream).unwrap();
+        let received = AtomicUsize::new(0);
+        let mut prefix = [0; 2];
+        read_exact(&mut tls, &mut prefix, &received).unwrap();
+        let mut body = vec![0; usize::from(u16::from_be_bytes(prefix))];
+        read_exact(&mut tls, &mut body, &received).unwrap();
+        assert_eq!(body.len() % 128, 0);
+        let mut response = Message::parse(&body).unwrap();
+        assert!(response.flags.cd);
+        let edns = response.edns.as_ref().unwrap();
+        assert!(edns.dnssec_ok);
+        assert_eq!(edns.options.len(), 1);
+        assert!(matches!(edns.options[0], EdnsOption::Padding(_)));
+        response.flags.qr = true;
+        let bytes = response.to_bytes().unwrap();
+        tls.write_all(&(bytes.len() as u16).to_be_bytes()).unwrap();
+        tls.write_all(&bytes).unwrap();
+    });
+    let mut roots = RootStore::new();
+    roots.add_der(CERT.to_vec());
+    let set = ForwarderSet::new(roots, true, 1_800_000_000).with_privacy(UpstreamPrivacy::strict());
+    let mut query = query();
+    query.flags.cd = true;
+    let mut edns = Edns::new(1232);
+    edns.dnssec_ok = true;
+    edns.options.push(EdnsOption::Ecs(recurse_x::edns::Ecs {
+        family: 1,
+        source_prefix: 24,
+        scope_prefix: 0,
+        address: vec![192, 0, 2],
+    }));
+    edns.options.push(EdnsOption::Cookie {
+        client: [7; 8],
+        server: vec![],
+    });
+    edns.options.push(EdnsOption::Unknown {
+        code: 65001,
+        data: vec![1, 2, 3],
+    });
+    query.edns = Some(edns);
+    let result = set.exchange_with(
+        &[Forwarder::encrypted(
+            Endpoint::new(address.ip(), address.port(), Proto::Tls),
+            "localhost",
+        )],
+        &query,
+        &query.to_bytes().unwrap(),
+        encrypted::IO_TIMEOUT_MS,
+    );
+    server.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
 }

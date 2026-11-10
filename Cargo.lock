@@ -4,9 +4,9 @@ version = 3
 
 [[package]]
 name = "courierust"
-version = "1.1.1"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5d9acf17b902baee05a1b95997adb463b1033d76a50bd652a191e22333ebe23"
+checksum = "e1c3667cc0b9be95cfa465a74635c24b7bfc61f37c03e343035e45621a3ab7fe"
 
 [[package]]
 name = "nextjson"
@@ -25,7 +25,7 @@ checksum = "40902ae48213c919e92efb5f135ee952596dd2d37426ab1ab64ad65bdfdb23d1"
 
 [[package]]
 name = "recurse-x"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "courierust",
  "nextjson",

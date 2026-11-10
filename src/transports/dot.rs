@@ -3,7 +3,7 @@
 use super::io::{network_error, Deadline, DeadlineStream};
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 
 use courierust::courierust_tls::{ClientConfig as TlsClientConfig, RootStore, TlsConnector};
 
@@ -89,9 +89,11 @@ impl DnsTransport for DotTransport {
         } else {
             timeout_ms.min(self.connect_timeout_ms)
         };
-        let stream =
-            TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(connect_limit))
-                .map_err(|e| network_error("DoT connect", e))?;
+        let stream = courierust::courierust_net::outbound::connect(
+            &addr,
+            Some(std::time::Duration::from_millis(connect_limit)),
+        )
+        .map_err(|e| network_error("DoT connect", e))?;
         let mut tls = self
             .connector()?
             .connect(

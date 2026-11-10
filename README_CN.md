@@ -55,13 +55,18 @@ P(所有依赖同时新鲜) >= max(0, 1 - sum(1 - p_i))
 加密上游默认验证证书。JSON 配置通过 `forwarderCaFile` 装载 PEM 信任根；库调用者可使用
 `EngineConfig::forwarder_roots` 或 `Resolver::set_forwarder_roots(roots, true)`。空信任根拒绝连接。
 
-DoT/DoQ 可以分别指定连接 IP 和 TLS 主机名。courierust 1.1.1 的 HTTP 客户端无法分别指定这两个值，
+DoT/DoQ 可以分别指定连接 IP 和 TLS 主机名。courierust 1.1.2 的 HTTP 客户端无法分别指定这两个值，
 因此 DoH/DoH3 的 `host` 必须是与 `ip` 相同的 IP 字面值，并由证书中的 IP 身份认证。
 无法保证指定 IP 的配置在加载时明确拒绝；HTTP 重定向也不会跟随。请求和响应使用 `application/dns-message`。
 
 传输的 `now = 0` 使用实时证书时钟。DoH/DoH3 在校验秒值变化时重建现有客户端，避免长期沿用启动时间；
 同一校验周期内继续复用 courierust 的连接池。这会缩短连接保留时间，不能作为性能提升来宣传。
 HTTP 阶段超时仍受依赖的阻塞 I/O 语义约束，代码不能抢占已经进入依赖内部的调用。
+出口网络代次变化后，DoH/DoH3 和 DoQ 会废弃缓存连接。DoQ 复用还必须匹配目的地址、TLS 身份、信任根、校验开关和证书时间。
+
+DoQ 的自实现 QUIC 仍属实验性传输：当前没有完整拥塞控制器、密钥更新或连接迁移，测试也尚未证明公网互操作性。
+自定义 `DoqProvider` 必须实现 `open_with_timeout` 和 `request_with_timeout`；只实现旧接口会返回 `Unsupported`，不会静默执行无时限调用。
+直接使用底层接口时，`ClientHandshake::new` 现在返回 `Result`，调用者需处理配置或系统随机源失败。
 
 DNSSEC 检测到无效签名时会拒绝答案，缓存命中与 stale 回退也会检查。验证递归保护限于当前线程，
 一个工作线程的验签不会跳过其他线程的检查。快照恢复会清除保存的验证标记。
@@ -71,7 +76,7 @@ ECDSA/EdDSA 尚未实现验证，NSEC/NSEC3 否定证明也未完成。`dnssec_a
 
 ## 构建与配置
 
-MSRV 为 Rust 1.78。当前使用 crates.io 正式版本：courierust 1.1.1、nextjson 0.1.5、tzcraft 0.1.2、rustbinary 0.1.10。
+MSRV 为 Rust 1.78。当前使用 crates.io 正式版本：courierust 1.1.2、nextjson 0.1.5、tzcraft 0.1.2、rustbinary 0.1.10。
 不包含本地依赖副本。`std` 构建统一使用系统密码学随机源；获取随机源失败时不会使用哈希值或时间生成密钥。
 
 ```powershell
@@ -115,3 +120,5 @@ cargo clippy --all-features --all-targets --locked -- -D warnings
 当前行为与验证结论以实现、测试和验收记录为准。
 
 许可证见 [LICENSE](LICENSE)。
+
+严格加密转发、查询披露额度和 Fake-IP 满池行为见 [DNS 隐私与失败边界](docs/dns-privacy.md)。

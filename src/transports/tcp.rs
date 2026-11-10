@@ -56,7 +56,7 @@ impl DnsTransport for TcpTransport {
         } else {
             connect_timeout.min(std::time::Duration::from_millis(self.connect_timeout_ms))
         };
-        let stream = std::net::TcpStream::connect_timeout(&addr, connect_timeout)
+        let stream = courierust::courierust_net::outbound::connect(&addr, Some(connect_timeout))
             .map_err(|e| network_error("TCP connect", e))?;
         let mut stream = DeadlineStream {
             stream: &stream,

@@ -183,7 +183,7 @@ pub struct TransportParams {
     /// server-initiated bidirectional streams.
     pub initial_max_stream_data_bidi_remote: u64,
     /// `initial_max_stream_data_uni` — receive window on
-    /// server-initiated unidirectional streams (the DoQ session stream).
+    /// unidirectional streams (disabled for DoQ).
     pub initial_max_stream_data_uni: u64,
     /// `initial_max_streams_bidi` — server-initiated bidi streams allowed.
     pub initial_max_streams_bidi: u64,
@@ -198,20 +198,18 @@ pub struct TransportParams {
 }
 
 impl TransportParams {
-    /// Sensible DoQ client defaults: generous receive windows, a modest
-    /// idle timeout, and room for the mandatory session stream. The
-    /// values mirror courierust's H3 client (which is interop-tested
-    /// against quinn/quiche peers).
+    /// Receive windows for client-initiated request streams. DoQ forbids
+    /// peer-initiated and unidirectional streams (RFC 9250 section 4.3.3).
     pub fn client_defaults(scid: Vec<u8>) -> Self {
         Self {
             max_idle_timeout_ms: 30_000,
             max_udp_payload_size: 1350,
             initial_max_data: 1 << 26,
             initial_max_stream_data_bidi_local: 1 << 20,
-            initial_max_stream_data_bidi_remote: 1 << 20,
-            initial_max_stream_data_uni: 1 << 20,
-            initial_max_streams_bidi: 1024,
-            initial_max_streams_uni: 16,
+            initial_max_stream_data_bidi_remote: 0,
+            initial_max_stream_data_uni: 0,
+            initial_max_streams_bidi: 0,
+            initial_max_streams_uni: 0,
             active_connection_id_limit: 2,
             initial_source_connection_id: scid,
             retry_source_connection_id: None,
@@ -264,9 +262,10 @@ fn varint_bytes(v: u64) -> Vec<u8> {
 pub struct ServerTransportParams {
     /// `initial_max_data` (connection receive window the server allows).
     pub initial_max_data: u64,
-    /// `initial_max_stream_data_bidi_local` — the server's receive
-    /// window for data we send on our bidirectional streams.
+    /// Server receive window on server-initiated bidirectional streams.
     pub initial_max_stream_data_bidi_local: u64,
+    /// Server receive window on client-initiated bidirectional streams.
+    pub initial_max_stream_data_bidi_remote: u64,
     /// `initial_max_streams_bidi` — streams we may open.
     pub initial_max_streams_bidi: u64,
     /// `initial_max_streams_uni` — streams the server may open.
@@ -283,19 +282,20 @@ pub struct ServerTransportParams {
 /// `0x0039` extension). Unknown parameters are skipped, not fatal.
 pub fn decode_server_transport_params(bytes: &[u8]) -> Result<ServerTransportParams> {
     let mut out = ServerTransportParams::default();
+    let mut seen = alloc::collections::BTreeSet::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
         let (id, used) = courierust::courierust_quic::varint::decode(bytes.rest_at(pos)?)
             .map_err(|_| Error::wire("QUIC transport parameter id malformed"))?;
         pos += used;
+        if !seen.insert(id) {
+            return Err(Error::wire("duplicate QUIC transport parameter"));
+        }
         let (len, used) = courierust::courierust_quic::varint::decode(bytes.rest_at(pos)?)
             .map_err(|_| Error::wire("QUIC transport parameter length malformed"))?;
         pos += used;
         let len =
             usize::try_from(len).map_err(|_| Error::wire("QUIC parameter length overflow"))?;
-        // The bound is checked by the read itself: `slice_at` reports a length
-        // that runs past the end, and it reports it through arithmetic that
-        // cannot overflow rather than a comparison that can wrap.
         let value = bytes
             .slice_at(pos, len)
             .map_err(|_| Error::wire("QUIC transport parameter truncated"))?;
@@ -303,6 +303,7 @@ pub fn decode_server_transport_params(bytes: &[u8]) -> Result<ServerTransportPar
         match id {
             0x04 => out.initial_max_data = decode_param_u64(value)?,
             0x05 => out.initial_max_stream_data_bidi_local = decode_param_u64(value)?,
+            0x06 => out.initial_max_stream_data_bidi_remote = decode_param_u64(value)?,
             0x08 => out.initial_max_streams_bidi = decode_param_u64(value)?,
             0x09 => out.initial_max_streams_uni = decode_param_u64(value)?,
             0x00 => out.original_destination_connection_id = Some(value.to_vec()),
@@ -406,30 +407,42 @@ impl fmt::Debug for ClientHandshake {
 
 impl ClientHandshake {
     /// A fresh client handshake for the given configuration. Generates
-    /// the X25519 key share and the 32-byte client random.
-    pub fn new(cfg: ClientConfig) -> Self {
+    /// the X25519 key share and the 32-byte client random. Invalid trust
+    /// configuration and OS entropy failures return an error before any send.
+    pub fn new(cfg: ClientConfig) -> Result<Self> {
+        Self::with_entropy(cfg, crate::entropy::fill)
+    }
+
+    fn with_entropy(cfg: ClientConfig, mut source: impl FnMut(&mut [u8]) -> bool) -> Result<Self> {
+        if cfg.alpn.is_empty() || cfg.alpn.len() > 255 {
+            return Err(Error::config(
+                "QUIC requires an ALPN identifier of 1 to 255 bytes",
+            ));
+        }
+        if cfg.verify
+            && (cfg.roots.is_empty() || cfg.hostname.as_deref().map_or(true, str::is_empty))
+        {
+            return Err(Error::config(
+                "verified QUIC requires trust roots and a TLS identity",
+            ));
+        }
         let mut random = [0u8; 32];
+        if !source(&mut random) {
+            return Err(Error::internal(
+                "operating-system entropy unavailable for TLS random",
+            ));
+        }
+        let mut entropy_ok = true;
         let mut rng = |buf: &mut [u8]| {
-            if !courierust::courierust_tls::crypto::rng::fill_random(buf) {
-                // Extremely unlikely; fill with a process-unique seed so
-                // the handshake still proceeds (this is not secret
-                // material by itself — the ECDHE private key below is
-                // the secret, and it comes from the same source).
-                let mut s = crate::entropy::seed_u64();
-                for chunk in buf.chunks_mut(8) {
-                    s = s
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    let bytes = s.to_le_bytes();
-                    for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
-                        *dst = *src;
-                    }
-                }
-            }
+            entropy_ok &= source(buf);
         };
-        rng(&mut random);
         let (ecdhe_secret, ecdhe_public) = x25519::keypair(&mut rng);
-        Self {
+        if !entropy_ok {
+            return Err(Error::internal(
+                "operating-system entropy unavailable for TLS key share",
+            ));
+        }
+        Ok(Self {
             cfg,
             random,
             ecdhe_secret,
@@ -447,7 +460,7 @@ impl ClientHandshake {
             next: hstype::ENCRYPTED_EXTENSIONS,
             chain: Vec::new(),
             done: false,
-        }
+        })
     }
 
     /// The transcript hash of all messages fed so far, using the
@@ -537,11 +550,6 @@ impl ClientHandshake {
             gb.extend_from_slice(&g.to_be_bytes());
         }
         exts.extend_from_slice(&extension(0x000a, &gb));
-        // signature_algorithms (RFC 8446 §4.2.3). A broad list so any
-        // server key type finds a matching scheme — a server whose
-        // certificate key has no offered scheme sends handshake_failure.
-        // Every offered scheme is one this module can verify (see
-        // `verify_certificate_verify`).
         let sigs = [
             // PSS-PSS
             0x0809u16, 0x080a, // sha256, sha384
@@ -576,7 +584,6 @@ impl ClientHandshake {
             ab.extend_from_slice(&self.cfg.alpn);
             exts.extend_from_slice(&extension(0x0010, &ab));
         }
-        // quic_transport_parameters (RFC 9001 §8.2)
         let params = self.cfg.transport_params.encode();
         exts.extend_from_slice(&extension(0x0039, &params));
 
@@ -596,9 +603,6 @@ impl ClientHandshake {
             return Err(Error::wire("TLS handshake message too short"));
         }
         let msg_type = msg.byte_at(0)?;
-        // A handshake length is three octets (RFC 8446 §4). Read as a `u32` and
-        // masked it would be one bad edit away from consuming `msg[4]`, which
-        // is the first byte of the body it is supposed to describe.
         let len =
             (u32::from_be_bytes([0, msg.byte_at(1)?, msg.byte_at(2)?, msg.byte_at(3)?])) as usize;
         if 4 + len != msg.len() {
@@ -608,11 +612,6 @@ impl ClientHandshake {
         match msg_type {
             hstype::SERVER_HELLO if !self.saw_server_hello => {
                 self.parse_server_hello(body)?;
-                // The ServerHello becomes part of the transcript before
-                // the handshake traffic secrets are derived: RFC 8446
-                // §7.1 hashes `ClientHello..ServerHello` for the
-                // "c/s hs traffic" labels. Deriving from CH alone
-                // produces keys that do not match the peer's.
                 self.transcript_msgs.push(msg.to_vec());
                 self.derive_handshake_secrets()?;
                 Ok(None)
@@ -637,12 +636,6 @@ impl ClientHandshake {
                         self.verify_certificate_verify(body, &hash_before_cv)?;
                         self.next = hstype::FINISHED;
                     }
-                    // Unreachable in this build: the outer arm has already
-                    // restricted `msg_type` to these three. It is an error
-                    // rather than `unreachable!()` because that restriction is
-                    // expressed in a guard clause twelve lines above, which is
-                    // the kind of coupling that does not survive a reordering —
-                    // and a panic here is reachable from a peer's bytes.
                     _ => return Err(Error::wire("TLS handshake message out of order")),
                 }
                 self.transcript_msgs.push(msg.to_vec());
@@ -657,12 +650,6 @@ impl ClientHandshake {
                 self.transcript_msgs.push(msg.to_vec());
                 let client_finished = self.derive_application_secrets()?;
                 self.done = true;
-                // `next` reaches FINISHED only through CertificateVerify, and
-                // `suite` is stored before `saw_server_hello` becomes true, so
-                // the suite is always present here. Reported as a handshake
-                // failure rather than an `expect`, because the argument is a
-                // statement about ordering elsewhere in this file and a panic
-                // on remote input is a denial of service, not an assertion.
                 let Some(suite) = self.suite else {
                     return Err(Error::wire(
                         "TLS Finished without a negotiated cipher suite",
@@ -678,7 +665,6 @@ impl ClientHandshake {
     }
 
     fn parse_server_hello(&mut self, body: &[u8]) -> Result<()> {
-        // legacy_version must be 0x0303.
         if body.len() < 35 {
             return Err(Error::wire("ServerHello too short"));
         }
@@ -695,7 +681,7 @@ impl ClientHandshake {
         let mut pos = 35usize;
         if sid_len != 0 {
             return Err(Error::wire(
-                "ServerHello legacy_session_id is not empty (QUIC forbids resumption)",
+                "ServerHello legacy_session_id does not match the empty client value",
             ));
         }
         pos += sid_len;
@@ -716,21 +702,27 @@ impl ClientHandshake {
                 "ServerHello selected an unsupported cipher suite",
             ));
         }
-        // Extensions: must contain supported_versions=0x0304 and key_share.
         if pos + 2 > body.len() {
             return Err(Error::wire("ServerHello missing extensions"));
         }
         let ext_total = usize::from(body.u16_at(pos)?);
         pos += 2;
-        if pos + ext_total > body.len() {
-            return Err(Error::wire("ServerHello extensions truncated"));
+        if pos + ext_total != body.len() {
+            return Err(Error::wire("ServerHello extensions length mismatch"));
         }
         let mut server_key_share: Option<[u8; 32]> = None;
         let mut saw_versions = false;
         let mut ep = pos;
         let end = pos + ext_total;
-        while ep + 4 <= end {
+        let mut seen = alloc::collections::BTreeSet::new();
+        while ep < end {
+            if end - ep < 4 {
+                return Err(Error::wire("ServerHello extension header truncated"));
+            }
             let etype = body.u16_at(ep)?;
+            if !seen.insert(etype) {
+                return Err(Error::wire("duplicate ServerHello extension"));
+            }
             let elen = usize::from(body.u16_at(ep + 2)?);
             ep += 4;
             let ev = body
@@ -738,18 +730,11 @@ impl ClientHandshake {
                 .map_err(|_| Error::wire("ServerHello extension truncated"))?;
             match etype {
                 0x002b => {
-                    // supported_versions in a ServerHello is a single
-                    // u16 `selected_version` (RFC 8446 §4.2.1) — unlike
-                    // the ClientHello, which carries a length-prefixed
-                    // list. It must be exactly TLS 1.3 (0x0304).
                     if elen == 2 && matches!(ev.array_at::<2>(0), Ok([0x03, 0x04])) {
                         saw_versions = true;
                     }
                 }
                 0x0033 => {
-                    // Only an x25519 share is usable; a malformed extension is
-                    // ignored rather than trusted, so a wrong share surfaces
-                    // as a missing one — the honest diagnosis.
                     if let Some(k) = x25519_key_share(ev) {
                         server_key_share = Some(k);
                     }
@@ -812,13 +797,23 @@ impl ClientHandshake {
         }
         let ext_total = usize::from(body.u16_at(pos)?);
         pos += 2;
-        if pos + ext_total > body.len() {
-            return Err(Error::wire("EncryptedExtensions truncated"));
+        if pos + ext_total != body.len() {
+            return Err(Error::wire("EncryptedExtensions length mismatch"));
         }
         let end = pos + ext_total;
         let mut params = None;
-        while pos + 4 <= end {
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut matched_alpn = false;
+        while pos < end {
+            if end - pos < 4 {
+                return Err(Error::wire(
+                    "EncryptedExtensions extension header truncated",
+                ));
+            }
             let etype = body.u16_at(pos)?;
+            if !seen.insert(etype) {
+                return Err(Error::wire("duplicate EncryptedExtensions extension"));
+            }
             let elen = usize::from(body.u16_at(pos + 2)?);
             pos += 4;
             let extension = body
@@ -826,8 +821,22 @@ impl ClientHandshake {
                 .map_err(|_| Error::wire("EncryptedExtensions extension truncated"))?;
             if etype == 0x0039 {
                 params = Some(decode_server_transport_params(extension)?);
+            } else if etype == 0x0010 {
+                // RFC 7301: exactly one selected protocol, with both enclosing
+                // lengths checked. A valid certificate alone does not bind DoQ.
+                if extension.len() < 3
+                    || usize::from(extension.u16_at(0)?) + 2 != extension.len()
+                    || usize::from(extension.byte_at(2)?) + 3 != extension.len()
+                    || extension.rest_at(3)? != self.cfg.alpn.as_slice()
+                {
+                    return Err(Error::transport("QUIC server selected an unexpected ALPN"));
+                }
+                matched_alpn = true;
             }
             pos += elen;
+        }
+        if !matched_alpn {
+            return Err(Error::transport("QUIC server omitted ALPN"));
         }
         params.ok_or_else(|| Error::wire("server omitted quic_transport_parameters"))
     }
@@ -983,7 +992,7 @@ impl ClientHandshake {
         let finished_key = expand_label(d.as_mut(), s_hs, b"finished", &[], h);
         let mut md = new_digest(suite);
         let verify_data = hmac(md.as_mut(), &finished_key, hash_before_finished);
-        if verify_data.as_slice() != body {
+        if !courierust::courierust_tls::crypto::constant_time_eq(&verify_data, body) {
             return Err(Error::new(
                 ErrorKind::Dnssec,
                 "server Finished did not verify",
@@ -1229,6 +1238,77 @@ pub fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>> {
 mod tests {
     use super::*;
 
+    fn test_config() -> ClientConfig {
+        ClientConfig {
+            alpn: b"doq".to_vec(),
+            server_name: Some("dns.example.test".into()),
+            hostname: Some("dns.example.test".into()),
+            roots: RootStore::new(),
+            verify: false,
+            now: 1_700_000_000,
+            transport_params: TransportParams::client_defaults(vec![1; 8]),
+        }
+    }
+
+    #[test]
+    fn handshake_entropy_failure_never_uses_a_fallback_key() {
+        assert!(ClientHandshake::with_entropy(test_config(), |_| false).is_err());
+        let mut calls = 0;
+        assert!(ClientHandshake::with_entropy(test_config(), |bytes| {
+            calls += 1;
+            bytes.fill(42);
+            calls == 1
+        })
+        .is_err());
+        assert_eq!(calls, 2);
+        let mut config = test_config();
+        config.verify = true;
+        assert!(ClientHandshake::new(config).is_err());
+    }
+
+    #[test]
+    fn encrypted_extensions_bind_exactly_one_alpn_and_transport_parameters() {
+        let handshake = ClientHandshake::new(test_config()).unwrap();
+        let parameters = [0x00, 0x39, 0x00, 0x00];
+        let alpn = [0x00, 0x10, 0x00, 0x06, 0x00, 0x04, 0x03, b'd', b'o', b'q'];
+        let body = |extensions: &[u8]| {
+            let mut bytes = (extensions.len() as u16).to_be_bytes().to_vec();
+            bytes.extend_from_slice(extensions);
+            bytes
+        };
+        let valid = [parameters.as_slice(), alpn.as_slice()].concat();
+        assert!(handshake.parse_encrypted_extensions(&body(&valid)).is_ok());
+        assert!(handshake
+            .parse_encrypted_extensions(&body(&parameters))
+            .is_err());
+        assert!(handshake.parse_encrypted_extensions(&body(&alpn)).is_err());
+        let mut wrong = valid.clone();
+        *wrong.last_mut().unwrap() = b'h';
+        assert!(handshake.parse_encrypted_extensions(&body(&wrong)).is_err());
+        let duplicate = [valid.as_slice(), alpn.as_slice()].concat();
+        assert!(handshake
+            .parse_encrypted_extensions(&body(&duplicate))
+            .is_err());
+        let mut trailing = body(&valid);
+        trailing.push(0);
+        assert!(handshake.parse_encrypted_extensions(&trailing).is_err());
+        let truncated = [valid.as_slice(), &[0]].concat();
+        assert!(handshake
+            .parse_encrypted_extensions(&body(&truncated))
+            .is_err());
+    }
+
+    #[test]
+    fn transport_parameters_keep_stream_direction_and_reject_duplicates() {
+        let parameters = decode_server_transport_params(&[0x05, 1, 7, 0x06, 1, 13]).unwrap();
+        assert_eq!(parameters.initial_max_stream_data_bidi_local, 7);
+        assert_eq!(parameters.initial_max_stream_data_bidi_remote, 13);
+        assert!(decode_server_transport_params(&[0x06, 1, 7, 0x06, 1, 13]).is_err());
+        let client = TransportParams::client_defaults(vec![1; 8]);
+        assert_eq!(client.initial_max_streams_bidi, 0);
+        assert_eq!(client.initial_max_streams_uni, 0);
+    }
+
     #[test]
     fn transport_params_roundtrip() {
         let scid = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1262,7 +1342,7 @@ mod tests {
             now: 1_700_000_000,
             transport_params: TransportParams::client_defaults(vec![1, 2, 3, 4, 5, 6, 7, 8]),
         };
-        let mut hs = ClientHandshake::new(cfg);
+        let mut hs = ClientHandshake::new(cfg).unwrap();
         let ch = hs.client_hello();
         // Header: type 1, length.
         assert_eq!(ch[0], 1);
@@ -1316,11 +1396,6 @@ mod tests {
 
     #[test]
     fn a_certificate_entry_is_bounded_by_the_list_not_the_message() {
-        // list_len = 6, entry claims a 8-octet certificate, and the message
-        // carries eight more bytes after the list. The trailing bytes are the
-        // point: a parser that bounded entries by the *message* would accept
-        // this and hand the caller bytes belonging to the next handshake
-        // message, so this test fails if that bound is ever loosened.
         let mut past_list = vec![0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x08, 0xAA, 0xAA, 0xAA];
         past_list.extend_from_slice(&[0xBB; 8]);
         assert!(parse_certificate_list(&past_list).is_err());
@@ -1348,10 +1423,6 @@ mod tests {
 
     #[test]
     fn a_handshake_length_is_three_octets() {
-        // RFC 8446 §4: a handshake length is three octets. Reading it as four
-        // consumes the first body byte, which is not a subtle failure — every
-        // message would be one byte short and the transcript would not match
-        // the peer's.
         let body = vec![0xAAu8; 198];
         let msg = hs_message(1, &body);
         assert_eq!(msg.len(), 202);
@@ -1517,7 +1588,7 @@ mod tests {
         let mut base_point = [0u8; 32];
         base_point[0] = 9;
 
-        let mut handshake = ClientHandshake::new(cfg.clone());
+        let mut handshake = ClientHandshake::new(cfg.clone()).unwrap();
         handshake
             .parse_server_hello(&server_hello_body(TLS13, &base_point))
             .expect("an x25519 ServerHello must be accepted");
@@ -1526,7 +1597,7 @@ mod tests {
         // Thirty-one octets: the group check sees a length it did not offer, so
         // the extension is ignored and the failure names the missing key share
         // rather than reporting a length error somewhere else.
-        let mut short_key = ClientHandshake::new(cfg.clone());
+        let mut short_key = ClientHandshake::new(cfg.clone()).unwrap();
         let err = short_key
             .parse_server_hello(&server_hello_body(TLS13, &base_point[..31]))
             .expect_err("a 31-octet key share is not x25519 with 32 octets");
@@ -1535,13 +1606,42 @@ mod tests {
         // The extension block claims more bytes than the body has.
         let mut truncated = server_hello_body(TLS13, &base_point);
         truncated.truncate(truncated.len() - 3);
-        let mut cut = ClientHandshake::new(cfg.clone());
+        let mut cut = ClientHandshake::new(cfg.clone()).unwrap();
         assert!(cut.parse_server_hello(&truncated).is_err());
 
         // A server that selects TLS 1.2 has not selected TLS 1.3.
-        let mut downgrade = ClientHandshake::new(cfg);
+        let mut downgrade = ClientHandshake::new(cfg).unwrap();
         assert!(downgrade
             .parse_server_hello(&server_hello_body(&[0x03, 0x03], &base_point))
+            .is_err());
+    }
+
+    #[test]
+    fn server_hello_rejects_duplicate_extensions_and_trailing_bytes() {
+        let mut base_point = [0; 32];
+        base_point[0] = 9;
+        let valid = server_hello_body(&[0x03, 0x04], &base_point);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(ClientHandshake::new(test_config())
+            .unwrap()
+            .parse_server_hello(&trailing)
+            .is_err());
+        let mut duplicate = valid.clone();
+        duplicate.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        let length = (duplicate.len() - 40) as u16;
+        duplicate[38..40].copy_from_slice(&length.to_be_bytes());
+        assert!(ClientHandshake::new(test_config())
+            .unwrap()
+            .parse_server_hello(&duplicate)
+            .is_err());
+        let mut truncated_header = valid;
+        truncated_header.push(0);
+        let length = (truncated_header.len() - 40) as u16;
+        truncated_header[38..40].copy_from_slice(&length.to_be_bytes());
+        assert!(ClientHandshake::new(test_config())
+            .unwrap()
+            .parse_server_hello(&truncated_header)
             .is_err());
     }
 }

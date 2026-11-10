@@ -465,14 +465,17 @@ code delivers:
   recursion. There are no NSEC/NSEC3 proofs, so negative answers are not
   authenticated. If you need a chain anchored at the IANA root, that work is
   not in here yet.
-- **DoQ**: QUIC v1 (RFC 9000/9001/9002) and DoQ framing (RFC 9250) are
-  implemented in this crate on top of courierust's public packet/CRYPTO
-  codecs, X25519, HKDF and signature verification. The handshake completes
-  against a courierust H3 server over loopback. Against the two public DoQ
-  resolvers we tested, the handshake flight arrives as a single datagram larger
-  than 1500 bytes and the path to them dropped 1400-byte UDP packets 50–66% of
-  the time on our network, so we could not complete a handshake with them from
-  here — that is a path-MTU observation, not a claim about the code.
+- **DoQ**: this crate implements its own QUIC client on courierust's public
+  codecs and cryptographic primitives. Tests cover framing, reassembly,
+  transport parameters, deadlines and provider contracts; they do not establish
+  public-server interoperability. Recovery is PTO based, without a full
+  congestion controller, key updates or connection migration. Treat this
+  transport as experimental until interoperability and network-load testing
+  establish its deployment limits. A custom `DoqProvider` must implement
+  `open_with_timeout` and `request_with_timeout`; legacy-only providers fail
+  with `Unsupported` instead of bypassing the timeout contract.
+  The low-level `ClientHandshake::new` now returns `Result` to report invalid
+  trust configuration and OS entropy failures before sending a ClientHello.
 - **Server side**: the client-facing server speaks plain UDP and TCP only.
   DoT/DoH/DoH3/DoQ are upstream transports; there is no DNS-over-HTTPS
   endpoint.
@@ -509,7 +512,7 @@ Rust 1.78 or newer (the CI matrix runs the MSRV and stable):
 ```sh
 cargo build --release                       # everything, default features
 cargo build --no-default-features           # no_std + alloc algorithmic core
-cargo test --all-features                   # 455 tests + 4 doctests
+cargo test --all-features                   # unit, integration and documentation tests
 cargo run --example quick_check             # live resolution, needs network
 ```
 
@@ -595,8 +598,10 @@ zero a timeout, or empty the cache:
 ```
 
 `rootServers` takes `ip` or `ip:port`, so a local unbound/knot instance (or a
-test stub) can stand in as the entry point of the tree. Forwarders are tried in
-order until one answers with a matching ID and question. Configuring any
+test stub) can stand in as the entry point of the tree. Standard forwarding
+races at most two workers within the selected group; a loopback first upstream
+has sequential precedence. Strict privacy mode always queries sequentially.
+Responses must match the ID, opcode and single question and carry QR=1. Configuring any
 forwarder switches the resolver to forwarding mode: a forwarder that cannot be
 reached is reported as an error rather than quietly turning into a full
 iterative resolution, because the two have different answers to "who sees this
@@ -612,7 +617,7 @@ opt-out, never a strict-privacy configuration. Wrong identity is not retried
 via plaintext iterative resolution.
 
 DoT and DoQ accept a connection IP and a separate TLS hostname. With the
-published courierust 1.1.1 client, DoH and DoH3 require `host` to be the same
+published courierust 1.1.2 client, DoH and DoH3 require `host` to be the same
 IP literal as `ip`, and the certificate must authenticate that IP. A hostname
 that would require a separate connection-address override is rejected at
 configuration load. HTTP redirects are disabled; requests and responses use
@@ -623,6 +628,11 @@ courierust's pool within a validation-time epoch and rebuild the client when
 that Unix second changes, because this dependency stores a fixed TLS time.
 This trades connection retention for correct validity checks; it is not a
 connection-performance improvement claim.
+HTTP timeouts remain subject to the dependency's blocking, per-stage I/O
+semantics: rejecting a late result does not preempt an in-progress call.
+DoH/DoH3 and DoQ discard cached connections after Courierust reports an outbound
+network generation change. DoQ also checks the endpoint, TLS identity, roots,
+verification mode and certificate time before reusing a connection.
 
 `dnssec_anchored` is retained for source compatibility but ignored. No caller
 boolean can produce `ChainAnchored`, and this build does not set AD until an
@@ -634,11 +644,13 @@ current thread; one validation cannot disable checks in another worker.
 Snapshot validation flags are discarded on restore and must be established
 again by the active resolver.
 
-The tested dependency set is courierust 1.1.1, nextjson 0.1.5, tzcraft 0.1.2
-and rustbinary 0.1.10, fetched from crates.io. The `std` feature uses the OS
-entropy provider even when encrypted transports are disabled. RustBinary's
-unused protocol/derive features are disabled. Use the committed lock file
-and `--locked` for repeatable builds; there are no local dependency forks.
+The current build uses courierust 1.1.2 from crates.io, plus nextjson 0.1.5,
+tzcraft 0.1.2 and rustbinary 0.1.10. The `std`
+feature uses OS entropy even with encrypted transports disabled. RustBinary's
+unused protocol/derive features are disabled. `Cargo.lock` records the registry
+source and checksum; use `--locked` to reproduce the repository's resolution.
+CI consumes the published dependency and verifies the packaged crate without
+a sibling checkout. See the [verification boundary](docs/dns-privacy.md).
 
 ### Examples
 
@@ -678,10 +690,9 @@ cargo run --example server_demo      # blocks; query it with dig -p 5353
 
 ## Tests and CI
 
-There are 431 unit tests, 24 integration tests in `tests/`, and 4 doctests —
-459 in the default configuration — and the suite does not assert on any reply
-from the public Internet: upstreams in the tests are local stub servers, so
-`cargo test` is hermetic in the sense that its
+The suite includes unit tests, loopback integration tests and doctests; counts
+vary with enabled features. It does not assert on replies from the public
+Internet. Upstreams are local stub servers, so the
 result is about the resolver and not about the network. What is covered includes
 the wire codec (including rejection cases), cache admission/eviction/serve-stale
 and **ECS partitioning**, persistence, the change-rate posterior and its Chernoff
@@ -758,3 +769,6 @@ Copyright 2026 blueokanna. RecurseX is available under the
 RecurseX or with a product the licensor provides using RecurseX. The standard
 PolyForm Shield terms do not impose a blanket ban on non-competitive commercial
 sales or subscriptions.
+
+Forwarding disclosure limits, strict encrypted mode and Fake-IP exhaustion behavior
+are documented in the [DNS privacy contract](docs/dns-privacy.md).

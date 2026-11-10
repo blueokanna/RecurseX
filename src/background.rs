@@ -12,6 +12,14 @@ use crate::sync::Mutex;
 use crate::upstream::Endpoint;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(any(
+    test,
+    feature = "dot",
+    feature = "doh",
+    feature = "doh3",
+    feature = "doq"
+))]
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -197,15 +205,23 @@ struct TaskContext {
     work: Work,
     reserved_bytes: u64,
     deadline: Instant,
+    #[cfg(any(
+        test,
+        feature = "dot",
+        feature = "doh",
+        feature = "doh3",
+        feature = "doq"
+    ))]
+    disclosed: BTreeSet<IpAddr>,
 }
-thread_local! { static TASK: RefCell<Option<TaskContext>> = const { RefCell::new(None) }; }
+thread_local! { static TASK: RefCell<Option<Arc<Mutex<TaskContext>>>> = const { RefCell::new(None) }; }
 
 pub(crate) fn task_deadline() -> Option<Instant> {
-    TASK.with(|task| task.borrow().as_ref().map(|task| task.deadline))
+    TASK.with(|task| task.borrow().as_ref().map(|task| task.lock().deadline))
 }
 
 pub(crate) struct TaskScope {
-    previous: Option<TaskContext>,
+    previous: Option<Arc<Mutex<TaskContext>>>,
 }
 impl TaskScope {
     /// Nested DNSKEY/DS work shares its caller's envelope and deadline.
@@ -234,22 +250,100 @@ impl TaskScope {
             limits,
             work: Work::default(),
             reserved_bytes: 0,
+            #[cfg(any(
+                test,
+                feature = "dot",
+                feature = "doh",
+                feature = "doh3",
+                feature = "doq"
+            ))]
+            disclosed: BTreeSet::new(),
             deadline: Instant::now()
                 .checked_add(Duration::from_millis(timeout_ms))
                 .unwrap_or_else(Instant::now),
         };
         Self {
-            previous: TASK.with(|task| task.replace(Some(context))),
+            previous: TASK.with(|task| task.replace(Some(Arc::new(Mutex::new(context))))),
         }
     }
     pub(crate) fn work(&self) -> Work {
-        TASK.with(|task| task.borrow().as_ref().map_or(Work::default(), |t| t.work))
+        TASK.with(|task| {
+            task.borrow()
+                .as_ref()
+                .map_or(Work::default(), |t| t.lock().work)
+        })
     }
 }
 impl Drop for TaskScope {
     fn drop(&mut self) {
         TASK.with(|task| task.replace(self.previous.take()));
     }
+}
+
+/// Capture shared accounting before spawning a forwarding worker. Copying the
+/// counters alone would give each worker a fresh allowance.
+#[cfg(any(
+    test,
+    feature = "dot",
+    feature = "doh",
+    feature = "doh3",
+    feature = "doq"
+))]
+#[derive(Clone)]
+pub(crate) struct WorkerContext {
+    task: Option<Arc<Mutex<TaskContext>>>,
+    counters: Option<Arc<ExchangeCounters>>,
+}
+#[cfg(any(
+    test,
+    feature = "dot",
+    feature = "doh",
+    feature = "doh3",
+    feature = "doq"
+))]
+impl WorkerContext {
+    pub(crate) fn capture() -> Self {
+        Self {
+            task: TASK.with(|slot| slot.borrow().clone()),
+            counters: COUNTERS.with(|slot| slot.borrow().clone()),
+        }
+    }
+
+    pub(crate) fn enter(self) -> (TaskScope, ExchangeScope) {
+        (
+            TaskScope {
+                previous: TASK.with(|slot| slot.replace(self.task)),
+            },
+            ExchangeScope(COUNTERS.with(|slot| slot.replace(self.counters))),
+        )
+    }
+}
+
+/// Reserve disclosure before opening a socket. A failed attempt still counts:
+/// a timeout cannot prove that the upstream did not receive the query.
+#[cfg(any(
+    test,
+    feature = "dot",
+    feature = "doh",
+    feature = "doh3",
+    feature = "doq"
+))]
+pub(crate) fn admit_forwarder(ip: IpAddr, max_upstreams: usize) -> Result<()> {
+    TASK.with(|slot| {
+        let task = slot.borrow();
+        let task = task
+            .as_ref()
+            .ok_or_else(|| Error::internal("missing forwarding work scope"))?;
+        let mut task = task.lock();
+        if !task.disclosed.contains(&ip) && task.disclosed.len() >= max_upstreams {
+            return Err(Error::new(
+                ErrorKind::Policy,
+                "upstream disclosure budget exhausted",
+            ));
+        }
+        task.disclosed.insert(ip);
+        Ok(())
+    })
 }
 
 /// All resolver transport dispatch goes through this boundary. Foreground
@@ -260,6 +354,12 @@ pub(crate) fn exchange(
     timeout_ms: u64,
     send: impl FnOnce(u64) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
+    if timeout_ms == 0 {
+        return Err(Error::new(
+            ErrorKind::Timeout,
+            "exchange deadline exhausted",
+        ));
+    }
     let send = |timeout| {
         let counters = COUNTERS.with(|slot| slot.borrow().clone());
         if let Some(counters) = &counters {
@@ -277,10 +377,11 @@ pub(crate) fn exchange(
         result
     };
     let admission = TASK.with(|task| -> Result<_> {
-        let mut task = task.borrow_mut();
-        let Some(task) = task.as_mut() else {
+        let task = task.borrow();
+        let Some(task) = task.as_ref() else {
             return Ok(None);
         };
+        let mut task = task.lock();
         let remaining = task
             .deadline
             .saturating_duration_since(Instant::now())
@@ -319,7 +420,8 @@ pub(crate) fn exchange(
             permit.received = Some(bytes.len() as u64);
         }
         TASK.with(|task| {
-            if let Some(task) = task.borrow_mut().as_mut() {
+            if let Some(task) = task.borrow().as_ref() {
+                let mut task = task.lock();
                 task.work.bytes = task.work.bytes.saturating_add(bytes.len() as u64);
                 task.reserved_bytes = task
                     .reserved_bytes
@@ -333,6 +435,92 @@ pub(crate) fn exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_exchange_timeout_is_not_rounded_up_inside_a_task() {
+        let _scope = TaskScope::enter_query(FetchLimits::default(), 1000).unwrap();
+        assert_eq!(
+            exchange(&endpoint(), 12, 0, |_| panic!(
+                "expired exchange must not send"
+            ))
+            .unwrap_err()
+            .kind,
+            ErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn workers_share_atomic_admission_accounting_and_disclosure() {
+        let scope = TaskScope::enter_query(
+            FetchLimits {
+                max_subqueries: 1,
+                ..FetchLimits::default()
+            },
+            2000,
+        )
+        .unwrap();
+        let counters = Arc::new(ExchangeCounters::default());
+        let _counters = ExchangeScope::enter(counters.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let context = WorkerContext::capture();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let _scope = context.enter();
+                barrier.wait();
+                admit_forwarder(endpoint().ip, 1).unwrap();
+                exchange(&endpoint(), 12, 100, |_| Ok(vec![0; 20]))
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(e) if e.kind == ErrorKind::RateLimited))
+                .count(),
+            1
+        );
+        assert_eq!(scope.work().subqueries, 1);
+        assert_eq!(scope.work().bytes, 32);
+        assert_eq!(counters.snapshot(), (1, 32));
+        assert_eq!(
+            admit_forwarder("127.0.0.2".parse().unwrap(), 1)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Policy
+        );
+    }
+
+    #[test]
+    fn detached_worker_retains_original_budget_after_parent_scope_exits() {
+        let scope = TaskScope::enter_query(
+            FetchLimits {
+                max_subqueries: 0,
+                ..FetchLimits::default()
+            },
+            1000,
+        )
+        .unwrap();
+        let context = WorkerContext::capture();
+        drop(scope);
+        let worker = std::thread::spawn(move || {
+            let _scope = context.enter();
+            exchange(&endpoint(), 12, 100, |_| {
+                panic!("worker escaped its parent's limit")
+            })
+        });
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind,
+            ErrorKind::RateLimited
+        );
+        assert!(exchange(&endpoint(), 12, 100, |_| Ok(vec![])).is_ok());
+    }
 
     #[test]
     fn nested_foreground_work_shares_one_envelope() {
@@ -386,7 +574,7 @@ mod tests {
         }));
         let permit = budget.reserve(endpoint().ip, 12).unwrap();
         assert!(budget.reserve(endpoint().ip, 1).is_err());
-        drop(permit); // Failure conservatively retains the byte reservation.
+        drop(permit);
         assert!(budget.reserve(endpoint().ip, 1).is_err());
     }
     #[test]

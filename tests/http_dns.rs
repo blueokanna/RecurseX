@@ -207,6 +207,46 @@ fn doh_uses_configured_ip_and_reuses_http2() {
     roundtrip(false);
 }
 
+fn network_change_reopens_connection(http3: bool) {
+    let upstream = upstream(http3, "application/dns-message", false);
+    let transport = transport(http3, true, 1_800_000_000);
+    let endpoint = Endpoint::new(
+        upstream.address.ip(),
+        upstream.address.port(),
+        if http3 { Proto::DoH3 } else { Proto::DoH },
+    );
+    transport
+        .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+        .unwrap();
+    courierust::courierust_net::outbound::network_changed();
+    for _ in 0..2 {
+        transport
+            .exchange(&query(), &endpoint, REQUEST_TIMEOUT_MS)
+            .unwrap();
+    }
+    let stats = upstream.stats.snapshot();
+    assert_eq!(upstream.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        if http3 {
+            stats.h3_connections
+        } else {
+            stats.h2_connections
+        },
+        2
+    );
+}
+
+#[test]
+fn standalone_doh_invalidates_its_pool_on_network_change() {
+    network_change_reopens_connection(false);
+}
+
+#[cfg(feature = "doh3")]
+#[test]
+fn standalone_doh3_invalidates_its_pool_on_network_change() {
+    network_change_reopens_connection(true);
+}
+
 #[cfg(feature = "doh3")]
 #[test]
 fn doh3_uses_configured_ip_and_reuses_quic() {

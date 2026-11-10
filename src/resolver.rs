@@ -308,6 +308,8 @@ impl UpstreamGroups {
 /// 4. `fallback` — whether the answer that came back is worth keeping.
 #[derive(Clone, Debug, Default)]
 pub struct DnsPolicy {
+    /// Forwarding disclosure and transport requirements.
+    pub privacy: crate::privacy::UpstreamPrivacy,
     /// Static answers, consulted before the cache and the network.
     pub hosts: crate::hosts::HostsTable,
     /// Fake-IP mode. `None` means `normal`: real addresses only.
@@ -951,7 +953,8 @@ impl Resolver {
         let policy = PolicyEngine::new(config.policy.clone());
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let mut forwarder_set =
-            crate::forward::ForwarderSet::new(config.engine.forwarder_roots.clone(), true, 0);
+            crate::forward::ForwarderSet::new(config.engine.forwarder_roots.clone(), true, 0)
+                .with_privacy(config.dns.privacy);
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         {
             for f in config.dns.upstreams.all() {
@@ -1038,7 +1041,8 @@ impl Resolver {
     /// `verify = false` is an explicit insecure test-only opt-out.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub fn set_forwarder_roots(&self, roots: courierust::courierust_tls::RootStore, verify: bool) {
-        let mut fs = crate::forward::ForwarderSet::new(roots, verify, 0);
+        let mut fs = crate::forward::ForwarderSet::new(roots, verify, 0)
+            .with_privacy(self.inner.config.dns.privacy);
         for f in self.inner.config.dns.upstreams.all() {
             fs.add(f);
         }
@@ -1223,7 +1227,15 @@ impl Resolver {
             };
             let mut guard = self.inner.shared.fake_ip.lock();
             let pool = guard.as_mut()?;
-            let owner = pool.lookup(ip, now)?;
+            if !pool.contains(ip) {
+                return None;
+            }
+            let Some(owner) = pool.lookup(ip, now) else {
+                return Some(Resolution {
+                    rcode: Rcode::NXDOMAIN,
+                    ..empty_answer(key, 0, now)
+                });
+            };
             self.inner.stats.fake_ip_ptr.fetch_add(1, Ordering::Relaxed);
             let ttl = settings.answer_ttl();
             return Some(Resolution {
@@ -1244,12 +1256,18 @@ impl Resolver {
             RrType::AAAA => crate::fakeip::Family::V6,
             _ => return None,
         };
+        let mut guard = self.inner.shared.fake_ip.lock();
+        let pool = guard.as_mut()?;
+        if pool.is_filtered(&key.name) {
+            self.inner
+                .stats
+                .fake_ip_filtered
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         if !settings.synthesizes(family) {
             return Some(empty_answer(key, settings.answer_ttl(), now));
         }
-
-        let mut guard = self.inner.shared.fake_ip.lock();
-        let pool = guard.as_mut()?;
         let ip = match pool.allocate(&key.name, family, now) {
             Ok(crate::fakeip::Allocation::Address(ip)) => ip,
             Ok(crate::fakeip::Allocation::Filtered) => {
@@ -1259,7 +1277,12 @@ impl Resolver {
                     .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            Err(_) => return None,
+            Err(_) => {
+                return Some(Resolution {
+                    rcode: Rcode::SERVFAIL,
+                    ..empty_answer(key, 0, now)
+                })
+            }
         };
         self.inner
             .stats
@@ -1413,11 +1436,21 @@ impl Resolver {
         #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
         let upstream = if self.forward_route(key).is_some() {
             self.forward_resolve(key)
+        } else if self.inner.config.dns.privacy.encrypted_only {
+            Err(Error::config(
+                "strict DNS privacy prohibits iterative resolution",
+            ))
         } else {
             self.iterative_resolve(key, ns_depth, deadline, budget)
         };
         #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
-        let upstream = self.iterative_resolve(key, ns_depth, deadline, budget);
+        let upstream = if self.inner.config.dns.privacy.encrypted_only {
+            Err(Error::config(
+                "strict DNS privacy requires encrypted forwarding support",
+            ))
+        } else {
+            self.iterative_resolve(key, ns_depth, deadline, budget)
+        };
         let mut res = match upstream {
             Ok(res) => res,
             Err(error) => {
@@ -1462,61 +1495,75 @@ impl Resolver {
     /// The upstream group responsible for `key`, or `None` when the query
     /// should be resolved iteratively.
     ///
-    /// Three inputs, in order: the fallback filter's forced-name list, the
-    /// `nameserver-policy` suffix rules, then the default group.
+    /// Explicit suffix rules take precedence over forced fallback domains,
+    /// then the default group. An invalid explicit group fails closed.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     fn forward_route(&self, key: &QueryKey) -> Option<&[crate::forward::Forwarder]> {
         let dns = &self.inner.config.dns;
         let groups = &dns.upstreams;
+        match dns.policy.route(&key.name) {
+            Route::Group(id) => return Some(groups.get(id).unwrap_or(&[])),
+            Route::Default => {}
+        }
         if dns.fallback.forces_fallback(&key.name) && groups.has_fallback() {
             return Some(groups.fallback.as_slice());
         }
-        let ruled = match dns.policy.route(&key.name) {
-            Route::Group(id) => groups.get(id),
-            Route::Default => None,
-        };
-
-        match ruled {
-            Some(g) if !g.is_empty() => Some(g),
-            _ if !groups.default.is_empty() => Some(groups.default.as_slice()),
-            _ if !self.inner.config.engine.forwarders.is_empty() => {
-                Some(self.inner.config.engine.forwarders.as_slice())
-            }
-            _ => None,
+        if !groups.default.is_empty() {
+            Some(groups.default.as_slice())
+        } else if !self.inner.config.engine.forwarders.is_empty() {
+            Some(self.inner.config.engine.forwarders.as_slice())
+        } else {
+            None
         }
     }
 
-    /// Resolve through the group responsible for `key` (RD=1), applying the
-    /// fallback poison gate.
+    /// Resolve within the selected group's disclosure boundary. Only default
+    /// routing may cross into the configured fallback group.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     fn forward_resolve(&self, key: &QueryKey) -> Result<Resolution> {
         let dns = &self.inner.config.dns;
         let groups = &dns.upstreams;
-        let forced = dns.fallback.forces_fallback(&key.name) && groups.has_fallback();
-        let primary = self.forward_route(key).ok_or_else(|| {
-            Error::new(
-                ErrorKind::NoUpstream,
-                format!("no upstream group is responsible for {}", key.name),
-            )
-        })?;
-        let res = self.forward_once(key, primary)?;
-        if !forced && dns.policy.route(&key.name) != Route::Default {
+        let policy_routed = dns.policy.route(&key.name) != Route::Default;
+        let forced =
+            !policy_routed && dns.fallback.forces_fallback(&key.name) && groups.has_fallback();
+        let primary = self
+            .forward_route(key)
+            .ok_or_else(|| Error::new(ErrorKind::NoUpstream, "no forwarding group for query"))?;
+        if policy_routed {
             self.inner
                 .stats
                 .policy_routed
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if !forced && groups.has_fallback() {
-            let addrs = answer_addresses(&res);
-            if dns.fallback.looks_poisoned(&addrs).is_some() {
+        let can_fallback = !forced && !policy_routed && groups.has_fallback();
+        let timeout = self.inner.config.engine.timeout_ms;
+        let primary_timeout = if can_fallback {
+            (timeout / 2).max(1).min(timeout)
+        } else {
+            timeout
+        };
+        let result = self.forward_once(key, primary, primary_timeout);
+        if !can_fallback {
+            return result;
+        }
+        match result {
+            Ok(res)
+                if dns
+                    .fallback
+                    .looks_poisoned(&answer_addresses(&res))
+                    .is_none() =>
+            {
+                Ok(res)
+            }
+            Err(error) if !error.is_transient() && error.kind != ErrorKind::Refused => Err(error),
+            _ => {
                 self.inner
                     .stats
                     .fallback_triggered
                     .fetch_add(1, Ordering::Relaxed);
-                return self.forward_once(key, &groups.fallback);
+                self.forward_once(key, &groups.fallback, timeout)
             }
         }
-        Ok(res)
     }
 
     /// One exchange against a specific group.
@@ -1525,6 +1572,7 @@ impl Resolver {
         &self,
         key: &QueryKey,
         group: &[crate::forward::Forwarder],
+        timeout_ms: u64,
     ) -> Result<Resolution> {
         let query = self.with_rng(|rng| {
             crate::forward::build_forward_query(
@@ -1536,12 +1584,7 @@ impl Resolver {
         });
         let bytes = query.to_bytes()?;
         let forwarder_set = Arc::clone(&self.inner.forwarder_set.lock());
-        let resp = forwarder_set.exchange_with(
-            group,
-            &query,
-            &bytes,
-            self.inner.config.engine.timeout_ms,
-        )?;
+        let resp = forwarder_set.exchange_with(group, &query, &bytes, timeout_ms)?;
         Ok(crate::forward::response_to_resolution(key, &resp))
     }
 
@@ -1824,10 +1867,6 @@ impl Resolver {
         let mut referrals = 0usize;
         let mut cached_rrsigs: Vec<Record> = Vec::new();
         let mut minimized: Option<Name> = None;
-        // The ECS scope the most recent answer declared. Overwritten on every
-        // exchange and read only by the arms that cache something, so the
-        // value that matters is always the one from the response that
-        // answered.
         let mut ecs_scope: Option<u8> = None;
 
         loop {
@@ -1848,10 +1887,6 @@ impl Resolver {
             if referrals > self.inner.config.engine.max_referrals {
                 return Err(Error::internal("referral loop during resolution"));
             }
-
-            // Cache check during CNAME chasing. The lookup carries the
-            // requester's partition, so it walks up through the ECS scopes
-            // exactly as the top-level lookup does.
             if depth > 0 {
                 let ck = key
                     .cache_key()
@@ -1893,8 +1928,6 @@ impl Resolver {
                 key,
                 deadline,
                 budget,
-                // A minimized prefix may legitimately come back bare; the
-                // full name may not.
                 query_name == current_name,
             )?;
 
@@ -1902,8 +1935,6 @@ impl Resolver {
                 let mut est = self.inner.shared.estimator.lock();
                 est.observe_upstream(&zone, rtt_ms as f64);
             }
-            // RFC 7871 §7.2.2: a response with no ECS option is equivalent to
-            // a SCOPE PREFIX-LENGTH of 0, which `answer_partition` handles.
             ecs_scope = resp
                 .edns
                 .as_ref()
@@ -2000,11 +2031,6 @@ impl Resolver {
                         let partition = crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope);
                         let mut cache = self.inner.shared.cache.lock();
                         match partition {
-                            // A scope-0 answer is valid for every client, so
-                            // it may go into the shared NXDOMAIN store. Any
-                            // other scope may not: the store is keyed by name
-                            // alone, which would hand one subnet's negative
-                            // answer to the world.
                             None => {
                                 cache.insert_nxdomain(&query_name, r, soa.clone(), soa_ttl, now)
                             }
@@ -2102,13 +2128,6 @@ impl Resolver {
                             }
                         }
                     }
-
-                    // The NXNS gate. A referral that names many servers and
-                    // glues none of them is not a delegation the resolver can
-                    // use; treating it as one is what turns an attacker's zone
-                    // into our bandwidth bill. The gate runs *before* any
-                    // address lookup is attempted, so a refused referral costs
-                    // nothing beyond the response that carried it.
                     let ns_with_glue = ns_names
                         .iter()
                         .filter(|n| glue.iter().any(|g| g.name == **n))
@@ -2168,10 +2187,6 @@ impl Resolver {
                         }
                     }
                     if endpoints.is_empty() {
-                        // `granted_lookups` was reserved by the referral gate;
-                        // only the lookups actually attempted are charged, so a
-                        // referral that turns out to be fully glued does not
-                        // consume the budget its NS count would have allowed.
                         let _ = granted_lookups;
                         endpoints =
                             self.resolve_ns_addresses(&ns_names, ns_depth, deadline, budget)?;
@@ -2229,15 +2244,9 @@ impl Resolver {
         }
         let mut endpoints = Vec::new();
         for ns in ns_names {
-            // Checking per name is what makes the wall clock finite: an
-            // out-of-bailiwick delegation costs a full walk per name server,
-            // and a zone may list several.
             if deadline.expired() {
                 break;
             }
-            // ...and checking the *count* is what makes the work finite. The
-            // wall clock alone would let a fast attacker start hundreds of
-            // lookups that each time out slowly.
             if budget.spend_ns_address_lookup(1).is_err() {
                 self.inner
                     .stats
@@ -2357,22 +2366,12 @@ impl Resolver {
         key: &QueryKey,
         deadline: Deadline,
         budget: &mut crate::budget::FetchBudget,
-        // Whether a response that carries nothing at all should be treated as
-        // "this server did not answer" and the next one tried. True when the
-        // query is for the full name, where such a response is useless; false
-        // for a QNAME-minimization prefix, where a bare response is the signal
-        // to query one label deeper and must reach the caller.
         skip_empty: bool,
     ) -> Result<(Message, u64)> {
         if servers.is_empty() {
             return Err(Error::new(ErrorKind::NoUpstream, "no servers to query"));
         }
         let now = self.inner.clock.now();
-        // The subject of the affinity lottery is the *question*, not the client
-        // and not the moment. Two resolvers holding the same delegation then
-        // reach the same server for the same name — which is what makes the
-        // choice reproducible — while two different names spread across the
-        // band instead of piling onto whichever server happens to sort first.
         let subject = affinity_subject(qname, qtype);
         let ranked = {
             let sel = self.inner.shared.selector.lock();
@@ -2403,10 +2402,6 @@ impl Resolver {
                 }
                 total_attempts += 1;
                 attempts += 1;
-                // Every upstream message and every byte counts against the
-                // resolution's envelope. This is the counter an NXNS-style
-                // adversary consumes, so exhausting it is a *reported* event,
-                // not a silent slowdown.
                 if budget.spend_subquery().is_err() {
                     self.inner
                         .stats
@@ -2440,10 +2435,6 @@ impl Resolver {
                     )
                 });
 
-                // The attempt timeout is `timeout_ms` clipped to what is left
-                // of the shared budget, so the last exchange cannot run past
-                // the deadline. `None` means the budget is already gone, and
-                // the outer loop's own check then ends the search.
                 let Some(attempt_ms) =
                     deadline.attempt_timeout_ms(self.inner.config.engine.timeout_ms)
                 else {
@@ -2493,13 +2484,11 @@ impl Resolver {
                         continue;
                     }
                 };
-                // Anti-spoofing: ID and question must match.
                 let query_msg = Message::parse(&q.bytes).unwrap_or_default();
                 if !response_matches_query(&query_msg, &msg) {
                     continue;
                 }
 
-                // Truncated over UDP → retry over TCP.
                 if msg.is_truncated() && self.inner.config.engine.tcp_fallback {
                     let tcp_ep = Endpoint {
                         proto: Proto::Tcp,
@@ -2522,18 +2511,6 @@ impl Resolver {
                         }
                     }
                 }
-
-                // A NOERROR response with no records in any section is not an
-                // answer, a referral, or a negative answer — RFC 2308 §2.2
-                // requires the SOA for the latter — so there is nothing in it
-                // to give the client. Delivering it would end the walk at
-                // whatever the first-ranked server happened to say, which is how
-                // one broken or intercepting resolver stops a whole resolution.
-                //
-                // The `NOERROR` test is load-bearing: a non-zero rcode *is* the
-                // answer's content. NXDOMAIN in particular routinely arrives
-                // with every section empty, and discarding it here would turn
-                // "this name does not exist" into "no server answered".
                 if skip_empty
                     && msg.flags.rcode == Rcode::NOERROR
                     && msg.answers.is_empty()
@@ -2552,16 +2529,6 @@ impl Resolver {
                     ));
                     continue;
                 }
-
-                // SERVFAIL, REFUSED, NOTIMP and FORMERR all mean "this server
-                // did not answer the query". Treating only SERVFAIL that way is
-                // a logic hole, not a style point: REFUSED carries no answer
-                // section, so `classify_response` reads it as `Empty`, and an
-                // `Empty` response at the full query name is a hard error — so
-                // one uncooperative server out of a zone's thirteen would end
-                // the whole resolution instead of the next server being tried.
-                // A recursive query has no legitimate REFUSED/NOTIMP/FORMERR
-                // answer to pass on either way.
                 if matches!(
                     msg.flags.rcode,
                     Rcode::SERVFAIL | Rcode::REFUSED | Rcode::NOTIMP | Rcode::FORMERR
@@ -2593,7 +2560,6 @@ impl Resolver {
 
     /// Populate the cache from a wire resolution.
     fn cache_resolution(&self, key: &QueryKey, res: &Resolution, now: Ts) {
-        // Group answer records by (name, type).
         let mut groups: BTreeMap<(Name, RrType), Vec<Record>> = BTreeMap::new();
         for r in &res.answers {
             groups
@@ -2616,7 +2582,6 @@ impl Resolver {
                 continue;
             };
             set.validated = res.validated;
-            // Attach matching RRSIGs (type_covered == rr_type).
             for sig in &res.rrsigs {
                 if let RData::Rrsig { type_covered, .. } = &sig.rdata {
                     if *type_covered == rr_type {
@@ -2632,9 +2597,7 @@ impl Resolver {
             };
             cache.insert_positive(&ck, set, now, inputs, res.validated);
         }
-        // Negative answers. The partition rule is the same as for positive
-        // data: only a scope-0 answer may reach the shared NXDOMAIN store,
-        // which is keyed by name alone.
+
         let partition = crate::cache::answer_partition(key.ecs.as_ref(), res.ecs_scope);
         if res.rcode.is_nxdomain() {
             let soa_ttl = res
@@ -2716,8 +2679,6 @@ impl Resolver {
         if self.inner.shutting_down.load(Ordering::Acquire) || !self.acquire_refresh_slot() {
             return false;
         }
-        // This set also prevents duplicates if an entry is replaced while its
-        // earlier generation is still resolving. Cache refreshing alone cannot.
         if !self.inner.refresh_keys.lock().insert(key.clone()) {
             self.inner
                 .stats
@@ -2943,8 +2904,6 @@ impl Resolver {
         let result = self.resolve_inner(
             &qk,
             0,
-            // A background refresh is its own query and gets its own budget;
-            // it is not a client waiting on a reply.
             Deadline::after(self.inner.config.engine.query_budget_ms),
             &mut budget,
             ResolutionCachePolicy::Bypass,
@@ -3090,8 +3049,6 @@ impl Resolver {
         std::thread::spawn(move || {
             #[cfg(feature = "persist")]
             let mut last_save = std::time::Instant::now();
-            // Sleep in slices so `shutdown()` is noticed within one slice
-            // rather than after a full (possibly long) maintenance interval.
             let slice = interval.min(100);
             let mut slept = 0u64;
             while !this.inner.shutting_down.load(Ordering::Relaxed) {
@@ -3116,13 +3073,6 @@ impl Resolver {
                         .alias_edges
                         .store(aliases.edge_count() as u64, Ordering::Relaxed);
                 }
-                // Fake-IP maintenance. Mappings are reclaimed here on a
-                // schedule rather than only under allocation pressure: a name
-                // nobody queries any more will never trigger an allocation
-                // again, so waiting for pressure would let its address sit
-                // out of circulation indefinitely. The gauges go in the same
-                // pass, because the pool is behind a lock and a status
-                // endpoint must not have to take it.
                 if r.inner.config.dns.fake_ip.is_some() {
                     let mut guard = r.inner.shared.fake_ip.lock();
                     if let Some(pool) = guard.as_mut() {
@@ -3144,9 +3094,6 @@ impl Resolver {
                     last_save = std::time::Instant::now();
                 }
             }
-            // Final flush: a clean shutdown is the best moment to leave a
-            // consistent snapshot behind, and the maintenance thread is the
-            // only writer.
             #[cfg(feature = "persist")]
             if this.inner.config.persist.is_some() {
                 let _ = this.persist_cache();
@@ -3211,7 +3158,6 @@ fn minimized_name(qname: &Name, zone: &Name) -> Name {
     if nlabels <= zlabels {
         return qname.clone();
     }
-    // Take the last (zlabels + 1) labels of qname.
     let keep = zlabels + 1;
     let skip = nlabels - keep;
     let labels = qname.labels();
@@ -4139,6 +4085,53 @@ mod tests {
         assert!(resp.flags.qr);
         assert_eq!(resp.rcode(), 0);
         assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[test]
+    fn fake_ip_exhaustion_never_falls_through_to_real_resolution() {
+        let r = policy_resolver(r#"{"dns":{"enhanced-mode":"fake-ip","fake-ip-max-entries":1}}"#);
+        let first = Name::from_ascii("first.example").unwrap();
+        let original = r.resolve(&first, RrType::A).unwrap();
+        let overflow = r
+            .resolve(&Name::from_ascii("second.example").unwrap(), RrType::A)
+            .unwrap();
+        assert_eq!(overflow.rcode, Rcode::SERVFAIL);
+        assert!(overflow.answers.is_empty());
+        assert_eq!(overflow.ttl, 0);
+        assert_eq!(
+            r.resolve(&first, RrType::A).unwrap().answers,
+            original.answers
+        );
+        assert_eq!(r.stats_snapshot().cache_misses, 0);
+    }
+
+    #[test]
+    fn fake_ip_exclusions_apply_to_aaaa_without_an_ipv6_pool() {
+        let r = policy_resolver(
+            r#"{"dns":{"enhanced-mode":"fake-ip","fake-ip-filter":["+.excluded.example"]}}"#,
+        );
+        let key = QueryKey {
+            name: Name::from_ascii("excluded.example").unwrap(),
+            rr_type: RrType::AAAA,
+            class: RrClass::IN,
+            ecs: None,
+            want_dnssec: false,
+            cd: false,
+        };
+        assert!(r.local_answer(&key, r.now()).is_none());
+    }
+
+    #[test]
+    fn unmapped_fake_ip_ptr_is_answered_locally() {
+        let r = policy_resolver(r#"{"dns":{"enhanced-mode":"fake-ip"}}"#);
+        let result = r
+            .resolve(
+                &Name::from_ascii("99.0.18.198.in-addr.arpa").unwrap(),
+                RrType::PTR,
+            )
+            .unwrap();
+        assert_eq!(result.rcode, Rcode::NXDOMAIN);
+        assert_eq!(r.stats_snapshot().cache_misses, 0);
     }
 
     /// fake-IP mode synthesizes an address from the configured range, and
