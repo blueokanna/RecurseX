@@ -1,5 +1,8 @@
 # DNS policy layer (Clash compatible)
 
+> Version: **0.2.6**. Explicit forwarder routes retain their disclosure boundary. A timeout does not authorize an unconfigured public resolver. Non-IN questions and response packets are rejected at query ingress.
+
+
 The `dns` section brings the surfaces a Clash / mihomo user already knows into
 RecurseX:
 

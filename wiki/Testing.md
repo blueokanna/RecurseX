@@ -1,5 +1,8 @@
 # Testing & verification
 
+Version: **0.2.6**.
+
+
 ## Commands
 
 These are the CI jobs, in order. They are not a menu: each line exists because a
@@ -60,21 +63,16 @@ Two of those legs are worth knowing by name, because they are the ones that bite
 
 ## What the tests cover
 
-The suite is 431 unit tests, 24 integration tests in `tests/` (3 + 10 + 7 + 4),
-and 4 doctests — 459 in the default configuration. The `no_std` core runs 320 of
-them and the std-only core 379, which is the point of running those legs
-separately.
+The 0.2.6 audit adds `answer_boundaries.rs` and DNSSEC/listener unit regressions
+for record ownership, classes, referral ancestry, alias-negative semantics,
+signature time wraparound, RDATA ordering and default client access. Recovery
+tests cover UDP blackholes, TCP retry/truncation and loopback cooldown; observations
+are checked against actual query results and cache hits.
 
-It is hermetic in the sense that matters: **no test asserts on a reply from the
-public Internet**, so the result depends on the resolver and not on the network's
-health or latency. Every test that needs an upstream gets a local stub, and the
-iterative walk is driven against a stub root server over loopback. Three tests do
-open a socket, and it is worth being exact about them: two send to `192.0.2.1`
-(TEST-NET-1, unroutable by definition) and assert only that the exchange *fails*
-inside its timeout, and one drives a stub upstream over loopback. A test that
-talked to real root servers would report on the network rather than on the
-resolver — and on a machine whose upstream intercepts UDP/53 it would report on
-the interception.
+Tests use local fixtures rather than assuming public DNS is reachable. Exact counts
+depend on the feature set; record the command and result together. See the current
+[audit record](../docs/audit-0.2.6.md). Hermetic passing results do not establish
+public interoperability, real-data probability coverage or device-specific behavior.
 
 - **Wire codec** (`message`, `rdata`, `name`, `qtype`, `edns`) — parse /
   serialize round-trips, name compression, truncation, error responses,
@@ -82,9 +80,8 @@ the interception.
 - **Cache** — insert/lookup across tiers, CNAME chains, serve-stale,
   NXDOMAIN store and its capacity, ECS partitioning, exact-lowest eviction,
   prefetch candidacy, sweep.
-- **Stability & admission** — the hazard model's conjugate update, the
-  evidence ceiling that stops forged observations from driving the change rate
-  down, fingerprint TTL-independence, score thresholds, the memory term (which
+- **Stability & admission** — the hazard model's approximate update, the
+  evidence ceiling that bounds accumulated model influence, fingerprint TTL-independence, score thresholds, the memory term (which
   must actually move the score).
 - **Estimator / planner / alias graph / upstream** — probability growth, TOD
   profile size, bounded memory, alias edges in both directions and pruning,
@@ -253,37 +250,17 @@ reporting an abort. The clock therefore renders through `try_read()` and
 prints `ManualClock(<locked>)` rather than waiting, and `src/time.rs` asserts
 exactly that with the write guard held.
 
-## Live verification
+## Independent clients and public-network checks
 
-`examples/quick_check.rs` resolves `example.com`, `www.example.com`,
-`google.com`, `ietf.org` and `nonexistent.invalid` through the full iterative
-pipeline twice (the second pass must hit cache), then prints stats:
+On Windows, explicitly run `cargo test --all-features --test system_client_interop -- --ignored --nocapture`.
+It temporarily binds loopback port 53 and asks the OS nslookup client for a fixed
+hosts record over UDP and TCP, then shuts down. An occupied port fails the check;
+no existing service is stopped and system DNS settings are unchanged. This checks
+wire interoperability, not public recursive resolution.
 
-```sh
-cargo run --no-default-features --features std --example quick_check
-```
-
-On a network that answers truthfully, a healthy run resolves all four real
-names and returns NXDOMAIN for the invalid one; `ietf.org` exercises the
-out-of-zone NS path (afilias-nst.info), which is also the case that catches
-QNAME-minimization regressions — a NODATA for a minimized prefix must deepen the
-query, not terminate it. On a network that does *not* answer truthfully it proves
-only that nothing crashed, which is still worth knowing and is not the same claim
-(see below).
-
-## Why the numbers are trustworthy
-
-- No fabricated test vectors: the RSA vector was generated with openssl and
-  cross-checked with an independent Python implementation.
-- Live names are resolved against the actual DNS tree, not a mock.
-- A live run is evidence that the wiring works, not a verdict on correctness.
-  The machine this was developed on has an upstream that hijacks UDP/53: two
-  thirds of queries to a well-known root address time out, and
-  `nonexistent.invalid` comes back empty in 8 ms, which is the interception
-  answering rather than the DNS tree. Correctness is therefore settled by the
-  hermetic stub tests, and a live run is re-read as "did anything crash".
-- The `no_std` core is built *and tested* in CI, so it cannot silently grow a
-  `std` dependency.
-- CI runs on the MSRV (1.78) and on stable, for Linux and Windows, with
-  `RUSTFLAGS=-D warnings`; the release profile (fat LTO, one codegen unit) is
-  tested too, because that is the profile that ships.
+`cargo run --no-default-features --features std --example quick_check` exercises the
+real authoritative network. Report timeouts, empty answers and response codes as
+observed; they alone do not prove interception. The current network's failed pure
+recursive probes are not evidence of universal availability. Connectivity cannot
+establish a DNSSEC chain. Hermetic tests, independent clients and live probes cover
+different boundaries, and none proves the absence of every defect.

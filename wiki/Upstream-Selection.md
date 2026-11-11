@@ -1,5 +1,8 @@
 # Upstream selection cost model
 
+> Version: **0.2.6**. Authority attempts share a deadline and reserve time for alternatives. UDP timeout/truncation can retry TCP within that budget. Failed loopback forwarders cool down for five seconds when alternatives exist; network changes reset that state.
+
+
 Picking an authoritative server by raw RTT is wrong. A server that is fast
 92% of the time can be *more expensive in expectation* than a slightly
 slower server that never fails, once retransmissions and SERVFAIL penalties

@@ -17,11 +17,14 @@ use crate::message::Message;
 use crate::resolver::Resolver;
 
 /// Server tuning.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Additional client networks allowed to recurse. Loopback is always allowed.
+    /// Empty by default, including when bound to a wildcard address.
+    pub allowed_clients: Vec<crate::cidr::IpCidr>,
     /// Number of UDP receiver threads (each blocks in `recv_from`).
     pub udp_workers: usize,
-    /// Number of resolution threads shared by the UDP and TCP paths.
+    /// Number of UDP resolution threads. TCP connections have separate limits.
     ///
     /// Datagrams are queued for these threads instead of each spawning its
     /// own, so the cost of a flood is bounded by the pool, not by how fast
@@ -47,6 +50,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            allowed_clients: Vec::new(),
             udp_workers: 2,
             udp_handlers: 8,
             udp_queue: 1024,
@@ -171,9 +175,13 @@ impl Server {
             let queue = queue.clone();
             let shed = self.udp_shed.clone();
             let shutdown = self.shutdown.clone();
+            let allowed = self.config.allowed_clients.clone();
+            let receive_limit = self.config.udp_recv_buffer.clamp(512, 65535);
             let handle = std::thread::Builder::new()
                 .name("dns-udp-recv".into())
-                .spawn(move || udp_recv_loop(sock, queue, shed, shutdown))?;
+                .spawn(move || {
+                    udp_recv_loop(sock, queue, shed, shutdown, allowed, receive_limit)
+                })?;
             self.handles.lock().push(handle);
         }
         for _ in 0..self.config.udp_handlers.max(1) {
@@ -197,9 +205,12 @@ impl Server {
         let conns = self.tcp_connections.clone();
         let shutdown = self.shutdown.clone();
         let idle = self.config.tcp_idle_timeout_ms;
+        let allowed = self.config.allowed_clients.clone();
         let handle = std::thread::Builder::new()
             .name("dns-tcp-accept".into())
-            .spawn(move || tcp_accept_loop(listener, resolver, max, conns, shutdown, idle))?;
+            .spawn(move || {
+                tcp_accept_loop(listener, resolver, max, conns, shutdown, idle, allowed)
+            })?;
         self.handles.lock().push(handle);
         self.tcp_addrs.lock().push(local);
         Ok(local)
@@ -280,14 +291,25 @@ impl<T> WorkQueue<T> {
     }
 }
 
+fn client_allowed(ip: IpAddr, allowed: &[crate::cidr::IpCidr]) -> bool {
+    // Dual-stack sockets report IPv4 clients using mapped IPv6 addresses.
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
+    ip.is_loopback() || allowed.iter().any(|network| network.contains(ip))
+}
+
 /// Receiver loop: read a datagram, hand it to the handler pool.
 fn udp_recv_loop(
     sock: Arc<UdpSocket>,
     queue: Arc<WorkQueue<UdpJob>>,
     shed: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    allowed: Vec<crate::cidr::IpCidr>,
+    receive_limit: usize,
 ) {
-    let mut buf = vec![0u8; 65535];
+    let mut buf = vec![0u8; receive_limit];
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -296,6 +318,9 @@ fn udp_recv_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
+        if !client_allowed(src.ip(), &allowed) {
+            continue;
+        }
         let job = UdpJob {
             bytes: crate::wire::capped(&buf, n).to_vec(),
             src,
@@ -326,6 +351,7 @@ fn tcp_accept_loop(
     conns: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     idle_ms: u64,
+    allowed: Vec<crate::cidr::IpCidr>,
 ) {
     for stream in listener.incoming() {
         if shutdown.load(Ordering::Relaxed) {
@@ -334,6 +360,12 @@ fn tcp_accept_loop(
         let Ok(stream) = stream else {
             continue;
         };
+        if !stream
+            .peer_addr()
+            .is_ok_and(|peer| client_allowed(peer.ip(), &allowed))
+        {
+            continue;
+        }
         let resolver = resolver.clone();
         let conns = conns.clone();
         let Some(slot) = ConnectionSlot::reserve(conns, max) else {
@@ -769,5 +801,34 @@ mod tests {
 
         server.shutdown();
         assert!(join_within(std::thread::spawn(move || server.join()), 5));
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn default_access_is_loopback_even_for_mapped_clients() {
+        let config = ServerConfig::default();
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(client_allowed(ip.parse().unwrap(), &config.allowed_clients));
+        }
+        for ip in [
+            "192.168.1.2",
+            "198.51.100.3",
+            "2001:db8::1",
+            "::ffff:198.51.100.3",
+        ] {
+            assert!(!client_allowed(
+                ip.parse().unwrap(),
+                &config.allowed_clients
+            ));
+        }
+        let allowed = vec![crate::cidr::IpCidr::parse("192.168.1.0/24").unwrap()];
+        assert!(client_allowed(
+            "::ffff:192.168.1.5".parse().unwrap(),
+            &allowed
+        ));
+        assert!(!client_allowed("192.168.2.5".parse().unwrap(), &allowed));
     }
 }

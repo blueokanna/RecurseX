@@ -1,20 +1,42 @@
-# RecurseX
+# RecurseX 0.2.6
+
+## DNS recovery and observations (0.2.6)
+
+Recursive authority attempts share the query deadline and reserve time for
+alternate servers. UDP timeout and truncation can retry over TCP within the
+same attempt budget. A failed or truncated TCP response is never accepted as
+a complete answer. A loopback forwarder with configured alternatives gets a
+larger cold-recursion allowance, bounded by the caller's deadline; transport
+failures pause that endpoint for five seconds. Network-generation changes
+reset this cooldown. Negative answers do not mark an endpoint unavailable.
+
+`observation::configure(256)` enables a process-wide in-memory ring of completed
+resolver calls; collection is disabled by default. `observation::snapshot()`
+returns actual answers, response/error categories, cache provenance and elapsed
+microseconds. Each event retains at most eight 256-byte answer summaries.
+Contention drops and counts observations instead of blocking resolution.
+`configure(0)` disables collection and clears retained names. Collection does
+not change DNS caching or persist query history. These are resolver calls, not
+packet counts: nested or loopback calls can produce separate observations.
+
+Hermetic regression coverage lives in `tests/recursive_recovery.rs` and
+`tests/query_observation.rs`. It exercises blackholed UDP, TCP failure and
+truncation, alternate authorities, loopback recovery, and real cache hits.
 
 *[中文文档](README_CN.md)*
 
-RecurseX is a recursive DNS resolver written in Rust. It walks the delegation
-tree the way BIND and Unbound do, so if you have ever read `named.conf` you
-already know what it does. What is different is *how it decides to trust what
-it already holds*: an expired cache entry is served only when a conservative
-probability bound, a consequence class and an aggregate risk budget all agree,
-and the entry is refreshed where refreshing actually changes that bound.
+RecurseX is a Rust recursive DNS resolver with semantic caching, bounded query
+work and observable-change-based refresh scheduling. Stale service is disabled
+by default. The model guides resource allocation; it does not authenticate DNS
+data or establish real-world error-probability coverage.
 
-The resolver is not a `HashMap<query, answer>`. That is the whole point.
+The package version is `0.2.6`; this working tree does not imply that a registry
+release or the hosted wiki has been published. Use `recurse-x = "0.2.6"` after
+publishing that package, or a sibling-checkout Cargo patch during development.
 
-> The design and the argument behind it are written up in
-> **[`paper/RecurseX-risk-constrained-refresh.md`](paper/RecurseX-risk-constrained-refresh.md)**
-> and, at implementation depth, in the wiki's
-> [Risk-constrained refresh](wiki/Refresh-Theory.md).
+See [refresh assumptions](wiki/Refresh-Theory.md), [DNSSEC scope](wiki/DNSSEC.md),
+[deployment](wiki/Deployment.md) and the [0.2.6 audit record](docs/audit-0.2.6.md).
+The earlier weakest-link and bottleneck-only proofs have been withdrawn.
 
 ```mermaid
 flowchart LR
@@ -191,12 +213,10 @@ lookup arrives. The guarantee is stated exactly and tested side by side with the
 starvation it prevents: if the budget is at least `classes × reservation`, every
 class contributes at least `reservation`.
 
-Prediction is used for the *value* and the credibility bound for *safety*. That
-is not an inconsistency — a value is an expectation and asking "what will we
-learn, on average" is exactly right; a safety decision asks "what is the
-probability we are wrong" and a mean is not a guarantee. The same split already
-separates `CacheScore` from `risk`. [The derivation, the honest limits and a
-worked value are in the wiki](wiki/Value-of-Information.md).
+Prediction ranks expected refresh value; the risk gate uses a Gamma tail calculation.
+Both remain conditional on the approximate model. The tail calculation does not
+establish real-world safety merely because it is more cautious than the mean.
+See [value of information](wiki/Value-of-Information.md).
 
 ## The loop
 
@@ -414,7 +434,7 @@ the parts that do not.
 | alias edges | 100 000 | CNAME chains |
 | sections in a message | 4 096 records, 16 questions | parse cost is linear in message size |
 | names | 255 octets, 127 labels, 128 pointer hops | wire format, with a proof that 128 hops cannot reject a valid name |
-| UDP response | the client's advertised EDNS size, floor 512 | no oversized datagrams, no reflection amplification |
+| UDP response | the client's advertised EDNS size, floor 512 | size negotiation only; not an amplification-ratio bound |
 
 Filling any of these tables is `O(1)` amortized per insert (`src/bounded.rs`):
 a stale-entry pass that costs nothing to run when the table is healthy, and a
@@ -457,14 +477,12 @@ code delivers:
   algorithms (5/7) are refused as deprecated. ECDSA (13/14) and EdDSA (15/16)
   are recognised but not verified by this build — signatures from zones that
   only use them produce `Indeterminate`, never a fabricated "secure".
-- **DNSSEC scope**: `Secure` means "an RRSIG over this data verified against a
-  DNSKEY that matches the signer's DS in the parent zone". The DNSKEY and DS
-  lookups ride the same hardened path as every other query, but this build
-  ships no root trust anchor and does not validate the DS RRset's own
-  signature, and nested lookups deliberately skip validation to bound
-  recursion. There are no NSEC/NSEC3 proofs, so negative answers are not
-  authenticated. If you need a chain anchored at the IANA root, that work is
-  not in here yet.
+- **DNSSEC scope**: `SignatureValid` means local signature success against an
+  unauthenticated key. The deprecated `Verdict::Secure` spelling is only a
+  compatibility alias. No root trust anchor, authenticated DS chain, NSEC/NSEC3
+  denial proof or wildcard proof is implemented. `Resolution.validated` stays
+  false for local success, caches receive no trust promotion, and AD stays clear.
+  See [the exact state contract](wiki/DNSSEC.md).
 - **DoQ**: this crate implements its own QUIC client on courierust's public
   codecs and cryptographic primitives. Tests cover framing, reassembly,
   transport parameters, deadlines and provider contracts; they do not establish
@@ -477,6 +495,8 @@ code delivers:
   The low-level `ClientHandshake::new` now returns `Result` to report invalid
   trust configuration and OS entropy failures before sending a ClientHello.
 - **Server side**: the client-facing server speaks plain UDP and TCP only.
+  Default access is loopback-only, including wildcard binds; additional client
+  networks require `ServerConfig::allowed_clients`.
   DoT/DoH/DoH3/DoQ are upstream transports; there is no DNS-over-HTTPS
   endpoint.
 - **Time**: `tzcraft` carries no IANA timezone database, so the estimator's
@@ -695,11 +715,10 @@ vary with enabled features. It does not assert on replies from the public
 Internet. Upstreams are local stub servers, so the
 result is about the resolver and not about the network. What is covered includes
 the wire codec (including rejection cases), cache admission/eviction/serve-stale
-and **ECS partitioning**, persistence, the change-rate posterior and its Chernoff
-bound (including the property that forged observations cannot manufacture
-evidence), the risk budget and the over-serving ledger, the per-resolution work
+and **ECS partitioning**, persistence, the approximate change-rate model and its model-conditional Chernoff
+bound (including finite evidence ceilings, not a proof of observation authenticity), the risk budget and the over-serving ledger, the per-resolution work
 envelope (including the NXNS gate), the answer provenance DAG and its
-bound-preserving trim lemma, calibration (Brier / log loss / reliability),
+failure-mass-preserving capacity summary, calibration (Brier / log loss / reliability),
 the estimator's `exp` implementation against reference values, planner decisions,
 the alias graph's both directions and pruning, upstream cost selection, the
 coalescer (including an owner that vanishes without publishing), UDP truncation
@@ -746,14 +765,14 @@ the build red.
 
 ## Security notes
 
-- **Spoofing defence is layered**: transaction ID drawn from an OS-seeded
-  SplitMix64 that is reseeded every 4096 draws, 0x20 QNAME case randomisation
+- **Spoofing defence is layered**: transaction ID drawn from OS-seeded
+  ChaCha20, rekeyed after 1 MiB of generated output, 0x20 QNAME case randomisation
   (on by default), response matching on ID *and* echoed question, unconnected
   UDP sockets so a response from an unexpected source is ignored, and bailiwick
   rules that decide what may be cached from any response.
-- **Reflection**: the UDP server never sends a datagram larger than the
-  client's advertised EDNS buffer, and it never answers with more data than the
-  client asked for.
+- **Reflection**: EDNS caps response size, not the response/request amplification
+  ratio. Loopback is the default client scope; LAN CIDRs require explicit access
+  configuration. Public recursion additionally needs network-side controls.
 - **Input handling**: the parser rejects malformed packets before any
   allocation of consequence, and every table that a hostile query stream can
   reach is capped (see the bounds table).

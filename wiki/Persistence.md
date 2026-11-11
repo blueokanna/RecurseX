@@ -1,5 +1,8 @@
 # Persistence (L3 tier)
 
+> Version: **0.2.6**. Snapshots are local state, not trust anchors. Restored signatures are rechecked before use. The version 0.2.6 trust boundary does not accept local signature success as validated=true.
+
+
 A warm resolver's cache is a *prediction asset*: the stability models,
 admission scores and tier assignments accumulated over hours of live
 resolution are exactly the state a cold restart throws away. The `persist`

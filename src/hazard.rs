@@ -33,13 +33,9 @@ pub const DEFAULT_CONFIDENCE: f64 = 0.95;
 
 /// Default prior shape `α₀`.
 ///
-/// `α₀ = 1` reads as "one change before any evidence", which makes the prior
-/// mean `1/T` (one change per TTL) and keeps the prior *weak* — a handful of
-/// honest observations moves it. `α₀ < 1` (Jeffreys) would be more
-/// agnostic, but it also makes the upper bound on `λ` diverge for a set
-/// with a long TTL, and a resolver that can never serve stale is a resolver
-/// that has not gained anything. `α₀ = 1` is the smallest value that keeps
-/// the prior mean finite and interpretable.
+/// Shape 1 is an engineering default giving prior mean `1/T`. Every positive
+/// Gamma shape has a finite mean when its rate is positive. TTL-based prior
+/// selection does not establish calibration or real-data coverage.
 pub const DEFAULT_PRIOR_SHAPE: f64 = 1.0;
 
 /// Default minimum observation interval (seconds).
@@ -67,8 +63,8 @@ pub struct HazardConfig {
     /// Upper clamp for the adaptive observation interval.
     pub max_interval_secs: f64,
     /// Target `P_LCB(fresh, ·)` at which the next observation is scheduled.
-    /// A value of `0.9` means "look again while we are still 90 % sure the
-    /// data we hold is correct", so a refresh never races the expiry.
+    /// A value of `0.9` is a model scheduling target, not an established
+    /// real-data correctness probability.
     pub target_freshness: f64,
 }
 

@@ -25,7 +25,7 @@
 //!
 //! Two questions, answered separately, then combined:
 //!
-//! * **Is it safe?** The freshness of the *whole answer* — the weakest link
+//! * **Is it safe?** The freshness of the *whole answer* — the conditional union bound
 //!   of its provenance DAG ([`crate::provenance`]) — must clear a
 //!   consequence-scaled floor, and the resulting ex-ante risk must fit the
 //!   aggregate budget ([`crate::risk::RiskLedger`]).
@@ -44,8 +44,8 @@
 //! rule is a proxy: it uses the zone's *claim* about its data as a stand-in
 //! for how often the data changes, which is exactly the conflation
 //! [`crate::hazard`] exists to remove. The rule here is the model's own
-//! scheduling answer — refresh when the conservative probability of still
-//! being correct will fall below a target inside the horizon:
+//! scheduling answer — refresh when the model prediction of remaining
+//! unchanged will fall below a target inside the horizon:
 //!
 //! ```text
 //! refresh  ⇔  P_LCB(fresh, horizon) < target  ∧  demand is expected

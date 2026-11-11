@@ -1,5 +1,8 @@
 # Value of information — where the refresh budget goes
 
+> Version: **0.2.6**. This is a model-based ranking objective, not a calibrated real-world safety guarantee. Refreshing a non-minimal dependency can increase the union lower bound.
+
+
 The refresh path has two halves, and until this module existed only one of them
 was built.
 
@@ -72,7 +75,7 @@ are.
 
 The posterior after an observation is obtained by cloning the hazard model and
 calling **the same `HazardModel::observe` the real refresh path calls**. Not a
-re-derivation of the conjugate update, not an approximation of the credibility
+re-derivation of the approximate update, not an approximation of the credibility
 bound.
 
 That choice is the reason the number can be trusted. A value function that
@@ -81,22 +84,12 @@ silent: the ranking would look entirely reasonable while pricing an update the
 model never performs. Replaying costs one clone and two bounded bisections per
 candidate — nothing next to the network round trip the token is about to buy.
 
-## Two distinctions that must not be blurred
+## Model scope
 
-**Prediction may be used here; it may not be used for safety.** `p₀` is the
-posterior-*predictive* mean. That is correct in this module, because a value is
-an expectation — what we will learn, on average. It would be incorrect in
-`risk`, where the quantity is the probability of being wrong and a mean is not a
-guarantee. The same split already separates `CacheScore` (ranking) from `risk`
-(deciding), and it holds here for the same reason.
-
-**`C = ∞` becomes a large finite number.** The `Absolute` class (`DNSKEY`, `DS`,
-`RRSIG`, `NSEC`, `NSEC3`) returns an infinite coefficient because it must never
-be traded against latency. A ranking cannot contain an infinity: `∞ − ∞` is
-`NaN`, and a `NaN` sorts unpredictably. So the ranking uses `ABSOLUTE_WEIGHT =
-1000`. This softens the prohibition by nothing — that lives in `risk::assess`,
-which still refuses with `ClassForbidsStale` — the number exists only to put
-such an entry at the top of a list.
+Both the expected-value score and the risk gate are conditional on the approximate
+hazard model. Replaying `observe` avoids a second implementation; it does not
+validate the model against reality. Neither a predictive mean nor a Gamma tail
+calculation establishes data authenticity. Stale defaults to disabled.
 
 ## The allocation, and its honest size
 

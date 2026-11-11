@@ -25,7 +25,7 @@ checksum = "40902ae48213c919e92efb5f135ee952596dd2d37426ab1ab64ad65bdfdb23d1"
 
 [[package]]
 name = "recurse-x"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "courierust",
  "nextjson",

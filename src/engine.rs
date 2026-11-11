@@ -195,12 +195,19 @@ pub enum ResponseKind {
 /// are authoritative for.
 pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name) -> ResponseKind {
     let rcode = msg.rcode();
-    if rcode == 3 {
-        return ResponseKind::Negative {
-            rcode: Rcode::NXDOMAIN,
-            soa: msg.authority_soa().cloned(),
-        };
+    if !matches!(rcode, 0 | 3) {
+        return ResponseKind::Empty;
     }
+    let soa = msg
+        .authorities
+        .iter()
+        .filter(|r| {
+            r.rr_type == RrType::SOA
+                && r.class == RrClass::IN
+                && qname.is_subdomain_of(&r.name)
+                && r.name.is_subdomain_of(zone)
+        })
+        .max_by_key(|r| r.name.label_count());
 
     let mut rrsigs: Vec<Record> = Vec::new();
     let mut answer_data: Vec<Record> = Vec::new();
@@ -208,6 +215,9 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
     let mut dname: Option<Record> = None;
 
     for rec in &msg.answers {
+        if rec.class != RrClass::IN {
+            continue;
+        }
         if rec.rr_type == RrType::RRSIG {
             rrsigs.push(rec.clone());
             continue;
@@ -221,13 +231,15 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
         }
         if rec.rr_type == RrType::DNAME
             && qname.is_strict_subdomain_of(&rec.name)
-            && dname.is_none()
+            && dname.as_ref().map_or(true, |previous| {
+                rec.name.label_count() > previous.name.label_count()
+            })
         {
             dname = Some(rec.clone());
         }
     }
 
-    if !answer_data.is_empty() {
+    if rcode == 0 && !answer_data.is_empty() {
         return ResponseKind::Answer {
             records: answer_data,
             rrsigs,
@@ -241,27 +253,34 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
     }
 
     // No direct answer: check the authority section.
-    let soa = msg.authority_soa();
-    if soa.is_some() {
+    if rcode == 3 || soa.is_some() {
         return ResponseKind::Negative {
-            rcode: Rcode::NOERROR,
+            rcode: if rcode == 3 {
+                Rcode::NXDOMAIN
+            } else {
+                Rcode::NOERROR
+            },
             soa: soa.cloned(),
         };
     }
     let mut referral: Option<(Name, Vec<Record>, Vec<Record>)> = None;
     for rec in &msg.authorities {
-        if rec.rr_type == RrType::NS && rec.name.is_strict_subdomain_of(zone) {
+        if rec.rr_type == RrType::NS
+            && rec.class == RrClass::IN
+            && rec.name.is_strict_subdomain_of(zone)
+            && qname.is_subdomain_of(&rec.name)
+        {
             let zone = rec.name.clone();
             let ns: Vec<Record> = msg
                 .authorities
                 .iter()
-                .filter(|r| r.rr_type == RrType::NS && r.name == zone)
+                .filter(|r| r.rr_type == RrType::NS && r.name == zone && r.class == RrClass::IN)
                 .cloned()
                 .collect();
             let glue: Vec<Record> = msg
                 .additionals
                 .iter()
-                .filter(|r| matches!(r.rr_type, RrType::A | RrType::AAAA))
+                .filter(|r| r.class == RrClass::IN && matches!(r.rr_type, RrType::A | RrType::AAAA))
                 .cloned()
                 .collect();
             referral = Some((zone, ns, glue));

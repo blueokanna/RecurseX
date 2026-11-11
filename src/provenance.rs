@@ -344,7 +344,11 @@ impl Provenance {
     /// Whether the answer's bound clears `threshold` *and* every dependency
     /// is stale-eligible.
     pub fn can_serve_stale(&self, threshold: f64) -> bool {
-        !self.is_empty() && self.permits_stale() && self.joint_lower_bound() >= threshold
+        threshold.is_finite()
+            && (0.0..=1.0).contains(&threshold)
+            && !self.is_empty()
+            && self.permits_stale()
+            && self.joint_lower_bound() >= threshold
     }
 }
 

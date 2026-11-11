@@ -1,46 +1,28 @@
 # Cache admission and the change-rate model
 
+> Version: **0.2.6**. Record identity is enforced before cache construction; exact canonical equality replaces hash-only equality. See the corrected refresh theory for statistical assumptions.
+
+
 The cache is *semantic*: keys are `(name, type, class, ECS partition)`, not
 raw wire messages, so a CNAME chain and an NXDOMAIN for the same name live in
 different structures. Entries are partitioned into hot / warm / cold tiers
 plus a per-name NXDOMAIN store.
 
-## The change-rate model
+## Observable-change model
 
-TTL ≠ data stability. A TTL is a *claim* about the maximum age of an answer;
-the number of times the RRset actually changed over a measured exposure is a
-*measurement* of a different thing. Every RRset carries a
-[`HazardModel`](Refresh-Theory.md) that keeps the measurement:
+`HazardModel` is an approximate Gamma rate model over endpoint content differences,
+not exact event counts. Its Chernoff calculation is conditional on that model;
+forgetting and evidence ceilings do not prove resistance to forged observations.
+Stale service is disabled by default. See [the corrected derivation](Refresh-Theory.md).
 
-- a `Gamma(α, β)` posterior over the change rate λ, where α counts changes
-  (including a prior shape of 1) and β counts observed seconds;
-- `alpha_ev` / `beta_ev` — the *evidence* half of that state, tracked
-  separately from the prior, so `has_evidence(secs)` can ask "have we
-  actually watched this long?" rather than "does the number look high?";
-- a hard ceiling: β never exceeds `w · τ`, where `w` is the prior rate and τ is
-  the forgetting constant (24 h). That ceiling is simultaneously the
-  non-stationarity mechanism and an anti-forgery bound — see
-  [the derivation](Refresh-Theory.md#non-stationarity-and-the-anti-forgery-bound-that-falls-out-of-it);
-- `ttl_ewma` / `ttl_volatility` — EWMA of the authoritative TTL and of its
-  deviation, which is how a name's TTL is *learned* rather than trusted;
-- `consecutive_failures` — refreshes that failed since the last success.
+Content equality compares sorted canonical records exactly, excluding TTL and RRSIG
+rotation. `fingerprint()` remains useful for diagnostics and scheduling, but does
+not decide equality alone. RRset construction rejects mixed owners, types, classes
+and mismatched covering signatures. Forwarded answers admit only data reachable
+from the question's alias chain. A nonexistent target cannot make an existing
+alias owner NXDOMAIN.
 
-`hazard_upper_bound()` returns the one-sided Chernoff bound `λ_hi` at
-confidence `1 − δ = 0.95`; `freshness_lcb(δ)` turns it into the probability
-that the data we hold is still correct. The refresh interval is then chosen so
-the data is looked at *before* the bound drops below `target_freshness = 0.9`,
-which is why a refresh never races the expiry.
-
-Content identity is a fingerprint over the sorted wire form of the RRset with
-the TTL field zeroed, so a TTL-only change does not count as a content change —
-and neither does an RRSIG rotation. That is deliberate: signature churn is not
-data churn, and treating it as such would drive every signed zone's change rate
-to the rollover constant.
-
-`durability_score()` is the posterior *predictive* probability over a 60 s
-horizon. It is used for **ranking** (what is worth keeping, what is worth
-prefetching), never as the safety gate — a decision uses the conservative
-bound, because a mean is not a guarantee.
+`durability_score()` ranks entries; risk gates use model bounds. Neither authenticates data.
 
 ## CacheScore admission
 

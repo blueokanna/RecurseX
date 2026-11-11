@@ -153,6 +153,9 @@ pub struct ForwarderSet {
     roots: courierust::courierust_tls::RootStore,
     verify: bool,
     now: i64,
+    // Only loopback transport failures enter this short cooldown. No domain
+    // answers (including NXDOMAIN) are treated as endpoint health failures.
+    local_cooldowns: Arc<Mutex<BTreeMap<TransportKey, std::time::Instant>>>,
 }
 
 /// Which upstreams are configured and whether certificates are verified;
@@ -188,6 +191,7 @@ impl ForwarderSet {
             roots,
             verify,
             now,
+            local_cooldowns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -408,6 +412,17 @@ impl ForwarderSet {
     ) -> Result<Message> {
         let mut last_err: Option<Error> = None;
         for (index, f) in group.iter().enumerate() {
+            let local_with_alternative = f.endpoint.ip.is_loopback() && group.len() > 1;
+            let local_key = TransportKey::of(f);
+            if local_with_alternative {
+                let mut cooldowns = self.local_cooldowns.lock();
+                let now = std::time::Instant::now();
+                cooldowns
+                    .retain(|key, until| key.generation == local_key.generation && *until > now);
+                if cooldowns.contains_key(&local_key) {
+                    continue;
+                }
+            }
             if canceled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 return Err(Error::new(
                     ErrorKind::Canceled,
@@ -424,13 +439,26 @@ impl ForwarderSet {
                 ));
                 break;
             }
-            // Reserve time for alternate servers; a blackhole must not consume
-            // the complete query budget before the next server is attempted.
-            let timeout_ms = (remaining / (group.len() - index) as u64).max(1);
+            let timeout_ms = if index == 0 && local_with_alternative {
+                (remaining / 2).max(1)
+            } else {
+                (remaining / (group.len() - index) as u64).max(1)
+            };
             let attempt_deadline = query_deadline(timeout_ms)?.min(deadline);
             let mut resp = match self.exchange_message(f, query, query_bytes, timeout_ms) {
                 Ok(m) => m,
                 Err(e) => {
+                    if local_with_alternative
+                        && matches!(e.kind, ErrorKind::Timeout | ErrorKind::Io)
+                    {
+                        let mut cooldowns = self.local_cooldowns.lock();
+                        if cooldowns.len() < 32 {
+                            cooldowns.insert(
+                                local_key,
+                                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                            );
+                        }
+                    }
                     last_err = Some(e);
                     continue;
                 }
@@ -662,14 +690,85 @@ pub fn response_to_resolution(
     let mut ttl = u32::MAX;
     let mut answers = Vec::new();
     let mut rrsigs = Vec::new();
-    for r in &resp.answers {
+    // Admit only records reachable from this question. A forwarded response
+    // must not seed unrelated names into the shared cache or bypass policy.
+    use crate::qtype::RrType;
+    use crate::rdata::RData;
+    let mut owner = key.name.clone();
+    let mut visited = alloc::collections::BTreeSet::new();
+    for _ in 0..64 {
+        if !visited.insert(owner.clone()) {
+            break;
+        }
+        let matching: Vec<_> = resp
+            .answers
+            .iter()
+            .filter(|r| {
+                r.class == key.class
+                    && r.name == owner
+                    && r.rr_type != RrType::RRSIG
+                    && (r.rr_type == key.rr_type || key.rr_type == RrType::ANY)
+            })
+            .collect();
+        if !matching.is_empty() {
+            answers.extend(matching.into_iter().cloned());
+            break;
+        }
+        let aliases: Vec<_> = resp
+            .answers
+            .iter()
+            .filter(|r| r.class == key.class && r.name == owner && r.rr_type == RrType::CNAME)
+            .collect();
+        if let [alias] = aliases.as_slice() {
+            if let RData::Cname(target) = &alias.rdata {
+                answers.push((*alias).clone());
+                // Keep a covering DNAME too; CNAME is its wire synthesis.
+                if let Some(dname) = resp
+                    .answers
+                    .iter()
+                    .filter(|r| {
+                        r.class == key.class
+                            && r.rr_type == RrType::DNAME
+                            && owner.is_strict_subdomain_of(&r.name)
+                    })
+                    .max_by_key(|r| r.name.label_count())
+                {
+                    if let RData::Dname(suffix) = &dname.rdata {
+                        if crate::engine::synthesize_dname_cname(&owner, &dname.name, suffix)
+                            .as_ref()
+                            == Some(target)
+                        {
+                            answers.push(dname.clone());
+                        }
+                    }
+                }
+                owner = target.clone();
+                continue;
+            }
+        }
+        break;
+    }
+    for r in &answers {
         ttl = ttl.min(r.ttl);
-        if r.rr_type == crate::qtype::RrType::RRSIG {
-            rrsigs.push(r.clone());
-        } else {
-            answers.push(r.clone());
+    }
+    for sig in &resp.answers {
+        if sig.class == key.class && sig.rr_type == RrType::RRSIG {
+            if let RData::Rrsig { type_covered, .. } = &sig.rdata {
+                if answers
+                    .iter()
+                    .any(|r| r.name == sig.name && r.rr_type == *type_covered)
+                {
+                    rrsigs.push(sig.clone());
+                }
+            }
         }
     }
+    let authorities = resp
+        .authorities
+        .iter()
+        .filter(|r| r.class == key.class && owner.is_subdomain_of(&r.name))
+        .cloned()
+        .collect();
     if ttl == u32::MAX {
         ttl = 0;
     }
@@ -683,16 +782,12 @@ pub fn response_to_resolution(
         class: key.class,
         rcode,
         answers,
-        authorities: resp.authorities.clone(),
+        authorities,
         rrsigs,
         validated: false,
         ttl,
         from_cache: false,
         stale: false,
-        // A forwarder is free to return ECS even though we asked without
-        // it; carrying the scope through means the answer is filed under the
-        // partition the server declared rather than silently treated as
-        // global.
         ecs_scope: resp
             .edns
             .as_ref()
@@ -1065,7 +1160,6 @@ mod tests {
             RData::A(Ipv4Addr::new(203, 0, 113, 2))
         );
         assert!(start.elapsed() < std::time::Duration::from_millis(600));
-        // A winner may finish before the other thread is scheduled.
         let _ = worker;
         assert!(fast_worker.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }

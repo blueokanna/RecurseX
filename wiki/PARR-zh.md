@@ -1,5 +1,8 @@
 # PARR —— 预测核心
 
+> 版本: **0.2.6**. 预测用于调度，真实覆盖率尚未建立。过期服务默认 Disabled；OnRefreshFailure 要求本次上游请求已失败。
+
+
 「Predictive Adaptive Recursive Resolver」是整条反馈回路的名字：解析器**测量**查询流和上游
 行为，并用这些测量**调优**自己的缓存与传输策略。回路分四段。
 

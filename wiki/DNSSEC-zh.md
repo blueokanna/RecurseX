@@ -1,67 +1,41 @@
-# DNSSEC
+# DNSSEC：局部验签与信任边界
 
-`dnssec` feature 校验应答链：对规范化 RRset 的 RRSIG 签名、从信任锚往下走的 DS 摘要链，
-以及一个**四态**的验证阶梯。校验刻意自包含——允许的依赖集里没有通用密码库，
-所以 RSA 校验是手写的。
+版本：**0.2.6**。
 
-## 校验什么
+当前实现 RSA/SHA-256 验签（算法 8）、SHA-256 DS 匹配及 RRset 规范化。
+这还不是完整的 DNSSEC 验证解析器：没有安装根信任锚，没有完成父区 DS 的认证链，
+没有 NSEC/NSEC3 否定证明和通配符展开证明。ECDSA 13/14、EdDSA 15/16 只识别，尚不验证。
 
-- **RRSIG（RFC 4034 §3.1.5）** —— 规范化 RRset（owner 名小写、RR 排序、原始 TTL）、SHA-256
-  摘要，用签名者 DNSKEY 验证。
-- **DS（RFC 4034 §5.1）** —— DS 摘要是对「规范化 owner 名 + DNSKEY RDATA」做 SHA-256，
-  必须与父区的 DS 记录匹配。
-- **链走查** —— 从该区 DNSKEY 沿 DS 链上溯到信任锚，带递归保护。
-- **Authority 段（RFC 4035 §3.2.3）** —— 负应答里 SOA 与 NSEC/NSEC3 材料**同样**必须通过
-  认证。这条规则是「全部」而不是「任一」：只查 Answer 段的解析器会把一条未签名的
-  「不存在证明」标成已签名。
+| 结果 | 本版本语义 |
+|---|---|
+| `SignatureValid` | 签名与取回或传入的密钥在数学上相符，但密钥身份未经认证。 |
+| `Indeterminate` | 缺证据、算法不支持、没有可信否定证明的未签名数据，或未支持的通配符证明。 |
+| `Bogus` | 受支持且适用的签名未通过局部校验；不代表已经证明该区属于安全委派。 |
+| `Insecure` | 为已认证的未签名委派保留；当前验证器不会产生此结果。 |
 
-## 验证阶梯，以及为什么它不是布尔值
+`Verdict::Secure` 保留为已弃用的兼容常量，等价于 `SignatureValid`，新代码应使用明确名称。
+`CryptoVerified` 仅表示局部验签；`ChainAnchored` 要求完整信任链，当前验证器不产生它。
+旧的 `anchored` 布尔参数不能提升验证等级。
 
-「DNSSEC 开着」和「这个答案是可信的」是两个不同的命题，把它们合并的解析器就夸大了自己查过什么。
-`ValidationState` 记录链**实际停在哪里**：
+`checked_signature_state()` 返回局部验签结果。解析器用 `checked_authentication()`
+决定 `Resolution.validated` 与缓存信任，因此局部成功仍然 `validated=false`，响应不置 AD。
+历史字段 `answer_groups_authenticated`、`authority_authenticated` 统计的是局部验签，
+不是可信链。所有 owner/type/class 分组都计入，包括没有签名的分组。
 
-| 状态 | 含义 | 置 `AD`？ | 信任惩罚 κ |
-|---|---|---|---|
-| `ChainAnchored` | 链到达**已配置的**信任锚，且 Answer 与 Authority 都可信 | **是** | 1 |
-| `CryptoVerified` | 签名验证通过、签名密钥被父区 DS 匹配，但 DS 记录自身的链没有走到锚 | 否 | 2 |
-| `Insecure` | 已知该区未签名（或使用本构建拒绝的算法） | 否 | 5 |
-| `Indeterminate` | 无法判定：算法不支持、缺密钥、`Bogus`，或验证槽被占用 | 否 | 10 |
+验签入口检查 DNSKEY 的 owner、class、protocol=3、zone-key 标记；每个数据记录必须与
+RRSIG 的 owner、type、class 一致，signer 必须覆盖 owner。DS 匹配检查所属名称、类别、
+记录类型、key tag 和摘要；匹配未经认证的 DS 仍然不建立信任锚。
+解析器不再为了给局部验签更强的名称而额外查询 DS。
 
-线格式校验器给出的判定仍然是 `Secure` / `Insecure` / `Bogus` / `Indeterminate`；
-`Verdict::state(anchored)` 把它映射成 `ValidationState`，诚实性就在这个映射里落实。
+规范化排序按 RDATA 字节进行，不把 RDLENGTH 当排序依据。签名时间使用 32 位序列号运算，
+支持回绕，拒绝跨度达到半个序列空间的歧义窗口。通配符展开缺少否定证明时返回无法判定，
+不会把有效通配符错误归为签名损坏。
 
-**本构建不随附任何根信任锚，且 `engine.dnssecAnchored` 默认为 `false`，所以除非部署自己装上锚
-并明确声明，`ChainAnchored` 是**不可达**的。** 没有锚时最好的状态是 `CryptoVerified`：
-「这个区签了这份数据」——这是真实且有用的断言，但**不是**「这条委派是真的」。`AD` 位只在
-`ChainAnchored` 时置位，所以仅签名验证通过的答案只在内部使用（喂给风险模型），绝不对外宣称；
-RFC 4035 §3.2.3 不允许把较弱的断言当成较强的发布。
+DNSKEY 子查询在当前线程跳过嵌套验证以限制递归；线程局部保护不会使其他工作线程漏检。
+无效签名在缓存准入前拒绝，缓存重用时重新检查；不支持和证据不足均保留无法判定状态。
 
-这个阶梯也正是风险模型的挂钩点：信任惩罚 κ 乘在 stale 决策的后果系数上，因此未经认证的数据需要
-低得多的陈旧概率才能被服务。见[风险约束刷新](Refresh-Theory-zh.md) §V。
+若应用要求经过信任链认证的答案，当前局部验证器不能满足该要求。
+可以配置验证型上游，但 RecurseX 不把上游的 AD 位当作本地完成的信任链。
 
-## RSA 实现
-
-`dnssec/rsa.rs` 用从零写的 u32-limb 大整数（平方-乘模幂、逐位长除取模）实现 RSA PKCS#1 v1.5
-验签，加 RFC 3110 DNSKEY RSA 解析。指数长度是一个字节；**该字节为 0 时，长度是紧随其后的
-两个字节**（RFC 3110 §2）——超过 255 字节的指数只能用这种三字节形式表达，此时指数从
-偏移 3 开始而不是偏移 1。测试套件里有一个用
-**openssl 真实生成的 1024 位 RSA/SHA-256 向量**——不是造出来的常量——外加对摘要和签名的篡改
-检查。
-
-验签是**对攻击者输入的全定义函数**：DNSKEY（中间人可重放的公开数据）和签名（由攻击者自选）
-都来自网络，所以畸形的 key 或签名一律返回 `false`，**绝不 panic**。
-`tests/parser_robustness.rs` 用空签名、零模数、声明长度超过 key 的指数等退化形状把这套契约锁住。
-
-## 诚实的边界
-
-- 实现了 RSA PKCS#1 v1.5 + SHA-256。ECDSA 与 SHA-1 签名能识别但尚未校验，所以依赖它们的链
-  报告为 `Indeterminate`，绝不会误报 `Secure`。
-- 编码消息的检查是严格的：完整的 DigestInfo 前缀、精确的摘要，以及 RFC 8017 §9.2 要求的至少
-  8 个 0xFF 填充字节——小指数伪造无法从一个过短的填充段里钻过去。
-- 请求 DNSSEC 时尊重 `do` 位；解析器把 RRSIG 和 RRset 一起存，校验过的数据在缓存命中时保持
-  校验状态，`validated` 标志能跨持久化保留。
-
-## 激进缓存
-
-缓存按 RFC 2308 用 SOA 推导的 TTL 存负应答，这是激进 NSEC/NSEC3 缓存的基座；NSEC 位图的
-解析/序列化在编解码器里。
+规范：[RFC 4034](https://www.rfc-editor.org/rfc/rfc4034)、
+[RFC 4035](https://www.rfc-editor.org/rfc/rfc4035)。

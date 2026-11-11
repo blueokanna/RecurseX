@@ -1,5 +1,8 @@
 # Architecture
 
+> Version: **0.2.6**. The listener enforces a client ACL before queuing work. Local signature checks do not authenticate cache entries. Forwarded cache admission follows the question’s alias chain.
+
+
 RecurseX is a pipeline, not a blob. Each layer owns one job and talks to the
 next through narrow interfaces, so the algorithmic core is `no_std` and the
 networked parts are isolated behind the `std` feature.

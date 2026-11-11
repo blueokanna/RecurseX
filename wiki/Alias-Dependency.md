@@ -1,5 +1,8 @@
 # Alias dependency
 
+> Version: **0.2.6**. A negative target does not make its existing alias NXDOMAIN. Dependency risk uses a conditional union bound, not the minimum member probability.
+
+
 A resolver serves `www.example.com A` from cache only while **both** the CNAME
 at `www` and the target's address data are fresh. That is a dependency between
 two cache entries, and a cache cannot represent it: `BTreeMap<key, data>` has

@@ -88,7 +88,7 @@ pub struct EngineConfig {
     /// depth limit by making each level of the tree cheap to enter and
     /// expensive to finish. See [`crate::budget`].
     pub fetch_limits: crate::budget::FetchLimits,
-    /// Fall back to TCP on truncation.
+    /// Fall back to TCP on truncation or UDP timeout, within the same budget.
     pub tcp_fallback: bool,
     /// Retransmit budget for the expected-cost model.
     pub retransmit_budget: u32,
@@ -1111,6 +1111,27 @@ impl Resolver {
 
     /// Resolve a query key.
     pub fn resolve_key(&self, key: &QueryKey) -> Result<Resolution> {
+        let started = Instant::now();
+        let result = self.resolve_key_inner(key);
+        #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+        let path = if self.forward_route(key).is_some() {
+            "forward"
+        } else {
+            "recursive"
+        };
+        #[cfg(not(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")))]
+        let path = "recursive";
+        crate::observation::record(key, path, &result, started.elapsed());
+        result
+    }
+
+    fn resolve_key_inner(&self, key: &QueryKey) -> Result<Resolution> {
+        if key.class != crate::qtype::RrClass::IN {
+            return Err(Error::new(
+                ErrorKind::Policy,
+                "only Internet class is supported",
+            ));
+        }
         let _query_scope = crate::background::TaskScope::enter_query(
             self.inner.config.engine.fetch_limits,
             self.inner.config.engine.query_budget_ms,
@@ -1485,7 +1506,7 @@ impl Resolver {
                 &res,
                 self.inner.config.engine.dnssec_anchored,
             );
-            res.validated = v.checked_signature_state()?;
+            res.validated = v.checked_authentication()?;
         }
 
         self.cache_resolution(key, &res, now);
@@ -1536,7 +1557,19 @@ impl Resolver {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let can_fallback = !forced && !policy_routed && groups.has_fallback();
-        let timeout = self.inner.config.engine.timeout_ms;
+        let timeout = if primary.first().is_some_and(|f| f.endpoint.ip.is_loopback()) {
+            // A loopback recursive service needs a full delegation walk, not
+            // just one authority exchange. Still stay inside the caller's
+            // overall deadline; ForwarderSet reserves time for alternatives.
+            self.inner
+                .config
+                .engine
+                .timeout_ms
+                .saturating_mul(3)
+                .min(self.inner.config.engine.query_budget_ms)
+        } else {
+            self.inner.config.engine.timeout_ms
+        };
         let primary_timeout = if can_fallback {
             (timeout / 2).max(1).min(timeout)
         } else {
@@ -1775,7 +1808,7 @@ impl Resolver {
             let mut cached = cached;
             if self.inner.config.engine.dnssec && !key.cd {
                 match crate::dnssec::validate_resolution_detailed(self, &cached, false)
-                    .checked_signature_state()
+                    .checked_authentication()
                 {
                     Ok(verified) => cached.validated = verified,
                     Err(error) => return Some(Err(error)),
@@ -1870,8 +1903,6 @@ impl Resolver {
         let mut ecs_scope: Option<u8> = None;
 
         loop {
-            // The budget covers the whole tree, so a nested walk that has spent
-            // it stops here instead of starting another round of referrals.
             if deadline.expired() {
                 return Err(Error::new(
                     ErrorKind::Timeout,
@@ -2101,7 +2132,6 @@ impl Resolver {
                             _ => None,
                         })
                         .collect();
-                    // Cache the NS RRset and in-bailiwick glue.
                     {
                         let mut cache = self.inner.shared.cache.lock();
                         let ns_set =
@@ -2391,10 +2421,14 @@ impl Resolver {
         let max_servers = servers
             .len()
             .min(self.inner.config.engine.max_servers_tried.max(1));
-        for (endpoint, _) in ranked.into_iter().take(max_servers) {
+        for (server_index, (endpoint, _)) in ranked.into_iter().take(max_servers).enumerate() {
             if deadline.expired() {
                 break;
             }
+            let remaining = deadline.at.saturating_duration_since(Instant::now());
+            let server_deadline = Deadline {
+                at: Instant::now() + remaining / (max_servers - server_index) as u32,
+            };
             let mut attempts = 0u32;
             while attempts < self.inner.config.engine.max_attempts_per_server {
                 if total_attempts >= self.inner.config.engine.max_total_attempts {
@@ -2436,17 +2470,66 @@ impl Resolver {
                 });
 
                 let Some(attempt_ms) =
-                    deadline.attempt_timeout_ms(self.inner.config.engine.timeout_ms)
+                    server_deadline.attempt_timeout_ms(self.inner.config.engine.timeout_ms)
                 else {
                     break;
                 };
 
                 let t0 = Instant::now();
-                let resp_bytes = match self
-                    .inner
-                    .transports
-                    .exchange(&endpoint, &q.bytes, attempt_ms)
-                {
+                let attempt_deadline = Deadline::after(attempt_ms);
+                let tcp_fallback =
+                    endpoint.proto == Proto::Udp && self.inner.config.engine.tcp_fallback;
+                let udp_ms = if tcp_fallback {
+                    (attempt_ms / 2).max(1)
+                } else {
+                    attempt_ms
+                };
+                let initial = self.inner.transports.exchange(&endpoint, &q.bytes, udp_ms);
+                let query_msg = Message::parse(&q.bytes)?;
+                let needs_tcp = tcp_fallback
+                    && match &initial {
+                        Err(error) => matches!(error.kind, ErrorKind::Timeout),
+                        Ok(bytes) => Message::parse(bytes).is_ok_and(|m| {
+                            m.is_truncated() && response_matches_query(&query_msg, &m)
+                        }),
+                    };
+                let exchanged = if needs_tcp {
+                    if total_attempts >= self.inner.config.engine.max_total_attempts {
+                        return Err(Error::new(
+                            ErrorKind::NoUpstream,
+                            "TCP retry exceeds wire attempt budget",
+                        ));
+                    }
+                    budget.spend_subquery().map_err(|_| {
+                        Error::new(ErrorKind::NoUpstream, "TCP retry exceeds subquery budget")
+                    })?;
+                    total_attempts += 1;
+                    self.inner
+                        .stats
+                        .upstream_queries
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Ok(bytes) = &initial {
+                        budget
+                            .spend_bytes(q.bytes.len() as u64 + bytes.len() as u64)
+                            .map_err(|_| {
+                                Error::new(ErrorKind::NoUpstream, "TCP retry exceeds byte budget")
+                            })?;
+                    }
+                    let tcp_ep = Endpoint {
+                        proto: Proto::Tcp,
+                        ..endpoint
+                    };
+                    match attempt_deadline.attempt_timeout_ms(attempt_ms) {
+                        Some(timeout) => self.inner.transports.exchange(&tcp_ep, &q.bytes, timeout),
+                        None => Err(Error::new(
+                            ErrorKind::Timeout,
+                            "TCP retry deadline exhausted",
+                        )),
+                    }
+                } else {
+                    initial
+                };
+                let resp_bytes = match exchanged {
                     Ok(b) => b,
                     Err(e) => {
                         last_err = Some(e.clone());
@@ -2484,32 +2567,17 @@ impl Resolver {
                         continue;
                     }
                 };
-                let query_msg = Message::parse(&q.bytes).unwrap_or_default();
                 if !response_matches_query(&query_msg, &msg) {
+                    last_err = Some(Error::transport("authority response did not match query"));
                     continue;
                 }
 
-                if msg.is_truncated() && self.inner.config.engine.tcp_fallback {
-                    let tcp_ep = Endpoint {
-                        proto: Proto::Tcp,
-                        ..endpoint
-                    };
-                    if let Ok(b) = self
-                        .inner
-                        .transports
-                        .exchange(&tcp_ep, &q.bytes, attempt_ms)
-                    {
-                        if let Ok(m) = Message::parse(&b) {
-                            if response_matches_query(&query_msg, &m) {
-                                self.inner.shared.selector.lock().record_success(
-                                    tcp_ep,
-                                    rtt_ms as f64,
-                                    now,
-                                );
-                                return Ok((m, rtt_ms));
-                            }
-                        }
-                    }
+                if msg.is_truncated() {
+                    last_err = Some(Error::new(
+                        ErrorKind::Truncated,
+                        "authority returned an incomplete answer",
+                    ));
+                    continue;
                 }
                 if skip_empty
                     && msg.flags.rcode == Rcode::NOERROR
@@ -2584,7 +2652,7 @@ impl Resolver {
             set.validated = res.validated;
             for sig in &res.rrsigs {
                 if let RData::Rrsig { type_covered, .. } = &sig.rdata {
-                    if *type_covered == rr_type {
+                    if *type_covered == rr_type && sig.name == name && sig.class == key.class {
                         set.add_rrsig(sig.clone());
                     }
                 }
@@ -2599,7 +2667,13 @@ impl Resolver {
         }
 
         let partition = crate::cache::answer_partition(key.ecs.as_ref(), res.ecs_scope);
-        if res.rcode.is_nxdomain() {
+        // An alias owner exists even when its target does not (RFC 2308).
+        // Cache its CNAME above, but do not attach NXDOMAIN to that owner.
+        let has_alias = res
+            .answers
+            .iter()
+            .any(|r| matches!(r.rr_type, RrType::CNAME | RrType::DNAME));
+        if res.rcode.is_nxdomain() && !has_alias {
             let soa_ttl = res
                 .authorities
                 .iter()
@@ -4250,15 +4324,11 @@ mod tests {
         let one: Ipv6Addr = "::1".parse().unwrap();
         assert_eq!(parse_ip6_arpa(&reverse6(one)), Some(one));
 
-        // An address with every nibble distinct, so a byte-order mistake
-        // cannot pass.
         let mixed: Ipv6Addr = "fdfe:dcba:9876:5432:10fe:dcba:9876:5432".parse().unwrap();
         assert_eq!(parse_ip6_arpa(&reverse6(mixed)), Some(mixed));
 
-        // The v4 form is a different hierarchy and must not be accepted.
         assert_eq!(p("1.0.18.198.in-addr.arpa"), None);
         assert_eq!(p("1.0.0.0.ip6.arpa"), None, "too few nibbles");
-        // A label that is not exactly one hex digit is not a nibble.
         let bad = reverse6(one).to_ascii().replace("1.0.", "1.00.");
         assert_eq!(p(&bad), None);
         assert_eq!(p("example.com"), None);
@@ -4292,8 +4362,6 @@ mod tests {
             ptr.answers[0].rdata
         );
 
-        // An address in range that was never handed out has no answer, and
-        // must not be invented.
         let unknown = Name::from_ascii("9.9.9.198.in-addr.arpa").unwrap();
         assert!(r.resolve(&unknown, RrType::PTR).is_err());
     }
@@ -4471,5 +4539,60 @@ mod tests {
             .resolve(&Name::from_ascii("printer.lan").unwrap(), RrType::A)
             .is_err());
         assert_eq!(s(&r).fake_ip_filtered, 1);
+    }
+}
+
+#[cfg(all(
+    test,
+    any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq")
+))]
+mod alias_negative_regression {
+    use super::*;
+    #[test]
+    fn forwarded_nxdomain_does_not_hide_the_existing_alias_in_cache() {
+        let resolver = Resolver::new(ResolverConfig::default());
+        let name = Name::from_ascii("alias.example.test").unwrap();
+        let key = QueryKey {
+            name: name.clone(),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ecs: None,
+            want_dnssec: false,
+            cd: false,
+        };
+        let mut message = Message::query(1, name.clone(), RrType::A, true);
+        message.flags.qr = true;
+        message.flags.rcode = Rcode::NXDOMAIN;
+        message.answers.push(Record {
+            name: name.clone(),
+            rr_type: RrType::CNAME,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::Cname(Name::from_ascii("missing.other.test").unwrap()),
+        });
+        // A valid negative SOA would previously cache NXDOMAIN at the alias.
+        message.authorities.push(Record {
+            name: Name::from_ascii("other.test").unwrap(),
+            rr_type: RrType::SOA,
+            class: RrClass::IN,
+            ttl: 300,
+            rdata: RData::Soa {
+                mname: Name::from_ascii("ns.other.test").unwrap(),
+                rname: Name::from_ascii("hostmaster.other.test").unwrap(),
+                serial: 1,
+                refresh: 300,
+                retry: 60,
+                expire: 3600,
+                minimum: 300,
+            },
+        });
+        let answer = crate::forward::response_to_resolution(&key, &message);
+        resolver.cache_resolution(&key, &answer, resolver.now());
+        let alias = resolver.resolve(&name, RrType::CNAME).unwrap();
+        assert_eq!(alias.rcode, Rcode::NOERROR);
+        assert!(alias.from_cache);
+        assert_eq!(alias.answers.len(), 1);
+        assert_eq!(alias.answers[0].rr_type, RrType::CNAME);
+        assert_eq!(resolver.stats_snapshot().upstream_queries, 0);
     }
 }

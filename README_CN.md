@@ -1,4 +1,14 @@
-# RecurseX
+# RecurseX 0.2.6
+
+## DNS 恢复与查询观测（0.2.6）
+
+递归请求为备用权威服务器保留预算，UDP 超时或截断后在同一截止时间内尝试 TCP。TCP 失败或仍然截断时，不接受不完整答案。本机回环上游允许更长的冷启动递归时间，但不突破调用者的总预算；存在备用服务器时，传输失败的回环地址避让 5 秒，网络代次改变后重新尝试。NXDOMAIN 等有效否定回答不会触发端点避让。
+
+查询观测默认关闭。`observation::configure(256)` 开启进程内有界缓冲，`observation::snapshot()` 返回真实答案摘要、响应码或错误类别、缓存来源和微秒耗时。每条记录最多保存 8 条、每条最多 256 字节的答案摘要。缓冲争用只丢弃并统计观测记录，不阻塞解析。`configure(0)` 关闭观测并清除历史；记录不落盘，也不会修改 DNS 缓存。
+
+记录对应解析器调用，不是数据包计数；嵌套解析与本机转发可能形成多条记录。回归测试 `tests/recursive_recovery.rs` 和 `tests/query_observation.rs` 使用本地 DNS 服务验证 UDP 黑洞、TCP 失败与截断、备用权威服务器、回环恢复，以及实际查询后的缓存命中。
+
+包版本为 `0.2.6`，不代表工作树已经发布到 crates.io 或托管 wiki。开发期使用相邻仓库的 Cargo patch，源码只在 RecurseX 仓库维护。
 
 [English](README.md) · [接口文档](https://docs.rs/recurse-x) · [验收记录](docs/refresh-validation.md)
 
@@ -122,3 +132,19 @@ cargo clippy --all-features --all-targets --locked -- -D warnings
 许可证见 [LICENSE](LICENSE)。
 
 严格加密转发、查询披露额度和 Fake-IP 满池行为见 [DNS 隐私与失败边界](docs/dns-privacy.md)。
+
+## 0.2.6 协议与信任修正
+
+转发应答仅准入当前问题及别名链可达的数据；目标 NXDOMAIN 不会否定已存在的别名。
+RRset 构造拒绝混合名称、类型和 class；委派必须位于当前区内且覆盖所查询名称。
+规范化内容按完整记录判等，避免仅凭非密码学指纹继承变化模型。
+
+DNSSEC 使用 `SignatureValid` 表示局部验签；旧 `Secure` 仅作弃用兼容名称。
+局部成功不使 `Resolution.validated` 变为 true、不提升缓存信任、不置 AD。
+目前没有根锚认证链、NSEC/NSEC3 或通配符证明，缺签名也不能证明属于合法未签名分支。
+验签增加记录身份绑定、RDATA 排序修正和 32 位签名时间回绕处理。
+
+监听默认只接受回环客户端，即使绑定通配地址。局域网需显式设置
+`ServerConfig::allowed_clients`；EDNS 响应大小限制不等于没有反射放大。
+详细部署条件见 [部署文档](wiki/Deployment-zh.md)，测试证据见 [0.2.6 审计记录](docs/audit-0.2.6.md)。
+中英文 wiki 已同步修正统计假设，旧论文中的最弱依赖与瓶颈唯一收益定理已撤回。

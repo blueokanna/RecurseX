@@ -265,6 +265,17 @@ impl PolicyEngine {
     /// Validate an incoming client query message. Returns an error the
     /// server should map to a FORMERR / REFUSED response.
     pub fn validate_query(&self, msg: &Message) -> Result<()> {
+        if msg.flags.qr
+            || msg
+                .questions
+                .iter()
+                .any(|q| q.qclass != crate::qtype::RrClass::IN)
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::Policy,
+                "expected an Internet-class DNS query",
+            ));
+        }
         if self.config.enforce_query_opcode && msg.flags.opcode != Opcode::QUERY {
             return Err(Error::new(
                 crate::error::ErrorKind::Policy,

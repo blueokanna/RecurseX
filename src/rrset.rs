@@ -100,7 +100,12 @@ impl RrSet {
         if self.records.len() != other.records.len() {
             return false;
         }
-        self.fingerprint() == other.fingerprint()
+        // A non-cryptographic hash is not evidence of content equality.
+        let mut left: Vec<_> = self.records.iter().map(record_wire_without_ttl).collect();
+        let mut right: Vec<_> = other.records.iter().map(record_wire_without_ttl).collect();
+        left.sort();
+        right.sort();
+        left == right
     }
 
     /// The absolute expiry of the set given `now` (saturating).
@@ -161,7 +166,8 @@ impl RrSet {
     /// remembered.
     pub fn from_records(records: Vec<Record>, max_ttl_cap: u32) -> Result<RrSet> {
         let first = records
-            .first()
+            .iter()
+            .find(|r| r.rr_type != RrType::RRSIG)
             .ok_or_else(|| crate::error::Error::internal("empty RRset construction"))?;
         let name = first.name.clone();
         let rr_type = first.rr_type;
@@ -170,6 +176,12 @@ impl RrSet {
         let mut data = Vec::with_capacity(records.len());
         let mut rrsigs = Vec::new();
         for rec in records {
+            let matching_type = rec.rr_type == rr_type
+                || (rec.rr_type == RrType::RRSIG
+                    && matches!(rec.rdata, RData::Rrsig { type_covered, .. } if type_covered == rr_type));
+            if rec.name != name || rec.class != class || !matching_type {
+                return Err(crate::error::Error::wire("mixed RRset identity"));
+            }
             ttl = ttl.min(rec.ttl);
             if rec.rr_type == RrType::RRSIG {
                 rrsigs.push(rec);

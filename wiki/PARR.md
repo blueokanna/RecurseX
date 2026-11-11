@@ -1,5 +1,8 @@
 # PARR — the prediction core
 
+> Version: **0.2.6**. Predictions schedule work; their real-data coverage is unestablished. Stale defaults to Disabled. OnRefreshFailure requires a failed upstream attempt for this request.
+
+
 "Predictive Adaptive Recursive Resolver" is the name for the whole feedback
 loop: the resolver *measures* the query stream and the upstream behavior, and
 *tunes* its own cache and transport policy from those measurements. The loop

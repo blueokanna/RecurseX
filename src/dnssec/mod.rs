@@ -21,10 +21,8 @@
 //! resolver that collapses them overstates what it checked. The distinction
 //! that matters is *where the chain stopped*:
 //!
-//! * A signature that verifies against a key the parent's DS matched proves
-//!   the **zone** signed the data. It does not prove the delegation itself
-//!   is the real one, because the DS RRset's own signature was not walked
-//!   upward.
+//! * Local signature verification establishes consistency with a supplied
+//!   key. Without authenticating that key it does not prove zone identity.
 //! * Proving the delegation requires an unbroken chain to an anchor the
 //!   operator installed. This build ships **no** root trust anchor, so
 //!   `ChainAnchored` is not emitted by this incomplete validator.
@@ -49,9 +47,10 @@ use crate::rdata::{RData, Record};
 /// The validation outcome for a set of records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// The chain validated: at least one RRSIG verified, anchored in a DS.
-    Secure,
-    /// No trust anchor applies (unsigned zone, or unsupported algorithm).
+    /// A signature verified against a supplied key, without authenticating the key.
+    SignatureValid,
+    /// An authenticated denial establishes an unsigned delegation.
+    /// Reserved: the current validator cannot produce this result.
     Insecure,
     /// A signature failed verification.
     Bogus,
@@ -68,12 +67,11 @@ pub enum ValidationState {
     /// Nothing could be concluded: an unsigned zone, an unsupported
     /// algorithm, a missing key, or a preempted validation slot.
     Indeterminate,
-    /// No validation applies because the zone is unsigned (or the algorithm
-    /// is one this build refuses to use). This is not a failure.
+    /// An authenticated unsigned delegation. Reserved: this validator does
+    /// not yet implement the proofs needed to emit it.
     Insecure,
-    /// The signature verified against a key the parent's DS matched, but the
-    /// DS RRset's own chain was not walked to an anchor. Proves the zone
-    /// signed the data; does not prove the delegation.
+    /// A signature verified against an unauthenticated key. This establishes
+    /// mathematical consistency, not the identity of the zone operator.
     CryptoVerified,
     /// The full chain reached a configured trust anchor, and the answer was
     /// otherwise authentic. Only this state permits `AD`.
@@ -87,10 +85,8 @@ impl ValidationState {
         matches!(self, ValidationState::ChainAnchored)
     }
 
-    /// Whether the data was shown to be authentic at all (either level of
-    /// signature verification). Note that authenticity and *chain* anchoring
-    /// are different claims; only [`Self::permits_authentic_data`] says the
-    /// resolver is willing to assert the former publicly.
+    /// Whether a signature verified mathematically. This does not authenticate
+    /// the key; only [`Self::permits_authentic_data`] represents chain trust.
     #[inline]
     pub fn is_signature_verified(self) -> bool {
         matches!(
@@ -127,11 +123,16 @@ impl ValidationState {
 }
 
 impl Verdict {
+    /// Compatibility spelling for local signature verification; never chain trust.
+    #[allow(non_upper_case_globals)]
+    #[deprecated(note = "use SignatureValid; local verification does not authenticate a chain")]
+    pub const Secure: Self = Self::SignatureValid;
+
     /// Map a local signature verdict. The legacy boolean is ignored:
     /// a caller promise cannot replace root-to-answer chain validation.
     pub fn state(self, _anchored: bool) -> ValidationState {
         match self {
-            Verdict::Secure => ValidationState::CryptoVerified,
+            Verdict::SignatureValid => ValidationState::CryptoVerified,
             Verdict::Insecure => ValidationState::Insecure,
             Verdict::Indeterminate => ValidationState::Indeterminate,
             Verdict::Bogus => ValidationState::Indeterminate,
@@ -151,7 +152,8 @@ pub struct Verification {
     pub state: ValidationState,
     /// Answer RRset groups examined.
     pub answer_groups: usize,
-    /// Answer RRset groups whose signature verified against an anchored key.
+    /// Answer groups with a locally valid signature (historical field name).
+    /// This count does not establish trust in the signing key.
     pub answer_groups_authenticated: usize,
     /// Whether an Authority section was present, and if so whether every
     /// group in it authenticated. `None` when there was no Authority
@@ -172,11 +174,18 @@ impl Verification {
         Ok(self.state.is_signature_verified())
     }
 
+    /// Reject invalid signatures, but only report authenticated complete chains.
+    /// Local signature success does not authenticate the fetched DNSKEY.
+    pub fn checked_authentication(self) -> crate::error::Result<bool> {
+        self.checked_signature_state()?;
+        Ok(self.permits_authentic_data())
+    }
+
     /// A report for a chain with no answer data.
     pub fn empty() -> Self {
         Self {
-            verdict: Verdict::Insecure,
-            state: ValidationState::Insecure,
+            verdict: Verdict::Indeterminate,
+            state: ValidationState::Indeterminate,
             answer_groups: 0,
             answer_groups_authenticated: 0,
             authority_authenticated: None,
@@ -220,6 +229,13 @@ pub fn key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u1
 
 /// Whether a DNSKEY record matches a DS record (digest + key tag).
 pub fn dnskey_matches_ds(dnskey: &Record, ds: &Record) -> bool {
+    if dnskey.rr_type != RrType::DNSKEY
+        || ds.rr_type != RrType::DS
+        || dnskey.name != ds.name
+        || dnskey.class != ds.class
+    {
+        return false;
+    }
     let (dnskey_flags, dnskey_proto, dnskey_alg, dnskey_key) = match &dnskey.rdata {
         RData::Dnskey {
             flags,
@@ -229,6 +245,9 @@ pub fn dnskey_matches_ds(dnskey: &Record, ds: &Record) -> bool {
         } => (*flags, *protocol, *algorithm, public_key),
         _ => return false,
     };
+    if dnskey_proto != 3 || dnskey_flags & 0x0100 == 0 {
+        return false;
+    }
     let (ds_key_tag, ds_alg, ds_digest_type, ds_digest) = match &ds.rdata {
         RData::Ds {
             key_tag,
@@ -289,7 +308,7 @@ fn rrsig_rdata_without_signature(sig: &RData) -> Option<Vec<u8>> {
 
 /// Build the RFC 4034 canonical RRset for the covered records.
 fn canonical_rrset(signer: &Name, records: &[&Record], original_ttl: u32) -> Vec<u8> {
-    let mut items: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+    let mut items: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len());
     for r in records {
         let mut item = Vec::with_capacity(64);
         r.name.write_wire(&mut item);
@@ -300,16 +319,23 @@ fn canonical_rrset(signer: &Name, records: &[&Record], original_ttl: u32) -> Vec
         r.rdata.to_wire(&mut rdata, None);
         item.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         item.extend_from_slice(&rdata);
-        items.push(item);
+        items.push((rdata, item));
     }
-    // Sort by canonical RDATA (the full wire form; RFC 4034 §3.1.8.1).
-    items.sort();
+    // RFC 4034 section 6.3 orders by RDATA octets, not RDLENGTH.
+    items.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::with_capacity(64 * items.len());
-    for item in items {
+    for (_, item) in items {
         out.extend_from_slice(&item);
     }
     let _ = signer;
     out
+}
+
+// RFC 4034 section 3.1.5: timestamps use serial-number arithmetic.
+// Reject ambiguous windows of half the serial space or more.
+fn signature_time_valid(inception: u32, expiration: u32, now: u32) -> bool {
+    let span = expiration.wrapping_sub(inception);
+    span < (1 << 31) && now.wrapping_sub(inception) <= span
 }
 
 /// Verify one RRSIG over a set of data records with a DNSKEY.
@@ -323,6 +349,7 @@ pub fn verify_rrsig(
     now_secs: u32,
 ) -> Result<bool, &'static str> {
     let RData::Rrsig {
+        type_covered,
         algorithm,
         labels,
         original_ttl,
@@ -349,15 +376,37 @@ pub fn verify_rrsig(
         return Err("DNSKEY is not a protocol-3 zone key");
     }
 
+    if dnskey.rr_type != RrType::DNSKEY
+        || rrsig.rr_type != RrType::RRSIG
+        || dnskey.name != *signer
+        || dnskey.class != rrsig.class
+        || !rrsig.name.is_subdomain_of(signer)
+        || records.is_empty()
+        || records
+            .iter()
+            .any(|r| r.name != rrsig.name || r.rr_type != *type_covered || r.class != rrsig.class)
+    {
+        return Ok(false);
+    }
     if *algorithm != *key_alg {
         return Ok(false);
     }
+    // Unsupported algorithms cannot produce a local cryptographic verdict,
+    // even when a time window is invalid. Do not mislabel them as Bogus.
+    if *algorithm != DnssecAlgorithm::RSASHA256 {
+        return Err("unsupported or deprecated DNSSEC algorithm");
+    }
     // Validity window (RFC 4034 §3.1.5).
-    if now_secs < *inception || now_secs > *expiration {
+    if !signature_time_valid(*inception, *expiration, now_secs) {
         return Ok(false);
     }
     // The RRSIG labels field must match the number of labels in the owner
     // (wildcards excepted; wildcards are not synthesized here).
+    if (*labels as usize) < rrsig.name.label_count() {
+        // Wildcard expansion needs authenticated denial proofs, which this
+        // validator does not implement. Do not call a valid wildcard bogus.
+        return Err("wildcard validation requires denial proofs");
+    }
     if *labels != rrsig.name.label_count() as u8 {
         return Ok(false);
     }
@@ -410,13 +459,8 @@ pub fn validate_rrset(
         return Verdict::Indeterminate;
     }
     if rrsigs.is_empty() {
-        // No signatures: an unsigned zone (Insecure) — unless the caller
-        // expected a signed zone, which it signals by providing keys.
-        return if dnskey_records.is_empty() {
-            Verdict::Insecure
-        } else {
-            Verdict::Bogus
-        };
+        // Absence of signatures is not an authenticated denial of DS.
+        return Verdict::Indeterminate;
     }
     let rec_refs: Vec<&Record> = records.iter().collect();
     let mut attempted = false;
@@ -450,7 +494,7 @@ pub fn validate_rrset(
                 continue;
             }
             match verify_rrsig(key, rrsig, &rec_refs, now_secs) {
-                Ok(true) => return Verdict::Secure,
+                Ok(true) => return Verdict::SignatureValid,
                 // The signature is well-formed for a supported algorithm and
                 // did not verify: this is a verdict of its own.
                 Ok(false) => attempted = true,
@@ -619,60 +663,38 @@ fn verify_section(
     rrsigs: &[Record],
     now_secs: u32,
 ) -> (Verdict, usize, usize) {
-    // Group data records by (owner, type).
-    let mut groups: alloc::collections::BTreeMap<(Name, RrType), Vec<Record>> =
-        alloc::collections::BTreeMap::new();
+    let mut groups: alloc::collections::BTreeMap<
+        (Name, RrType, crate::qtype::RrClass),
+        Vec<Record>,
+    > = alloc::collections::BTreeMap::new();
     for r in records {
         groups
-            .entry((r.name.clone(), r.rr_type))
+            .entry((r.name.clone(), r.rr_type, r.class))
             .or_default()
             .push(r.clone());
     }
-    if groups.is_empty() {
-        return (Verdict::Insecure, 0, 0);
-    }
-    let mut signed_groups = 0usize;
-    let mut authenticated = 0usize;
-    let mut all_secure = true;
-    let mut worst = Verdict::Insecure;
-    for ((owner, rr_type), group) in groups {
-        let covered = rrsigs_for(rrsigs, rr_type)
+    let total = groups.len();
+    let mut verified = 0;
+    let mut bogus = false;
+    for ((owner, rr_type, class), group) in groups {
+        let covered: Vec<Record> = rrsigs_for(rrsigs, rr_type)
             .into_iter()
-            .filter(|s| rrsig_signer(s) == Some(&owner) || s.name == owner)
-            .collect::<Vec<Record>>();
-        if covered.is_empty() {
-            // Unsigned group (typically a delegation's CNAME in an unsigned
-            // zone): nothing can authenticate it, so the chain is not fully
-            // authenticated.
-            all_secure = false;
-            continue;
-        }
-        signed_groups += 1;
+            .filter(|s| s.name == owner && s.class == class)
+            .collect();
         match validate_group(resolver, &group, &covered, now_secs) {
-            Verdict::Secure => authenticated += 1,
-            Verdict::Bogus => {
-                all_secure = false;
-                worst = Verdict::Bogus;
-            }
-            Verdict::Indeterminate => {
-                all_secure = false;
-                if worst == Verdict::Insecure {
-                    worst = Verdict::Indeterminate;
-                }
-            }
-            Verdict::Insecure => all_secure = false,
+            Verdict::SignatureValid => verified += 1,
+            Verdict::Bogus => bogus = true,
+            _ => {}
         }
     }
-    let verdict = if signed_groups > 0 && all_secure {
-        Verdict::Secure
-    } else if worst == Verdict::Bogus {
+    let verdict = if bogus {
         Verdict::Bogus
-    } else if signed_groups == 0 {
-        Verdict::Insecure
+    } else if total > 0 && total == verified {
+        Verdict::SignatureValid
     } else {
-        worst
+        Verdict::Indeterminate
     };
-    (verdict, signed_groups, authenticated)
+    (verdict, total, verified)
 }
 
 /// The verdict for a whole resolution, including its Authority section.
@@ -695,18 +717,11 @@ fn verify_chain(
     let authority_authenticated = if authorities.is_empty() {
         None
     } else {
-        // Only the SOA and the NSEC/NSEC3/NS material belongs to the
-        // negative answer; the rest of an Authority section is delegation
-        // data, which RFC 4035 does not ask us to authenticate as part of
-        // *this* response.
+        // Check every data RRset; unsigned authority data cannot be hidden
+        // by restricting the report to a subset of record types.
         let relevant: Vec<Record> = authorities
             .iter()
-            .filter(|r| {
-                matches!(
-                    r.rr_type,
-                    RrType::SOA | RrType::NSEC | RrType::NSEC3 | RrType::NS
-                )
-            })
+            .filter(|r| r.rr_type != RrType::RRSIG)
             .cloned()
             .collect();
         if relevant.is_empty() {
@@ -721,6 +736,8 @@ fn verify_chain(
                 verify_section(resolver, &relevant, &authority_sigs, now_secs);
             if authority_verdict == Verdict::Bogus {
                 verdict = Verdict::Bogus;
+            } else if authority_verdict != Verdict::SignatureValid && verdict != Verdict::Bogus {
+                verdict = Verdict::Indeterminate;
             }
             // Authenticated only when every group in it authenticated; a
             // Bogus or Indeterminate authority group cannot be waved
@@ -765,50 +782,9 @@ fn validate_group(
     if keys.is_empty() {
         return Verdict::Indeterminate;
     }
-    // The signature must verify against a key that is *also* covered by a DS
-    // in the parent zone; a key that verifies but is not anchored proves
-    // nothing about the delegation.
-    for key in &keys {
-        if verify_rrset_quietly(records, rrsigs, key, now_secs)
-            && key_is_anchored(resolver, &signer, key)
-        {
-            return Verdict::Secure;
-        }
-    }
-    // No anchored key verified: reuse the shared verdict logic so the
-    // distinction between "wrong signature" and "cannot be judged" stays in
-    // one place.
+    // Fetching an unauthenticated DS adds no chain trust. Do not spend
+    // another network query on a result that cannot establish an anchor.
     validate_rrset(records, rrsigs, &keys, now_secs)
-}
-
-/// [`validate_rrset`] for a single key: `true` only when a signature over
-/// `records` verifies with it.
-fn verify_rrset_quietly(
-    records: &[Record],
-    rrsigs: &[Record],
-    key: &Record,
-    now_secs: u32,
-) -> bool {
-    let rec_refs: Vec<&Record> = records.iter().collect();
-    for rrsig in rrsigs {
-        if matches!(verify_rrsig(key, rrsig, &rec_refs, now_secs), Ok(true)) {
-            return true;
-        }
-    }
-    false
-}
-
-fn key_is_anchored(resolver: &crate::resolver::Resolver, signer: &Name, key: &Record) -> bool {
-    // The DS for `signer` lives in the parent zone; querying `signer` for DS
-    // reaches the parent's authoritative data through the delegation.
-    match resolver.resolve(signer, RrType::DS) {
-        Ok(ds_res) => ds_res
-            .answers
-            .iter()
-            .filter(|r| r.rr_type == RrType::DS && r.name == *signer)
-            .any(|ds| dnskey_matches_ds(key, ds)),
-        Err(_) => false,
-    }
 }
 
 #[cfg(test)]
@@ -881,7 +857,7 @@ mod tests {
     /// reported as chain-anchored, and must never be advertised with `AD`.
     #[test]
     fn verification_without_an_anchor_is_never_chain_anchored() {
-        let s = Verdict::Secure.state(false);
+        let s = Verdict::SignatureValid.state(false);
         assert_eq!(s, ValidationState::CryptoVerified);
         assert!(s.is_signature_verified());
         assert!(
@@ -889,7 +865,7 @@ mod tests {
             "AD must not be set without an anchor"
         );
 
-        let s = Verdict::Secure.state(true);
+        let s = Verdict::SignatureValid.state(true);
         assert_eq!(s, ValidationState::CryptoVerified);
         assert!(!s.permits_authentic_data());
     }
@@ -950,7 +926,7 @@ mod tests {
     #[test]
     fn an_unauthenticated_authority_section_blocks_ad() {
         let v = Verification {
-            verdict: Verdict::Secure,
+            verdict: Verdict::SignatureValid,
             state: ValidationState::ChainAnchored,
             answer_groups: 1,
             answer_groups_authenticated: 1,
@@ -990,5 +966,144 @@ mod tests {
         // verdict in either direction.
         let v = validate_rrset(&[], &[], &[], 0);
         assert_eq!(v, Verdict::Indeterminate);
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+    use crate::qtype::RrClass;
+
+    #[test]
+    fn unsupported_algorithm_with_expired_window_stays_indeterminate() {
+        let name = Name::from_ascii("example.test").unwrap();
+        let data = Record {
+            name: name.clone(),
+            rr_type: RrType::A,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::A("192.0.2.1".parse().unwrap()),
+        };
+        let public_key = vec![1; 64];
+        let key = Record {
+            name: name.clone(),
+            rr_type: RrType::DNSKEY,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::Dnskey {
+                flags: 256,
+                protocol: 3,
+                algorithm: DnssecAlgorithm::ECDSAP256SHA256,
+                public_key: public_key.clone(),
+            },
+        };
+        let sig = Record {
+            name: name.clone(),
+            rr_type: RrType::RRSIG,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::Rrsig {
+                type_covered: RrType::A,
+                algorithm: DnssecAlgorithm::ECDSAP256SHA256,
+                labels: 2,
+                original_ttl: 60,
+                inception: 0,
+                expiration: 1,
+                key_tag: key_tag(256, 3, 13, &public_key),
+                signer: name,
+                signature: vec![0; 64],
+            },
+        };
+        assert_eq!(
+            validate_rrset(&[data], &[sig], &[key], 100),
+            Verdict::Indeterminate
+        );
+    }
+
+    #[test]
+    fn serial_time_window_crosses_u32_wrap() {
+        for now in [u32::MAX - 5, u32::MAX, 0, 5] {
+            assert!(signature_time_valid(u32::MAX - 5, 5, now));
+        }
+        assert!(!signature_time_valid(u32::MAX - 5, 5, 6));
+        assert!(!signature_time_valid(u32::MAX - 5, 5, u32::MAX - 6));
+        assert!(!signature_time_valid(0, 1 << 31, 1));
+    }
+
+    #[test]
+    fn local_crypto_cannot_promote_resolution_or_cache_trust() {
+        let report = Verification {
+            verdict: Verdict::SignatureValid,
+            state: ValidationState::CryptoVerified,
+            answer_groups: 1,
+            answer_groups_authenticated: 1,
+            authority_authenticated: Some(true),
+        };
+        assert!(report.checked_signature_state().unwrap());
+        assert!(!report.checked_authentication().unwrap());
+        assert_eq!(Verification::empty().verdict, Verdict::Indeterminate);
+    }
+
+    #[test]
+    fn canonical_order_uses_rdata_not_length() {
+        let name = Name::from_ascii("example.test").unwrap();
+        let first = Record {
+            name: name.clone(),
+            rr_type: RrType::CNAME,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::Cname(Name::from_ascii("a.long.example").unwrap()),
+        };
+        let second = Record {
+            rdata: RData::Cname(Name::from_ascii("z.test").unwrap()),
+            ..first.clone()
+        };
+        let first_wire = canonical_rrset(&name, &[&first], 60);
+        let second_wire = canonical_rrset(&name, &[&second], 60);
+        assert!(first_wire.len() > second_wire.len());
+        assert_eq!(
+            canonical_rrset(&name, &[&second, &first], 60),
+            [first_wire, second_wire].concat()
+        );
+    }
+
+    #[test]
+    fn ds_digest_does_not_override_record_identity() {
+        let name = Name::from_ascii("example.test").unwrap();
+        let public_key = vec![1, 3, 1];
+        let mut wire = Vec::new();
+        name.write_wire(&mut wire);
+        wire.extend_from_slice(&[1, 0, 3, 8]);
+        wire.extend_from_slice(&public_key);
+        let key = Record {
+            name: name.clone(),
+            rr_type: RrType::DNSKEY,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::Dnskey {
+                flags: 256,
+                protocol: 3,
+                algorithm: DnssecAlgorithm::RSASHA256,
+                public_key: public_key.clone(),
+            },
+        };
+        let mut ds = Record {
+            name,
+            rr_type: RrType::DS,
+            class: RrClass::IN,
+            ttl: 60,
+            rdata: RData::Ds {
+                key_tag: key_tag(256, 3, 8, &public_key),
+                algorithm: DnssecAlgorithm::RSASHA256,
+                digest_type: DsDigestType::SHA256,
+                digest: sha256(&wire).to_vec(),
+            },
+        };
+        assert!(dnskey_matches_ds(&key, &ds));
+        ds.name = Name::from_ascii("other.test").unwrap();
+        assert!(!dnskey_matches_ds(&key, &ds));
+        ds.name = key.name.clone();
+        ds.class = RrClass::CH;
+        assert!(!dnskey_matches_ds(&key, &ds));
     }
 }

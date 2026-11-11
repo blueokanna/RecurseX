@@ -1,5 +1,8 @@
 # RecurseX wiki
 
+> Version: **0.2.6**. The current contracts are the conditional union bound, disabled-by-default stale service, explicit DNSSEC limitations and loopback-only listener access unless additional CIDRs are configured.
+
+
 A predictive adaptive recursive DNS resolver. The short story is in the
 [README](../README.md); this wiki goes one level deeper into how the pieces
 actually work and why they are shaped the way they are.
@@ -44,14 +47,10 @@ gate, and how ECS partitions the key space.
 Chinese versions of the core pages are available as `*-zh.md` next to these
 files.
 
-## Ground rules (read this first)
+## Operating boundaries
 
-1. **TTL is never invented.** Every prediction the resolver makes only tunes
-   *internal* policy. The TTL a client sees is exactly what the authority
-   returned (minus elapsed time for cached data).
-2. **Nothing unbounded.** Every model in this crate has a hard cap. A hostile
-   query stream can make the resolver busy, but it cannot make it grow
-   without bound.
-3. **No faked transports.** Every transport ships a real, usable
-   implementation. If a layer were only a stub, the crate would say so
-   instead of pretending.
+Normal cache answers age the authoritative TTL; explicitly enabled stale service
+uses the configured positive response TTL. Defaults bound resource use, but an
+explicit unlimited connection setting and volumetric attacks still require operator
+controls. Transport implementation is not proof of universal interoperability;
+DoQ remains experimental.

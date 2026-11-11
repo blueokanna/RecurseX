@@ -1,5 +1,8 @@
 # Beyond the lookup
 
+> Version: **0.2.6**. The old staleness-proof and weakest-link claims are withdrawn. The implemented model supplies predictions and bounded scheduling, not network-level authenticity or availability proofs.
+
+
 A proposal was put to this project: replace destination-addressed routing with a
 **behavioural hash**, replace deterministic resolution with **probabilistic
 superposition**, make the **name itself the route**, and replace caching with
@@ -157,22 +160,11 @@ novel proposition, and a patent claim to it would be read against that body of
 work on the first office action. Presenting it here as an unclaimed break with
 the axioms would be a factual error about the field.
 
-**What is real and already in this crate.** The parts of the idea that are
-standards-track and genuinely usable:
-
-* **The cache is keyed on names, not addresses.** `CacheKey` is
-  `(name, type, class, ECS partition)`. A CNAME chain and an NXDOMAIN for the
-  same name live in different structures under the same key space.
-* **A name can carry its own steering parameters**, inside DNS, today:
-  **SVCB / HTTPS** (RFC 9460) expresses `ipv4hint`, `ipv6hint`, ALPN, port
-  overrides and `mandatory` parameters — the closest thing to "the name contains
-  the route" that a client can act on without a new internet.
-* **Intent is already a first-class layer** in this crate: `policy.rs` and
-  `routing.rs` implement `nameserver-policy`, `fallback-filter`, `hosts` and
-  fake-IP, which is policy routing by name.
-
-No new mechanism is claimed for this item. The honest contribution is that the
-resolver implements the standards-track version of it.
+The implementation provides observable-change predictions, bounded evidence
+and bounded refresh scheduling. It does not prove continuous correctness between
+samples. Dependency aggregation uses a conditional union bound; refreshing a
+non-minimal member can help. The earlier claims of provable staleness and
+bottleneck-only benefit are withdrawn; see [the corrected model](Refresh-Theory.md).
 
 ---
 

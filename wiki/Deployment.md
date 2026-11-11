@@ -1,106 +1,75 @@
-# Deployment & hardening
+# Deployment and failure boundaries
 
-## Running it
+Version: **0.2.6**.
 
-The client-facing `Server` binds UDP and TCP (plain DNS). The JSON config
-(`config::Config`) covers listen addresses, cache sizes, engine behavior,
-policy, forwarders and persistence. A minimal systemd-style deployment:
+## Listener and lifecycle
 
-```json
-{
-  "listen": [{ "addr": "0.0.0.0:53", "proto": "udp" }],
-  "listen": [{ "addr": "0.0.0.0:53", "proto": "tcp" }],
-  "cache": { "hotCapacity": 2048, "warmCapacity": 131072 },
-  "engine": {
-    "qnameMinimization": true,
-    "use0x20": true,
-    "dnssec": true
-  },
-  "persist": { "path": "/var/lib/recursex/cache.rxc", "saveIntervalMs": 60000 }
-}
-```
+`Server::new` accepts loopback clients only, even when bound to `0.0.0.0` or `::`.
+LAN service must configure `ServerConfig::allowed_clients` with explicit `IpCidr`
+networks. IPv4-mapped IPv6 peers are normalized at this access check. UDP rejects
+unapproved clients before queuing; TCP rejects them before allocating a handler.
+This ACL is programmatic; `Config` JSON does not currently expose `allowed_clients`.
 
-Note the example above shows two listen entries; in practice a single entry
-with `"proto": "udp"` plus `Server::bind_tcp` on the same port covers both.
+Bind UDP and TCP to the same port. In particular, when requesting port zero, use the
+address returned by `bind_udp` for `bind_tcp`. If either bind fails, shut down and
+join the partially started server. Client-side encrypted listeners are not provided.
 
-Run the maintenance loop (`spawn_maintenance`) so sweeps, graph pruning and
-predictive prefetch actually happen, and so the persistent tier is written on
-schedule.
+Run `spawn_maintenance()` explicitly for prefetch, sweeps and scheduled persistence.
+For shutdown, signal the server and resolver, then join the server and maintenance
+handles. Socket and queue loops poll shutdown at 100 ms intervals; a resolution
+already in progress can take its remaining upstream deadline. Shutdown is not an
+instantaneous cancellation of blocking dependency I/O.
 
-## Stopping it
+## Resource limits
 
-Both the server and the resolver have a shutdown path, and a deployment
-should use it: dropping the process without it leaves the `persist` snapshot
-up to one `saveIntervalMs` old, and leaves connection state to the OS.
+Defaults: 2 UDP receivers, 8 UDP handlers, 1024 queued datagrams, 1024 concurrent TCP
+connections and a 30-second TCP idle timeout. The configured UDP receive-buffer size
+is honored and clamped to 512..65535 bytes. Mobile embedders should set smaller queue
+and thread limits. A TCP limit of zero explicitly disables that cap; do not use it
+on an untrusted network. In-message reads have a deadline, so a slow byte stream
+cannot keep a connection alive indefinitely by continually resetting an idle timer.
 
-```rust
-// SIGTERM handler, or the end of main:
-server.shutdown();      // every loop stops within 100 ms
-resolver.shutdown();
-server.join();          // returns once the threads have exited
-```
+Per-source token buckets are best effort: forged source addresses can evade them.
+EDNS negotiation limits response size, not the response/request amplification ratio.
+Keep recursive service behind source validation, firewall policy and appropriate
+network rate limits. Allowing `0.0.0.0/0` or `::/0` explicitly opens recursion to the
+world; the in-process limits do not make this safe against volumetric attacks.
 
-Shutdown is a flag, not a signal: the UDP receivers wake on their socket
-timeout, the handler pool on its queue timeout, the TCP accept loop is
-released by a self-connect (so it does not wait for a real client) and each
-connection reader on its own socket timeout. The maintenance loop stops
-sleeping in at most 100 ms slices and writes a final snapshot on the way out,
-so the next start restores from a fresh file even if the last scheduled save
-had not fired yet.
+## Upstream behavior
 
-Two client-facing bounds protect the thread budget:
+Pure recursion needs reachable authoritative UDP/TCP port 53. If a network drops,
+redirects or restricts it, transport recovery cannot make that path universally work.
+Configure acceptable forwarding alternatives deliberately; a privacy-constrained
+route never silently escapes to an unconfigured public resolver.
 
-- **TCP idle timeout** (`tcp_idle_timeout_ms`, default 30 s): a connection
-  that sends nothing between messages is closed (RFC 7766 section 6.2.3
-  recommends exactly this instead of holding an idle client forever).
-- **Message deadline**: a client that dribbles a message one byte at a time
-  cannot hold a reader past the idle timeout either, because the in-message
-  deadline is capped at the smaller of 10 s and the idle timeout.
+Authority attempts reserve time for alternatives. UDP timeout or truncation can retry
+TCP within the same deadline; truncated TCP is not accepted. A failed loopback
+forwarder with alternatives is avoided for five seconds; network-generation changes
+clear this cooldown. Valid negative answers do not penalize endpoint availability.
 
-## Security model
+DoT/DoH/DoH3/DoQ require configured trust roots and verified identity. JSON uses
+`forwarderCaFile`; library callers use `EngineConfig::forwarder_roots` or
+`set_forwarder_roots(roots, true)`. DoT/DoQ can separate connection IP and TLS name.
+Current Courierust HTTP APIs cannot do that for DoH/DoH3: `host` must match `ip` as an
+IP literal, with matching certificate IP identity. Unsupported combinations fail
+configuration instead of silently dialing a different address. Redirects are refused.
+DoQ remains experimental: public interoperability, congestion control and migration
+are not established deployment guarantees.
 
-- **Rate limiting**: a token-bucket limiter per client IP (`client_qps` /
-  `client_burst`), with a bounded bucket table so a spoofed-source flood
-  cannot grow memory.
-- **Anti-spoofing**: every upstream response is checked against the query —
-  transaction ID *and* question echo — and the ID and the 0x20 casing come from
-  a **ChaCha20 counter-mode CSPRNG**, not from a fast non-cryptographic mixer.
-  RFC 5452 §9.2 is explicit that the guessability of the ID is the security
-  parameter here: a predictable generator makes the 65 536 IDs and the port
-  space decorative. The generator is re-keyed after every 1 MiB of keystream
-  (`DEFAULT_REKEY_BYTES`) — a volume bound rather than a draw-count bound,
-  because a count bounds it only indirectly and differently for 0x20-heavy
-  traffic. Non-cryptographic mixing (SplitMix64) is still used where guessing
-  buys an attacker nothing — eviction sampling and test fixtures — and is
-  documented as such.
-- **Bailiwick discipline**: only in-zone data may be cached from a response.
-  Out-of-zone glue is used transiently, never cached as authoritative.
-- **DNSSEC**: with `dnssec` enabled, answers are placed on a four-state ladder —
-  `Indeterminate` (no usable anchor or signature), `Insecure` (proven
-  unsigned), `CryptoVerified` (signature checked, DS chain not anchored), and
-  `ChainAnchored` (the chain reaches a configured trust anchor). Only the last
-  state sets `AD`, because only that state is a claim about the delegation chain
-  and not merely about the bytes in this message.
-- **Filtering**: policy `block` rules drop queries under the listed names.
+Security randomness uses OS-seeded ChaCha20 and rekeys after 1 MiB of output.
+SplitMix64 is for non-security sampling and deterministic tests. Upstream source,
+transaction ID and question identity checks remain necessary alongside randomness.
+See [DNSSEC](DNSSEC.md) for why local signature success cannot assert AD.
 
-## Operational notes
+## Observations and diagnosis
 
-- The UDP transport validates the source address of every response; on
-  Windows, "connection reset" on a connected UDP socket is treated as a
-  transient event (it is how the OS surfaces ICMP errors), not a fatal
-  connection state.
-- Timeouts: per-server attempt budgets and a global attempt budget bound the
-  worst case for a pathological zone; `timeout_ms` bounds each exchange.
-- The resolver never blocks on upstream in the request path for cache hits;
-  misses and stale-refresh go through the coalescer, so duplicate concurrent
-  queries share one upstream exchange.
+Collection is off until `observation::configure(capacity)`; capacity is capped at 512.
+Snapshots report completed resolver calls, not packet counts. Nested calls can appear
+separately; each event retains at most eight 256-byte answer summaries. Contention
+drops observations rather than blocking resolution. `configure(0)` disables and
+clears the ring. History is not persisted and clearing it does not clear the cache.
 
-## Limits to know before you trust it
-
-- DoT/DoH/DoH3/DoQ are **upstream** transports; the client-facing server is
-  plain UDP/TCP. Terminate TLS in front of it if you need encrypted client
-  transport.
-- DoQ ships a from-scratch RFC 9250 client (QUIC v1 + QUIC-TLS 1.3) as the
-  default transport, so encrypted upstream forwarding works out of the box;
-  a custom QUIC stack can still be plugged in through the `DoqProvider` trait.
-- DNSSEC is RSA/SHA-256; ECDSA chains resolve as `Indeterminate`.
+Test UDP and TCP separately, then a cold recursive answer, a cache hit, an authoritative
+negative and a configured fallback. Distinguish DNS response codes, transport errors,
+certificate failures and work-budget exhaustion. A bound listener proves only that
+the socket opened, not that authoritative resolution is reachable.
