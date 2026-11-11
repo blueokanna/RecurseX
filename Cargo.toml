@@ -28,7 +28,7 @@ exclude = [
 [features]
 default = ["std", "dot", "doh", "doh3", "doq", "dnssec", "persist"]
 std = ["dep:courierust", "courierust/std"]
-dnssec = ["std", "dep:courierust"]
+dnssec = ["std", "dep:courierust", "dep:ring"]
 dot = ["std", "dep:courierust"]
 doh = ["std", "dep:courierust"]
 doh3 = ["std", "doh"]
@@ -36,6 +36,7 @@ doq = ["std", "dep:courierust"]
 persist = ["std", "dep:rustbinary"]
 
 [dependencies]
+ring = { version = "0.17.14", default-features = false, features = ["std"], optional = true }
 nextjson = { version = "0.1.5", default-features = false, features = [
     "derive",
 ] }

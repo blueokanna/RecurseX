@@ -1,51 +1,104 @@
-# DNSSEC: signature checks and the trust boundary
+# DNSSEC authentication
 
-Version: **0.2.6**.
+Enable validation with `{"engine":{"dnssec":true}}`. Rust **1.78** remains the
+minimum supported version. The optional ring 0.17.14 dependency supplies
+cryptographic verification; all network requests use RecurseX's existing path.
 
-RecurseX currently implements RSA/SHA-256 signature verification (algorithm 8),
-SHA-256 DS matching and canonical RRset construction. It does **not** implement a
-complete validating recursive resolver: there is no installed root trust anchor,
-authenticated parent-DS walk, NSEC/NSEC3 denial validation or wildcard denial proof.
-ECDSA 13/14 and EdDSA 15/16 are recognized but unsupported.
+## Root-to-answer chain
 
-| Result | Meaning in this release |
-|---|---|
-| `SignatureValid` | The signature is mathematically consistent with a fetched/supplied key. The key is not authenticated. |
-| `Indeterminate` | Missing evidence, unsupported algorithm, unsigned data without authenticated denial, or unsupported wildcard proof. |
-| `Bogus` | A supported, applicable signature failed local checks. This is not proof that the zone was securely delegated. |
-| `Insecure` | Reserved for an authenticated unsigned delegation; the current validator does not produce it. |
+The built-in IANA root DS anchors are 20326 (KSK-2017) and 38696 (KSK-2024,
+activated on 11 October 2026). The validator authenticates the root DNSKEY RRset
+with an anchor-matching key, verifies each parent DS RRset, matches the child's
+key to that DS, authenticates the complete child DNSKEY RRset, and verifies the
+answer with its authenticated zone keys. Multiple DS/DNSKEY records and KSK/ZSK
+separation are supported, including overlapping key rollovers.
 
-`Verdict::Secure` remains a deprecated compatibility constant for `SignatureValid`.
-Code should use the explicit name. `ValidationState::CryptoVerified` describes only
-local cryptography; `ChainAnchored` requires a complete chain and is never emitted
-by the current validator. The legacy `anchored` boolean cannot promote a result.
+| Result | Behavior |
+| --- | --- |
+| `ChainAnchored` | Required answer, authority and denial proofs authenticate; `Resolution.validated=true`. |
+| `Insecure` | Authenticated unsigned delegation, NSEC3 opt-out, or authenticated DS with only unsupported algorithms/digests; return data with AD clear. |
+| `Indeterminate` | Missing anchors/material or exhausted validation resources; validation-enabled resolution fails with `ErrorKind::Dnssec`. |
+| `Bogus` verdict | Invalid/expired signatures, missing signatures in a secure zone, broken DS/DNSKEY links or invalid denial; reject before answer-cache admission. |
 
-`Verification::checked_signature_state()` reports local signature success.
-The resolver uses `checked_authentication()` for `Resolution.validated` and cache
-trust. Consequently local success leaves `validated=false`, and emitted responses
-never assert AD. Historical `answer_groups_authenticated` and
-`authority_authenticated` fields count local signature checks, not trusted chains.
-Every owner/type/class group is counted, including unsigned groups.
+`SignatureValid`/`CryptoVerified` still describe local verification against
+supplied keys, not zone identity. Neither the deprecated `Verdict::Secure` alias
+nor the legacy `dnssec_anchored` flag can elevate trust.
 
-Verification binds DNSKEY owner and class to the signer, checks protocol 3 and the
-zone-key flag, and binds every covered record to the RRSIG owner, type and class.
-The signer must enclose the owner. DS matching checks owner, class, record types,
-key tag and digest; matching an unauthenticated DS is still not anchoring.
-The resolver no longer fetches DS solely to give local verification a stronger name.
+## Coverage
 
-Canonical RRsets sort by RDATA octets, not by the preceding RDLENGTH.
-Signature time windows use 32-bit serial arithmetic, including wraparound; ambiguous
-windows of half the serial space or more are rejected. Wildcard expansion is
-indeterminate, rather than incorrectly reporting a valid wildcard signature as bogus.
+- RSA/SHA-256 (8), RSA/SHA-512 (10), ECDSA P-256/SHA-256 (13),
+  ECDSA P-384/SHA-384 (14), Ed25519 (15); SHA-256 (2) and SHA-384 (4) DS digests.
+- Owner/class, DNSKEY protocol and zone-key/revocation flags, algorithm and key
+  tags; canonical RRset sorting/deduplication and 32-bit serial signature times.
+- NSEC/NSEC3 NXDOMAIN, NODATA, closest-encloser, wildcard and unsigned-delegation
+  proofs, including NSEC3 opt-out. An SOA alone cannot authenticate denial.
+- CNAME chains and DNAME-authenticated synthesized CNAMEs. An insecure link
+  prevents AD on the combined answer.
+- AD requires complete authentication, CD clear, and a client AD or DO request.
+  CD permits unchecked data but never AD. Upstream AD is not trusted.
+  Ordinary non-DO responses omit DNSSEC denial records and signatures.
 
-DNSKEY subqueries suppress nested validation on the same thread to bound recursion.
-The guard is thread-local, so an unrelated worker does not skip checks. Invalid
-signatures fail before cache admission and are rechecked on reuse. Unsupported or
-missing evidence remains indeterminate and is not silently relabeled secure.
+## Evidence and limits
 
-For applications requiring authenticated answers, this release's local verifier
-does not satisfy that requirement. A validating upstream can supply answers, but
-RecurseX does not convert an upstream AD bit into a locally validated chain.
+DNSKEY/DS fetches share the client's routing, privacy, wire-work budget and
+deadline. They bypass client in-flight coalescing to avoid self-waits. NS address
+lookups needed to reach evidence are routing hints: they do not recursively
+validate or populate the client answer cache during validation.
+
+A private 256-entry cache retains complete, fresh response/proof evidence.
+Material is admitted after authentication. Reuse rechecks signatures and the
+chain; ordinary/persisted `validated` flags are not proof. Negative and wildcard
+answers retain their authority proofs. Response TTLs cannot outlive authenticated
+chain material or signatures. Expired evidence is discarded.
+
+Each validation permits at most 128 material lookups, 128 eligible signature/key
+checks, 8 candidate signatures per RRset, 64 DNSKEYs per set and 64 denial records
+per proof. NSEC3 permits at most 150 iterations and 10,000 hash rounds per proof.
+The shared query budget can stop work sooner. Exceeding a limit fails closed.
+
+## Trust-anchor configuration
+
+Omitting `dnssecTrustAnchors` uses the built-in set. An explicit array **replaces**
+it; an empty array cannot establish trust. Example using KSK-2024:
+
+```json
+{
+  "engine": {
+    "dnssec": true,
+    "dnssecTrustAnchors": [{
+      "name": ".",
+      "keyTag": 38696,
+      "algorithm": 8,
+      "digestType": 2,
+      "digest": "683d2d0acb8c9b712a1948b27f741219298d0a450d612c483af444a4c0fb2b16"
+    }]
+  }
+}
+```
+
+Library callers can supply DS or DNSKEY `Record`s through
+`EngineConfig::dnssec_trust_anchors`, including private-zone anchors. Configuring
+validation without the `dnssec` feature is rejected.
+
+Anchors are static operator configuration. **Automatic RFC 5011 maintenance is
+not implemented**: future rollovers require trusted software/configuration
+updates. Ed448 and deprecated algorithms are not verified. Resource limits
+deliberately reject unusually expensive chains. This implementation has not had
+an independent security audit; hermetic tests do not establish interoperability
+with every authoritative server.
+
+## Tests
+
+`tests/dnssec_chain.rs` covers signed root/TLD/child zones, KSK/ZSK separation,
+rollover, SHA-384 DS, all five algorithms, proof/cache reuse, negative and
+wildcard proofs, aliases, CD/AD, tampering, expiration and work limits.
+`tests/dnssec_fail_closed.rs` covers invalid signatures in caches and forwarded
+answers. CI runs Rust 1.78/stable on Linux/Windows and a `dnssec`-only build.
+These tests do not depend on public DNS.
 
 References: [RFC 4034](https://www.rfc-editor.org/rfc/rfc4034),
-[RFC 4035](https://www.rfc-editor.org/rfc/rfc4035).
+[RFC 4035](https://www.rfc-editor.org/rfc/rfc4035),
+[RFC 5155](https://www.rfc-editor.org/rfc/rfc5155),
+[RFC 6840](https://www.rfc-editor.org/rfc/rfc6840),
+[RFC 9718](https://www.rfc-editor.org/rfc/rfc9718),
+[IANA root anchors](https://www.iana.org/dnssec/files).

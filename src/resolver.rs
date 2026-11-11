@@ -79,9 +79,12 @@ pub struct EngineConfig {
     pub edns_udp_size: u16,
     /// Whether to request and validate DNSSEC.
     pub dnssec: bool,
-    /// Legacy compatibility flag. Ignored: only a completed chain validator
-    /// may establish root-anchored authentication, which is not implemented.
+    /// Legacy compatibility flag. Ignored: trust is established by the chain.
     pub dnssec_anchored: bool,
+    /// Trusted DS or DNSKEY records. Defaults to IANA's 2017 and 2024 root KSKs.
+    /// An empty set fails closed when validation is enabled.
+    #[cfg(feature = "dnssec")]
+    pub dnssec_trust_anchors: Vec<Record>,
     /// The per-resolution work envelope.
     ///
     /// Bounded *work*, not just bounded depth: the NXNS shape defeats a
@@ -142,6 +145,8 @@ impl Default for EngineConfig {
             edns_udp_size: 1232,
             dnssec: false,
             dnssec_anchored: false,
+            #[cfg(feature = "dnssec")]
+            dnssec_trust_anchors: crate::dnssec::default_trust_anchors(),
             fetch_limits: crate::budget::FetchLimits::default(),
             tcp_fallback: true,
             retransmit_budget: 2,
@@ -861,6 +866,8 @@ pub struct ResolverInner {
     pub transports: Transports,
     /// The statistics counters.
     pub stats: Stats,
+    #[cfg(feature = "dnssec")]
+    dnssec_evidence: Mutex<crate::dnssec::EvidenceCache>,
     /// The forwarding upstream set.
     #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
     pub forwarder_set: Mutex<Arc<crate::forward::ForwarderSet>>,
@@ -972,6 +979,8 @@ impl Resolver {
                 clock,
                 transports: Transports::new(),
                 stats: Stats::default(),
+                #[cfg(feature = "dnssec")]
+                dnssec_evidence: Mutex::new(crate::dnssec::EvidenceCache::default()),
                 #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
                 forwarder_set: Mutex::new(Arc::new(forwarder_set)),
                 inflight: Mutex::new(Inflight::new(config.max_inflight)),
@@ -1016,13 +1025,13 @@ impl Resolver {
         self.inner.rng_rekeys.load(Ordering::Relaxed)
     }
 
-    /// Local signature verification never implies a root-anchored chain.
+    /// `validated` is set only after complete chain authentication.
     /// The legacy configuration boolean has no authority to elevate trust.
     #[cfg(feature = "dnssec")]
     fn trust_level(&self, validated: bool) -> crate::risk::TrustLevel {
         use crate::dnssec::ValidationState;
         let state = if validated {
-            ValidationState::CryptoVerified
+            ValidationState::ChainAnchored
         } else {
             ValidationState::Insecure
         };
@@ -1126,6 +1135,11 @@ impl Resolver {
     }
 
     fn resolve_key_inner(&self, key: &QueryKey) -> Result<Resolution> {
+        if self.inner.config.engine.dnssec && !cfg!(feature = "dnssec") {
+            return Err(Error::config(
+                "DNSSEC validation requires the dnssec feature",
+            ));
+        }
         if key.class != crate::qtype::RrClass::IN {
             return Err(Error::new(
                 ErrorKind::Policy,
@@ -1391,7 +1405,11 @@ impl Resolver {
             qr: true,
             rd: query.flags.rd,
             ra: true,
-            ad: false,
+            ad: cfg!(feature = "dnssec")
+                && self.inner.config.engine.dnssec
+                && res.validated
+                && !query.flags.cd
+                && (want_dnssec || query.flags.ad),
             cd: query.flags.cd,
             rcode: res.rcode,
             ..HeaderFlags::default()
@@ -1411,6 +1429,9 @@ impl Resolver {
             }
         }
         for r in &res.authorities {
+            if !want_dnssec && matches!(r.rr_type, RrType::RRSIG | RrType::NSEC | RrType::NSEC3) {
+                continue;
+            }
             let mut rec = r.clone();
             rec.ttl = res.ttl;
             m.authorities.push(rec);
@@ -1498,15 +1519,20 @@ impl Resolver {
             }
         };
         res.served_at = now;
+        #[cfg(feature = "dnssec")]
+        if crate::dnssec::validation_active() {
+            // NS-address lookups used to reach evidence are routing hints.
+            // They must not recursively validate or seed the answer cache.
+            return Ok(res);
+        }
 
         #[cfg(feature = "dnssec")]
         if self.inner.config.engine.dnssec && !key.cd {
-            let v = crate::dnssec::validate_resolution_detailed(
-                self,
-                &res,
-                self.inner.config.engine.dnssec_anchored,
-            );
-            res.validated = v.checked_authentication()?;
+            crate::dnssec::authenticate(self, &mut res)?;
+            self.inner
+                .dnssec_evidence
+                .lock()
+                .insert(key.cache_key(), &res, now);
         }
 
         self.cache_resolution(key, &res, now);
@@ -1621,6 +1647,56 @@ impl Resolver {
         Ok(crate::forward::response_to_resolution(key, &resp))
     }
 
+    /// Fetch DNSSEC evidence without re-entering client coalescing or trusting
+    /// ordinary cache metadata. Network I/O retains the current task envelope.
+    #[cfg(feature = "dnssec")]
+    pub(crate) fn resolve_dnssec_material(
+        &self,
+        name: &Name,
+        rr_type: RrType,
+    ) -> Result<Resolution> {
+        let key = QueryKey {
+            name: name.clone(),
+            rr_type,
+            class: RrClass::IN,
+            ecs: None,
+            want_dnssec: true,
+            cd: true,
+        };
+        let now = self.now();
+        if let Some(res) = self.inner.dnssec_evidence.lock().get(&key.cache_key(), now) {
+            return Ok(res);
+        }
+        let deadline = Deadline {
+            at: crate::background::task_deadline()
+                .unwrap_or_else(|| Deadline::after(self.inner.config.engine.query_budget_ms).at),
+        };
+        let mut budget = crate::budget::FetchBudget::new(self.inner.config.engine.fetch_limits);
+        #[cfg(any(feature = "dot", feature = "doh", feature = "doh3", feature = "doq"))]
+        if self.forward_route(&key).is_some() {
+            let res = self.forward_resolve(&key)?;
+            return Ok(res);
+        }
+        if self.inner.config.dns.privacy.encrypted_only {
+            return Err(Error::config(
+                "strict DNS privacy prohibits iterative DNSSEC fetches",
+            ));
+        }
+        let res = self.iterative_resolve(&key, 0, deadline, &mut budget)?;
+        Ok(res)
+    }
+
+    #[cfg(feature = "dnssec")]
+    pub(crate) fn cache_dnssec_material(&self, res: &Resolution, ttl: u32) {
+        let mut res = res.clone();
+        res.ttl = res.ttl.min(ttl);
+        let key = CacheKey::plain(res.name.clone(), res.rr_type, res.class);
+        self.inner
+            .dnssec_evidence
+            .lock()
+            .insert(key, &res, self.now());
+    }
+
     /// Attempt to satisfy a query purely from cache, walking CNAME chains.
     /// Returns `None` when the chain cannot be completed from cache.
     fn resolve_from_cache(
@@ -1629,6 +1705,20 @@ impl Resolver {
         now: Ts,
         cache_policy: ResolutionCachePolicy,
     ) -> Option<Result<Resolution>> {
+        #[cfg(feature = "dnssec")]
+        if crate::dnssec::validation_active() {
+            return None;
+        }
+        #[cfg(feature = "dnssec")]
+        if self.inner.config.engine.dnssec && !key.cd {
+            let evidence = self.inner.dnssec_evidence.lock().get(&key.cache_key(), now);
+            if let Some(mut res) = evidence {
+                if let Err(error) = crate::dnssec::authenticate(self, &mut res) {
+                    return Some(Err(error));
+                }
+                return Some(Ok(res));
+            }
+        }
         let planner = ResolutionPlanner::new(self.inner.config.planner);
         let mut current = key.clone();
         let mut answers: Vec<Record> = Vec::new();
@@ -1807,11 +1897,32 @@ impl Resolver {
         let cached = {
             let mut cached = cached;
             if self.inner.config.engine.dnssec && !key.cd {
-                match crate::dnssec::validate_resolution_detailed(self, &cached, false)
-                    .checked_authentication()
+                // Ordinary/persisted caches have no complete denial or wildcard
+                // evidence. Re-fetch those answers, never infer trust from a bit.
+                if cached.answers.is_empty()
+                    || cached.rcode == Rcode::NXDOMAIN
+                    || cached.answers.iter().any(|r| {
+                        r.rr_type == RrType::CNAME
+                            && !cached.rrsigs.iter().any(|s| {
+                                s.name == r.name
+                                    && matches!(
+                                        &s.rdata,
+                                        RData::Rrsig {
+                                            type_covered: RrType::CNAME,
+                                            ..
+                                        }
+                                    )
+                            })
+                    })
+                    || cached.rrsigs.iter().any(|s| {
+                        matches!(&s.rdata,
+                    RData::Rrsig { labels, .. } if usize::from(*labels) < s.name.label_count())
+                    })
                 {
-                    Ok(verified) => cached.validated = verified,
-                    Err(error) => return Some(Err(error)),
+                    return None;
+                }
+                if let Err(error) = crate::dnssec::authenticate(self, &mut cached) {
+                    return Some(Err(error));
                 }
             }
             cached
@@ -1918,7 +2029,7 @@ impl Resolver {
             if referrals > self.inner.config.engine.max_referrals {
                 return Err(Error::internal("referral loop during resolution"));
             }
-            if depth > 0 {
+            if depth > 0 && !self.inner.config.engine.dnssec {
                 let ck = key
                     .cache_key()
                     .with_ecs(crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope));
@@ -1944,7 +2055,9 @@ impl Resolver {
             let query_name = match minimized.take() {
                 Some(q) => q,
                 None => {
-                    if self.inner.config.engine.qname_minimization {
+                    if self.inner.config.engine.qname_minimization
+                        && !matches!(current_type, RrType::DS | RrType::DNSKEY)
+                    {
                         minimized_name(&current_name, &zone)
                     } else {
                         current_name.clone()
@@ -1989,6 +2102,7 @@ impl Resolver {
                     }
                     answers.extend(keep);
                     rrsigs.extend(sigs);
+                    authorities.extend(resp.authorities.iter().cloned());
                     break;
                 }
                 ResponseKind::Cname {
@@ -2002,26 +2116,29 @@ impl Resolver {
                     ttl = ttl.min(record.ttl);
                     answers.push(record.clone());
                     rrsigs.extend(sigs);
-                    let mut set =
-                        RrSet::new(record.name.clone(), RrType::CNAME, key.class, record.ttl);
-                    set.add_record(record);
-                    let ck = CacheKey {
-                        name: current_name.clone(),
-                        rr_type: RrType::CNAME,
-                        class: key.class,
-                        ecs: crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope),
-                    };
-                    let inputs = self
-                        .inner
-                        .shared
-                        .estimator
-                        .lock()
-                        .score_inputs(&current_name, now);
-                    self.inner
-                        .shared
-                        .cache
-                        .lock()
-                        .insert_positive(&ck, set, now, inputs, false);
+                    authorities.extend(resp.authorities.iter().cloned());
+                    if !self.inner.config.engine.dnssec {
+                        let mut set =
+                            RrSet::new(record.name.clone(), RrType::CNAME, key.class, record.ttl);
+                        set.add_record(record);
+                        let ck = CacheKey {
+                            name: current_name.clone(),
+                            rr_type: RrType::CNAME,
+                            class: key.class,
+                            ecs: crate::cache::answer_partition(key.ecs.as_ref(), ecs_scope),
+                        };
+                        let inputs = self
+                            .inner
+                            .shared
+                            .estimator
+                            .lock()
+                            .score_inputs(&current_name, now);
+                        self.inner
+                            .shared
+                            .cache
+                            .lock()
+                            .insert_positive(&ck, set, now, inputs, false);
+                    }
                     self.link_alias(&current_name, &target, current_type, key.class, now);
                     if !target.is_subdomain_of(&zone) || zone == Name::root() {
                         zone = Name::root();
@@ -2042,7 +2159,15 @@ impl Resolver {
                             .ok_or_else(|| Error::wire("bad DNAME synthesis"))?;
                     ttl = ttl.min(record.ttl);
                     let cname = engine::make_cname_record(&current_name, &synthesized, record.ttl);
+                    rrsigs.extend(
+                        resp.answers
+                            .iter()
+                            .filter(|r| r.rr_type == RrType::RRSIG && r.name == record.name)
+                            .cloned(),
+                    );
+                    answers.push(record);
                     answers.push(cname);
+                    authorities.extend(resp.authorities.iter().cloned());
                     current_name = synthesized;
                     if !current_name.is_subdomain_of(&zone) || zone == Name::root() {
                         zone = Name::root();
@@ -2052,6 +2177,18 @@ impl Resolver {
                     depth += 1;
                 }
                 ResponseKind::Negative { rcode: r, soa } => {
+                    if self.inner.config.engine.dnssec {
+                        if query_name != current_name {
+                            minimized = Some(current_name.clone());
+                            continue;
+                        }
+                        // Preserve every denial RRset and signature for validation.
+                        // No negative record enters the cache before authentication.
+                        authorities.extend(resp.authorities.iter().cloned());
+                        rcode = r;
+                        ttl = ttl.min(soa.as_ref().map(negative_ttl).unwrap_or(0));
+                        break;
+                    }
                     if r.is_nxdomain() {
                         rcode = r;
                         if let Some(s) = &soa {
@@ -2132,7 +2269,7 @@ impl Resolver {
                             _ => None,
                         })
                         .collect();
-                    {
+                    if !self.inner.config.engine.dnssec {
                         let mut cache = self.inner.shared.cache.lock();
                         let ns_set =
                             RrSet::from_records(ns.clone(), self.inner.config.cache.max_ttl_cap)
@@ -4065,13 +4202,11 @@ mod tests {
         assert!(!plain.flags.ad);
         let mut asked = q.clone();
         asked.flags.ad = true;
-        // A signature-verified answer is *not* enough: this build ships no
-        // trust anchor, so the delegation itself was never proven and the
-        // `AD` bit would overstate what was checked. Advertising it requires
-        // the deployment to have configured an anchor.
+        // Validation is disabled in this configuration; an externally supplied
+        // boolean alone must not enable AD, including the legacy anchor flag.
         assert!(
             !r.build_response(&asked, &res).flags.ad,
-            "AD must not be set without a configured trust anchor"
+            "AD must not be set when DNSSEC validation is disabled"
         );
         let mut anchored_cfg = ResolverConfig::default();
         anchored_cfg.engine.root_servers = vec!["127.0.0.1:1".parse().unwrap()];

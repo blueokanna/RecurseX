@@ -223,7 +223,7 @@ pub fn classify_response(msg: &Message, qname: &Name, qtype: RrType, zone: &Name
             continue;
         }
         if rec.name == *qname {
-            if rec.rr_type == qtype {
+            if rec.rr_type == qtype || qtype == RrType::ANY {
                 answer_data.push(rec.clone());
             } else if rec.rr_type == RrType::CNAME && cname.is_none() {
                 cname = Some(rec.clone());

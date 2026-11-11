@@ -465,24 +465,19 @@ Several things in this codebase exist once, on purpose, and the code says so:
 - the alias graph (the general graph is gone rather than kept unread),
 - the refresh path (`refresh_with_dependents` is what both triggers call),
 - the capacity sweeps (`src/bounded.rs` is used by four tables),
-- the DNSSEC verification routine (`validate_rrset` is what the chain walker
-  calls).
+- the DNSSEC signature and authenticated chain routines.
 
 ## What this does not do
 
 Said plainly, because the alternative is a README that implies more than the
 code delivers:
 
-- **DNSSEC algorithms**: RSASHA256 (8) is fully verified from scratch. SHA-1
-  algorithms (5/7) are refused as deprecated. ECDSA (13/14) and EdDSA (15/16)
-  are recognised but not verified by this build — signatures from zones that
-  only use them produce `Indeterminate`, never a fabricated "secure".
-- **DNSSEC scope**: `SignatureValid` means local signature success against an
-  unauthenticated key. The deprecated `Verdict::Secure` spelling is only a
-  compatibility alias. No root trust anchor, authenticated DS chain, NSEC/NSEC3
-  denial proof or wildcard proof is implemented. `Resolution.validated` stays
-  false for local success, caches receive no trust promotion, and AD stays clear.
-  See [the exact state contract](wiki/DNSSEC.md).
+- **DNSSEC algorithm and anchor policy**: the complete chain validator supports
+  algorithms 8, 10, 13, 14 and 15, DS digests 2 and 4, NSEC/NSEC3 denial,
+  unsigned delegations and wildcard proofs. Deprecated algorithms and Ed448
+  are not verified. Built-in IANA root anchors include keys 20326 and 38696;
+  automatic RFC 5011 anchor maintenance is not implemented. Operators must
+  update static anchors for future rollovers. See [DNSSEC](wiki/DNSSEC.md).
 - **DoQ**: this crate implements its own QUIC client on courierust's public
   codecs and cryptographic primitives. Tests cover framing, reassembly,
   transport parameters, deadlines and provider contracts; they do not establish
@@ -655,8 +650,9 @@ network generation change. DoQ also checks the endpoint, TLS identity, roots,
 verification mode and certificate time before reusing a connection.
 
 `dnssec_anchored` is retained for source compatibility but ignored. No caller
-boolean can produce `ChainAnchored`, and this build does not set AD until an
-actual complete chain validator exists.
+boolean can produce `ChainAnchored`. With `engine.dnssec=true`, AD is set only
+when the complete chain and required denial proofs authenticate, CD is clear,
+and the client requests AD or DO. Missing or bogus evidence fails closed.
 
 Detected bogus signatures are rejected before serving or caching an answer,
 including cache hits and stale fallback. Recursion guards apply to the
@@ -665,7 +661,7 @@ Snapshot validation flags are discarded on restore and must be established
 again by the active resolver.
 
 The current build uses courierust 1.1.2 from crates.io, plus nextjson 0.1.5,
-tzcraft 0.1.2 and rustbinary 0.1.10. The `std`
+tzcraft 0.1.2, rustbinary 0.1.10 and optional ring 0.17.14 for DNSSEC. The `std`
 feature uses OS entropy even with encrypted transports disabled. RustBinary's
 unused protocol/derive features are disabled. `Cargo.lock` records the registry
 source and checksum; use `--locked` to reproduce the repository's resolution.

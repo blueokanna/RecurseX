@@ -20,6 +20,10 @@
 
 #![cfg(feature = "std")]
 
+#[path = "support/sockets.rs"]
+mod sockets;
+
+use std::io::ErrorKind as IoErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -151,33 +155,6 @@ impl Stub {
         }
     }
 
-    /// A stub that receives and **discards**: queries are never answered, and
-    /// because the socket reads them the kernel has no reason to send ICMP port
-    /// unreachable, so each attempt ends in a clean read timeout. That is what
-    /// makes `dead_walk` measure the budget rather than the operating system's
-    /// error reporting.
-    fn black_hole() -> Stub {
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind black hole");
-        let addr = sock.local_addr().expect("black hole addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        sock.set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("black hole timeout");
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while !flag.load(Ordering::Relaxed) {
-                // Read and drop: no reply, ever.
-                let _ = sock.recv_from(&mut buf);
-            }
-        });
-        Stub {
-            addr,
-            seen: Arc::new(AtomicUsize::new(0)),
-            asked: Arc::new(Mutex::new(Vec::new())),
-            stop,
-        }
-    }
-
     fn queries_seen(&self) -> usize {
         self.seen.load(Ordering::Relaxed)
     }
@@ -193,6 +170,82 @@ impl Drop for Stub {
     }
 }
 
+/// Keep both transports open without answering. A UDP-only black hole leaves
+/// TCP fallback talking to a closed port: Linux can refuse it immediately,
+/// while Windows may spend the remaining query budget trying to connect.
+struct BlackHole {
+    addr: SocketAddr,
+    udp_seen: Arc<AtomicUsize>,
+    tcp_seen: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BlackHole {
+    fn start() -> Self {
+        let (tcp, udp) = sockets::bind_dns_pair().expect("bind UDP/TCP black hole");
+        let addr = udp.local_addr().expect("black hole addr");
+        udp.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("black hole timeout");
+        tcp.set_nonblocking(true).expect("nonblocking listener");
+        let udp_seen = Arc::new(AtomicUsize::new(0));
+        let tcp_seen = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let udp_count = udp_seen.clone();
+        let tcp_count = tcp_seen.clone();
+        let flag = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut connections = Vec::new();
+            while !flag.load(Ordering::Relaxed) {
+                match udp.recv_from(&mut buf) {
+                    Ok(_) => {
+                        udp_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            IoErrorKind::WouldBlock
+                                | IoErrorKind::TimedOut
+                                | IoErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => panic!("receive black hole datagram: {error}"),
+                }
+                loop {
+                    match tcp.accept() {
+                        Ok((stream, _)) => {
+                            connections.push(stream);
+                            tcp_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) if error.kind() == IoErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == IoErrorKind::Interrupted => continue,
+                        Err(error) => panic!("accept black hole connection: {error}"),
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            udp_seen,
+            tcp_seen,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for BlackHole {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !std::thread::panicking() {
+                result.expect("black hole worker");
+            }
+        }
+    }
+}
+
 /// Build the reply for one query of the delegation chain.
 fn delegate(resp: &mut Message, qname: &Name, port: u16) {
     let class = RrClass::IN;
@@ -205,11 +258,8 @@ fn delegate(resp: &mut Message, qname: &Name, port: u16) {
             ttl,
             rdata: RData::A(ANSWER_IP),
         }),
-        // Root refers to the TLD.
         "test" => referral(resp, "test", "ns.test", port),
-        // The TLD refers one label deeper.
         "example.test" => referral(resp, "example.test", "ns.example.test", port),
-        // A well-formed resolver must never ask anything else in this test.
         _ => resp.flags.rcode = Rcode::REFUSED,
     }
 }
@@ -254,9 +304,6 @@ fn referral(resp: &mut Message, zone: &str, ns_name: &str, port: u16) {
         ttl,
         rdata: RData::A(Ipv4Addr::LOCALHOST),
     });
-    // The port has to travel in the glue for the stub to be the next hop, and
-    // A records carry no port — so the config does it. Asserted here so the
-    // dependency is explicit rather than surprising.
     assert_ne!(port, 0);
 }
 
@@ -450,16 +497,26 @@ fn an_empty_answer_is_not_an_answer() {
     );
 }
 
-/// A name whose queries are never answered must end at the deadline, not at the
-/// sum of every retry. `timeout_ms` is 400 and the budget is 500, so the walk
-/// must come back after roughly one attempt rather than 400 ms × attempts ×
-/// servers.
+/// A name whose queries are never answered must end at the deadline, including
+/// time spent in TCP fallback.
 #[test]
 fn a_dead_walk_ends_at_the_query_budget() {
-    let stub = Stub::black_hole();
+    assert_dead_walk_budget(true);
+}
+
+#[test]
+fn a_dead_walk_without_tcp_fallback_ends_at_the_query_budget() {
+    assert_dead_walk_budget(false);
+}
+
+fn assert_dead_walk_budget(tcp_fallback: bool) {
+    let stub = BlackHole::start();
     let mut cfg = config(stub.addr);
     cfg.engine.timeout_ms = 400;
     cfg.engine.query_budget_ms = 500;
+    cfg.engine.tcp_fallback = tcp_fallback;
+    cfg.engine.max_attempts_per_server = 16;
+    cfg.engine.max_total_attempts = 64;
 
     let started = Instant::now();
     let err = resolve(cfg, "www.example.test").expect_err("a dead upstream must fail");
@@ -467,9 +524,15 @@ fn a_dead_walk_ends_at_the_query_budget() {
 
     assert_eq!(err.kind, ErrorKind::Timeout, "got {err:?}");
     assert!(
+        elapsed >= Duration::from_millis(400),
+        "a silent upstream must consume the query budget, took {elapsed:?}"
+    );
+    assert!(
         elapsed < Duration::from_millis(2_500),
         "the budget must bound the walk, took {elapsed:?}"
     );
+    assert!(stub.udp_seen.load(Ordering::Relaxed) > 0);
+    assert_eq!(stub.tcp_seen.load(Ordering::Relaxed) > 0, tcp_fallback);
 }
 
 /// Every query the stub sees must be for the name under test, or for one of its
@@ -513,8 +576,6 @@ fn an_unglued_referral_is_refused_before_any_address_lookup() {
         "the error must name the cause, got {}",
         err.msg
     );
-    // The root query plus the referral that carried it: nothing else may have
-    // been asked, and in particular no `ns*.evil.test` address lookups.
     assert!(
         stub.queries_seen() <= 4,
         "the gate must stop the fan-out; saw {} queries",
@@ -565,8 +626,6 @@ fn ecs_scope_controls_who_may_reuse_an_answer() {
     let after_first = stub.queries_seen();
     assert!(after_first >= 3, "the walk must have happened");
 
-    // A client inside the declared scope, at a *different* granularity: served
-    // entirely from cache. Nothing new goes upstream.
     let inside = ask("10.0.0.200", 25);
     assert_eq!(inside.flags.rcode, Rcode::NOERROR);
     assert_eq!(
@@ -575,8 +634,6 @@ fn ecs_scope_controls_who_may_reuse_an_answer() {
         "a client inside the declared /24 must reuse the answer"
     );
 
-    // A client outside the scope: a different /24 is a different network, so
-    // it has to resolve for itself.
     let outside = ask("10.9.9.1", 24);
     assert_eq!(outside.flags.rcode, Rcode::NOERROR);
     let after_outside = stub.queries_seen();
@@ -584,9 +641,6 @@ fn ecs_scope_controls_who_may_reuse_an_answer() {
         after_outside > after_first,
         "a different subnet must not reuse a subnet-scoped answer"
     );
-
-    // A client with no ECS at all must not be handed the scoped answer either.
-    // It still gets an answer — it simply has to ask for it.
     let mut plain = Message::query(
         0x2201,
         Name::from_ascii("www.example.test").unwrap(),

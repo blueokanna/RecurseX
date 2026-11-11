@@ -145,10 +145,24 @@ impl Name {
 
     /// Whether `self` is a subdomain of (or equal to) `other`.
     pub fn is_subdomain_of(&self, other: &Name) -> bool {
-        // Both canonical forms end with the root label and both are label
-        // aligned, so "one byte form ends with the other" is exactly "one
-        // label chain nests inside the other".
-        self.0.ends_with(&other.0)
+        // DNS labels may contain length-like bytes. Compare only at label
+        // boundaries, without allocating each suffix on this hot path.
+        let mut suffix = self.as_bytes();
+        loop {
+            if suffix == other.as_bytes() {
+                return true;
+            }
+            let Some((&len, tail)) = suffix.split_first() else {
+                return false;
+            };
+            if len == 0 {
+                return false;
+            }
+            let Some(next) = tail.get(usize::from(len)..) else {
+                return false;
+            };
+            suffix = next;
+        }
     }
 
     /// Whether `self` is a strict subdomain of `other`.
@@ -160,8 +174,6 @@ impl Name {
     /// (i.e. the common suffix, label-aligned). Returns the root when there
     /// is no common non-root suffix.
     pub fn common_suffix(&self, other: &Name) -> Name {
-        // Compare label by label from the right, walking both chains
-        // backwards and stopping at the first disagreement.
         let a_labels = self.labels();
         let b_labels = other.labels();
         let mut suffix: Vec<u8> = Vec::new();
@@ -205,9 +217,6 @@ impl Name {
         let mut hops = 0usize;
         let mut total = 1usize; // the terminal root octet
         loop {
-            // `byte_at` carries the "is there a byte here" check, so the loop
-            // needs no separate guard to be safe — and there is no index
-            // expression left for the compiler to bounds-check.
             let len = usize::from(buf.byte_at(p).map_err(|_| Error::wire("truncated name"))?);
             match len & 0xc0 {
                 0x00 => {
@@ -234,8 +243,6 @@ impl Name {
                     lens.push(len as u8);
                     let start = label_bytes.len();
                     label_bytes.extend_from_slice(label);
-                    // Only the bytes just appended are folded to lower case;
-                    // `get_mut` keeps a wrong `start` from panicking.
                     if let Some(appended) = label_bytes.get_mut(start..) {
                         for b in appended {
                             b.make_ascii_lowercase();
@@ -271,9 +278,6 @@ impl Name {
         if lens.len() >= MAX_LABELS {
             return Err(Error::wire("too many labels"));
         }
-        // Reassemble `[len][label]…` from the recorded lengths. Both reads are
-        // checked, so a length list that disagreed with the byte pool would be
-        // an error rather than a panic.
         fn lengths_disagree() -> Error {
             Error::internal("label lengths disagree with the byte pool")
         }
@@ -334,8 +338,6 @@ impl Name {
             Ok(())
         }
 
-        // `split_first` walks the string without an index, so every character
-        // read is a `Some`/`None` decision rather than a bounds check.
         let mut rest: &[u8] = bytes;
         while let Some((&b, tail)) = rest.split_first() {
             rest = tail;
@@ -372,10 +374,6 @@ impl Name {
                 }
                 b'.' => {
                     if current.is_empty() {
-                        // A leading dot or an empty label (e.g. "a..b") is
-                        // rejected; a trailing dot is fine — it terminates
-                        // the last label and the root follows. "Empty" here
-                        // means nothing at all follows the dot.
                         if rest.is_empty() {
                             break;
                         }
@@ -400,8 +398,6 @@ impl Name {
     pub fn to_ascii(&self) -> String {
         let bytes: &[u8] = &self.0;
         let mut s = String::with_capacity(bytes.len() + 4);
-        // The same label walk the rest of the type uses, so the body never
-        // computes an offset into the buffer.
         for label in self.label_iter() {
             if !s.is_empty() {
                 s.push('.');
@@ -512,9 +508,6 @@ impl NameCompressor {
 
     /// Write `name` to `out`, compressing any suffix already emitted.
     pub fn write(&mut self, name: &Name, out: &mut Vec<u8>) {
-        // Enumerate suffixes (full name → single label), each with its
-        // offset relative to the start of the name. The bare root is
-        // excluded from compression targets.
         let mut suffixes: Vec<(Name, usize)> = Vec::with_capacity(8);
         let mut cur = name.clone();
         let total = name.wire_len();
@@ -528,9 +521,6 @@ impl NameCompressor {
                 None => break,
             }
         }
-        // The longest suffix already in the table, carrying what the
-        // compression pointer needs — which suffix, and the offset it was
-        // written at — rather than a position to look up again.
         let hit = suffixes.iter().enumerate().find_map(|(i, (suffix, _))| {
             self.offsets.get(suffix).map(|offset| (i, suffix, *offset))
         });
@@ -549,15 +539,8 @@ impl NameCompressor {
                         out.push(0xc0 | ((offset >> 8) as u8));
                         out.push((offset & 0xff) as u8);
                     }
-                    // Unreachable: every entry in `suffixes` came from walking
-                    // this name's own parents. Writing the name out in full is
-                    // the correct fallback — the same name, just less
-                    // compression — and unlike a half-written name it cannot
-                    // corrupt the message.
                     None => name.write_wire(out),
                 }
-                // Each suffix starts at `base + rel` in the bytes just
-                // written, in both branches.
                 for (s, rel) in suffixes.iter().take(i) {
                     self.record(base, s, *rel);
                 }
@@ -703,8 +686,6 @@ mod tests {
         let mut rng = crate::prng::SplitMix64::new(1);
         let r = n.randomized_case(&mut rng);
         assert_eq!(r.canonical(), n);
-        // The two forms must differ in at least one case position (the
-        // seed 1 produces a mix).
         let a = n.as_bytes();
         let b = r.as_bytes();
         assert_eq!(a.len(), b.len());

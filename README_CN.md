@@ -81,12 +81,17 @@ DoQ 的自实现 QUIC 仍属实验性传输：当前没有完整拥塞控制器�
 DNSSEC 检测到无效签名时会拒绝答案，缓存命中与 stale 回退也会检查。验证递归保护限于当前线程，
 一个工作线程的验签不会跳过其他线程的检查。快照恢复会清除保存的验证标记。
 
-**完整的根信任锚到答案的验证链尚未实现，AD 位保持关闭。** 当前验证器支持 RSASHA256；
-ECDSA/EdDSA 尚未实现验证，NSEC/NSEC3 否定证明也未完成。`dnssec_anchored` 布尔值不能提升信任状态。
+已接入根信任锚 → 父区 DS → 子区 DNSKEY → 答案的认证链，并验证 NSEC/NSEC3、
+未签名委派、通配符以及 CNAME/DNAME 链。仅完整认证成功、CD 关闭且客户端请求 AD/DO 时设置 AD。
+默认根锚包含 20326 和 2026 年启用的 38696；`engine.dnssec=true` 开启验证，
+`dnssec_anchored` 布尔值不能提升信任状态。配置及边界见 [DNSSEC](wiki/DNSSEC-zh.md)。
+
+支持算法 8、10、13、14、15 和 DS 摘要 2、4。根锚为静态配置，未来轮换需更新软件或配置；
+未实现 RFC 5011 自动信任锚维护。Ed448 和已弃用算法不产生安全判定。
 
 ## 构建与配置
 
-MSRV 为 Rust 1.78。当前使用 crates.io 正式版本：courierust 1.1.2、nextjson 0.1.5、tzcraft 0.1.2、rustbinary 0.1.10。
+MSRV 为 Rust 1.78。当前依赖：courierust 1.1.2、nextjson 0.1.5、tzcraft 0.1.2、rustbinary 0.1.10，以及 DNSSEC 可选依赖 ring 0.17.14。
 不包含本地依赖副本。`std` 构建统一使用系统密码学随机源；获取随机源失败时不会使用哈希值或时间生成密钥。
 
 ```powershell
@@ -141,7 +146,7 @@ RRset 构造拒绝混合名称、类型和 class；委派必须位于当前区�
 
 DNSSEC 使用 `SignatureValid` 表示局部验签；旧 `Secure` 仅作弃用兼容名称。
 局部成功不使 `Resolution.validated` 变为 true、不提升缓存信任、不置 AD。
-目前没有根锚认证链、NSEC/NSEC3 或通配符证明，缺签名也不能证明属于合法未签名分支。
+现已实现根锚认证链、NSEC/NSEC3 和通配符证明；只有通过认证的无 DS 委派才能进入未签名分支。
 验签增加记录身份绑定、RDATA 排序修正和 32 位签名时间回绕处理。
 
 监听默认只接受回环客户端，即使绑定通配地址。局域网需显式设置

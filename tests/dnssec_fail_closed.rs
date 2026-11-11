@@ -134,13 +134,17 @@ fn refresh_failure_cannot_serve_an_expired_signature_or_charge_stale_metrics() {
 fn invalid_forwarded_answer_is_never_admitted_to_cache() {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .set_read_timeout(Some(std::time::Duration::from_millis(20)))
         .unwrap();
     let address = socket.local_addr().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_stop = stop.clone();
     let server = std::thread::spawn(move || {
-        for _ in 0..2 {
+        while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let mut bytes = [0; 4096];
-            let (length, peer) = socket.recv_from(&mut bytes).unwrap();
+            let Ok((length, peer)) = socket.recv_from(&mut bytes) else {
+                continue;
+            };
             let query = recurse_x::Message::parse(&bytes[..length]).unwrap();
             let mut response = recurse_x::Message::new(query.id);
             response.flags.qr = true;
@@ -200,5 +204,6 @@ fn invalid_forwarded_answer_is_never_admitted_to_cache() {
             LookupOutcome::Miss
         ));
     }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();
 }

@@ -451,12 +451,11 @@ impl DnssecAlgorithm {
         self.0
     }
 
-    /// Whether this implementation can verify signatures for this
-    /// algorithm. RSASHA256 (8) is implemented; the SHA-1 and RSA-MD5
-    /// family is deliberately rejected as deprecated; ECDSA / EdDSA are
-    /// recognized but not yet verified by this build.
+    /// Whether the DNSSEC feature verifies this algorithm: RSA/SHA-256,
+    /// RSA/SHA-512, ECDSA P-256/P-384, or Ed25519. Deprecated algorithms
+    /// and Ed448 are not accepted as secure by this implementation.
     pub fn supported(self) -> bool {
-        matches!(self.0, 8)
+        matches!(self.0, 8 | 10 | 13 | 14 | 15)
     }
 
     /// Human-readable algorithm name; falls back to `UNKNOWN`.

@@ -267,8 +267,6 @@ impl ForwarderSet {
             crate::budget::FetchLimits::default(),
             timeout_ms,
         );
-        // Validate the complete group before sending anything. A typo must not
-        // silently switch a strict query to another privacy boundary.
         for forwarder in group {
             forwarder.validate()?;
             if self.privacy.encrypted_only
@@ -763,12 +761,35 @@ pub fn response_to_resolution(
             }
         }
     }
-    let authorities = resp
+    let authority_zone = resp
         .authorities
         .iter()
-        .filter(|r| r.class == key.class && owner.is_subdomain_of(&r.name))
+        .filter(|r| r.rr_type == RrType::SOA && owner.is_subdomain_of(&r.name))
+        .max_by_key(|r| r.name.label_count())
+        .map(|r| r.name.clone());
+    let authorities: Vec<_> = resp
+        .authorities
+        .iter()
+        .filter(|r| {
+            r.class == key.class
+                && (owner.is_subdomain_of(&r.name)
+                    || (matches!(r.rr_type, RrType::NSEC | RrType::NSEC3 | RrType::RRSIG)
+                        && authority_zone
+                            .as_ref()
+                            .map_or(true, |zone| r.name.is_subdomain_of(zone))))
+        })
         .cloned()
         .collect();
+    if answers.is_empty() {
+        ttl = authorities
+            .iter()
+            .filter_map(|r| match &r.rdata {
+                RData::Soa { minimum, .. } => Some(r.ttl.min(*minimum)),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(0);
+    }
     if ttl == u32::MAX {
         ttl = 0;
     }

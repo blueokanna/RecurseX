@@ -143,6 +143,10 @@ pub struct EngineJson {
     /// Enable DNSSEC validation; absent = default.
     #[njson(default)]
     pub dnssec: Option<bool>,
+    /// Replace the built-in IANA root anchors with explicitly configured DS
+    /// records. Omission preserves defaults; an empty set fails validation.
+    #[njson(default)]
+    pub dnssec_trust_anchors: Option<Vec<DnssecTrustAnchorJson>>,
     /// Fall back to TCP on truncation; absent = default.
     #[njson(default)]
     pub tcp_fallback: Option<bool>,
@@ -184,6 +188,74 @@ pub struct EngineJson {
     /// transports, because certificate verification uses it as the identity.
     #[njson(default)]
     pub forwarders: Vec<ForwarderJson>,
+}
+
+/// A trusted DS record supplied by the operator, never by an upstream.
+#[derive(Debug, Clone, PartialEq, NsonSerialize, NsonDeserialize)]
+#[njson(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DnssecTrustAnchorJson {
+    /// Canonical zone name, such as `.`.
+    pub name: String,
+    /// RFC 4034 key tag.
+    pub key_tag: u16,
+    /// DNSSEC algorithm number.
+    pub algorithm: u8,
+    /// DS digest algorithm: SHA-256 (2) or SHA-384 (4).
+    pub digest_type: u8,
+    /// Hexadecimal digest, without whitespace.
+    pub digest: String,
+}
+
+#[cfg(feature = "dnssec")]
+impl DnssecTrustAnchorJson {
+    fn record(&self) -> Result<crate::Record> {
+        let len = match self.digest_type {
+            2 => 32,
+            4 => 48,
+            _ => {
+                return Err(Error::config(
+                    "DNSSEC trust anchors require SHA-256 or SHA-384",
+                ))
+            }
+        };
+        if self.digest.len() != len * 2 || !self.digest.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::config("invalid DNSSEC trust anchor digest"));
+        }
+        let digest = self
+            .digest
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |c: u8| {
+                    if c.is_ascii_digit() {
+                        c - b'0'
+                    } else {
+                        c.to_ascii_lowercase() - b'a' + 10
+                    }
+                };
+                match pair {
+                    [a, b] => digit(*a) * 16 + digit(*b),
+                    _ => 0,
+                }
+            })
+            .collect();
+        let algorithm = crate::qtype::DnssecAlgorithm(self.algorithm);
+        if !algorithm.supported() {
+            return Err(Error::config("unsupported DNSSEC trust anchor algorithm"));
+        }
+        Ok(crate::Record {
+            name: crate::Name::from_ascii(&self.name)?,
+            rr_type: RrType::DS,
+            class: crate::qtype::RrClass::IN,
+            ttl: u32::MAX,
+            rdata: crate::RData::Ds {
+                key_tag: self.key_tag,
+                algorithm,
+                digest_type: crate::qtype::DsDigestType(self.digest_type),
+                digest,
+            },
+        })
+    }
 }
 
 /// A forwarding upstream.
@@ -902,7 +974,25 @@ impl Config {
                 "forwarders require a build with the dot, doh, doh3 or doq feature",
             ));
         }
-        ec.dnssec = engine.dnssec.unwrap_or(d.engine.dnssec) && cfg!(feature = "dnssec");
+        if engine.dnssec == Some(true) && !cfg!(feature = "dnssec") {
+            return Err(Error::config(
+                "DNSSEC validation requires the dnssec feature",
+            ));
+        }
+        ec.dnssec = engine.dnssec.unwrap_or(d.engine.dnssec);
+        #[cfg(feature = "dnssec")]
+        if let Some(anchors) = &engine.dnssec_trust_anchors {
+            ec.dnssec_trust_anchors = anchors
+                .iter()
+                .map(DnssecTrustAnchorJson::record)
+                .collect::<Result<_>>()?;
+        }
+        #[cfg(not(feature = "dnssec"))]
+        if engine.dnssec_trust_anchors.is_some() {
+            return Err(Error::config(
+                "DNSSEC trust anchors require the dnssec feature",
+            ));
+        }
         let client_burst = self.client_burst.unwrap_or(d.rate_limit.client_capacity);
         let client_qps = self
             .client_qps

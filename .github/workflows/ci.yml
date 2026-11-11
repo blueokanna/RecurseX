@@ -93,6 +93,16 @@ jobs:
         run: cargo test --locked --all-features
       - name: Test (default features)
         run: cargo test --locked
+      - name: DNSSEC chain, denial and failure regressions (dnssec only)
+        run: cargo test --locked --no-default-features --features dnssec --test dnssec_chain --test dnssec_fail_closed
+      - name: Repeat iterative query deadline regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in {1..5}; do
+            echo "Iterative query deadline round $iteration/5"
+            cargo test --locked --all-features --test iterative_path a_dead_walk
+          done
       - name: Repeat outbound factory regression (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
