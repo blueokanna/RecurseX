@@ -5,6 +5,7 @@
 //! advertised EDNS size with the TC bit set when they do not fit.
 
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +16,9 @@ use std::thread::JoinHandle;
 
 use crate::message::Message;
 use crate::resolver::Resolver;
+
+mod stream_io;
+use stream_io::{read_deadline, write_deadline};
 
 /// Server tuning.
 #[derive(Clone, Debug)]
@@ -410,45 +414,6 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// Read exactly `buf.len()` bytes under a deadline, tolerating socket
-/// timeouts.
-///
-/// `read_exact` cannot be used here: it gives up on the first timeout, and a
-/// partial read would leave the stream out of sync with the framing. Reading
-/// in a loop keeps the protocol state intact while still letting the caller
-/// enforce a deadline between reads. Returns `false` when the connection
-/// should be closed (peer closed, deadline passed, or shutdown).
-fn read_deadline(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-    shutdown: &AtomicBool,
-    deadline: std::time::Instant,
-) -> std::io::Result<bool> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        if shutdown.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        let Some(rest) = buf.get_mut(filled..) else {
-            return Ok(false);
-        };
-        match stream.read(rest) {
-            Ok(0) => return Ok(false), // peer closed cleanly
-            Ok(n) => filled += n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(true)
-}
-
 /// Serve length-prefixed queries on one connection until the peer closes it,
 /// it goes idle for `idle_ms`, or the server shuts down.
 ///
@@ -466,8 +431,7 @@ fn tcp_conn(
     let client_ip = stream.peer_addr().ok().map(|p| p.ip());
     let idle = std::time::Duration::from_millis(idle_ms.max(SHUTDOWN_POLL_MS));
     let message_timeout = std::time::Duration::from_secs(10).min(idle);
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(SHUTDOWN_POLL_MS)))?;
-    stream.set_write_timeout(Some(idle))?;
+    stream.set_nonblocking(false)?;
 
     loop {
         let mut len_buf = [0u8; 2];
@@ -496,7 +460,14 @@ fn tcp_conn(
         let mut framed = Vec::with_capacity(response.len() + 2);
         framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
         framed.extend_from_slice(&response);
-        stream.write_all(&framed)?;
+        if !write_deadline(
+            &mut stream,
+            &framed,
+            shutdown,
+            std::time::Instant::now() + message_timeout,
+        )? {
+            return Ok(());
+        }
     }
 }
 

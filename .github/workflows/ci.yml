@@ -111,6 +111,14 @@ jobs:
             cargo test --locked --all-features --test outbound_factory
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Repeat TCP fallback and fragmented query regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in {1..10}; do
+            echo "TCP recovery round $iteration/10"
+            cargo test --locked --all-features --test recursive_recovery -- --test-threads=8
+          done
       - name: Repeat encrypted DNS loopback regressions (Windows MSRV)
         if: matrix.toolchain == 'msrv' && matrix.os == 'windows-latest'
         shell: pwsh
